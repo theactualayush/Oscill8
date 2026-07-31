@@ -1,0 +1,11 @@
+lseg-data>=2.1.1
+pandas>=2.2
+numpy>=1.26
+streamlit>=1.38
+plotly>=5.22
+psycopg2-binary>=2.9
+sqlalchemy>=2.0
+tenacity>=9.0
+python-dotenv>=1.0
+pytest>=8.0
+pytest-mock>=3.14
