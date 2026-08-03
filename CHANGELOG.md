@@ -45,3 +45,8 @@
   leg-history cache across overlapping rolling instances)
 - Unit Tests (`tests/test_strategy_definitions.py`,
   `tests/test_strategy_combinations.py`, `tests/test_strategy_pricing.py`)
+- 139 tests passing in total (102 pre-existing from Modules 1 + 2 + 37
+  new for Module 3)
+- Manually validated against real historical data using a live SOFR
+  fly (`SRAZ26` / `SRAH27` / `SRAM27`, weights `+1` / `-2` / `+1`) —
+  calculated strategy prices matched manual calculation exactly

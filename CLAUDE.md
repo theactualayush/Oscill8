@@ -121,10 +121,11 @@ Key design points a future session needs:
   boundaries, so intraday cache-miss downloads still fetch full
   calendar days at a time. Harmless (extras are deduped on insert) but
   worth knowing before building Module 3 on top of this.
-- Test suite: 96/96 passing (54 Module 1 + 42 Module 2) locally with
-  `requirements.txt` installed. `test_live_connection.py` still
+- Test suite: 102 tests passing across Modules 1 + 2 combined, locally
+  with `requirements.txt` installed. `test_live_connection.py` still
   requires a real LSEG Workspace desktop session and cannot run in a
-  headless/remote environment.
+  headless/remote environment (it is a standalone script, not a pytest
+  suite, so it contributes 0 to this count in any environment).
 
 ## Module 3 – Strategy Engine
 
@@ -222,8 +223,13 @@ Key design points a future session needs:
   this: it uses whatever `listing_cycle` each market currently declares
   in `core.config.MARKETS` as-is. Adding a hybrid cycle is an orthogonal
   `core.config`/`core.futures_calendar` change, out of scope here.
-- Test suite: 139/139 passing (97 pre-existing + 42 new) locally with
-  the pinned `requirements.txt` versions installed.
+- Test suite: 139 tests passing in total (102 pre-existing from
+  Modules 1 + 2 + 37 new for Module 3), locally with the pinned
+  `requirements.txt` versions installed.
+- Manually validated against real historical data using a live SOFR
+  fly (`SRAZ26` / `SRAH27` / `SRAM27`, weights `+1` / `-2` / `+1`) —
+  the engine's calculated strategy prices matched manual calculation
+  exactly.
 
 ---
 
