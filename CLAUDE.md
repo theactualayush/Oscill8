@@ -126,6 +126,82 @@ Key design points a future session needs:
   requires a real LSEG Workspace desktop session and cannot run in a
   headless/remote environment.
 
+## Module 3 – Strategy Engine
+
+COMPLETED AND TESTED.
+
+Turns individual futures contracts into historical multi-leg strategy
+price series (spreads, flies, condors, and arbitrary custom weight/
+offset structures), generically rather than through per-strategy-name
+calculation paths. Retrieves all historical prices exclusively through
+`database.get_history` — never calls `core.downloader` or `lseg.data`
+directly.
+
+strategy_engine/
+    __init__.py     (public re-exports)
+    definitions.py  (StrategyDefinition — generic shape/weight model)
+    combinations.py (StrategyInstance, generate_instances — wraps
+                     core.futures_calendar; no new RIC/calendar logic)
+    pricing.py      (StrategyHistory, build_history, generate_histories
+                     — leg retrieval, inner-join alignment, weighting)
+
+tests/
+    test_strategy_definitions.py, test_strategy_combinations.py,
+    test_strategy_pricing.py
+
+Key design points a future session needs:
+
+- A strategy is represented purely as data — `market_key`, `offsets`,
+  `weights`, `interval`, `price_field` — never as a named "spread"/
+  "fly"/"condor" code path. `StrategyDefinition.__post_init__` validates
+  eagerly: offsets must start at 0 and be strictly increasing, offsets/
+  weights must match in length (>= 2 legs), weights can't all be zero.
+- `generate_instances(definition, contract_start, contract_end)`
+  produces rolling `StrategyInstance`s (concrete RIC tuples) by
+  delegating entirely to `core.futures_calendar.generate_contracts` +
+  `rolling_windows` — Module 3 never calls `core.ric` directly, since
+  `generate_contracts` already returns fully-resolved RIC strings.
+- Contract-selection window (`contract_start`/`contract_end`, which
+  RICs get combined) and price-history window (`price_start`/
+  `price_end`, what date range gets fetched for those legs) are
+  independent parameters across `generate_instances` vs.
+  `build_history`/`generate_histories` — deliberately not one combined
+  range, so callers can generate combinations over a wide contract
+  universe while pricing only a narrower window, or vice versa.
+- Leg alignment is an **inner join on Date** — the strategy value is
+  only computed for timestamps where every leg has an observation.
+  No forward-fill: a missing leg bar drops that timestamp entirely
+  rather than fabricating a value from a stale price. This is
+  interval-agnostic (works identically for DAILY/HOURLY/4H) since all
+  three intervals produce deterministic, directly comparable `Date`
+  timestamps from `database.get_history`.
+- `database.get_history` can return a fully-empty DataFrame (no cached
+  rows and nothing from LSEG) with `Date` defaulted to `object` dtype
+  rather than `datetime64[ns]` (see `database/cache.py:136`).
+  `build_history` explicitly re-coerces each leg's `Date` column via
+  `pd.to_datetime` before merging, so an all-empty leg still joins
+  cleanly instead of raising a pandas dtype-mismatch error.
+- `generate_histories(instances, price_start, price_end)` shares one
+  `leg_cache` dict across all instances passed to it, keyed on
+  `(ric, interval, price_start, price_end)`, so a RIC shared by several
+  overlapping rolling instances (e.g. adjacent flies sharing two of
+  three legs) is only fetched from `database.get_history` once. This
+  cache is scoped to a single call — no cross-call/global cache, no
+  invalidation to manage.
+- Metadata (market, RICs, weights, offsets, interval, price field)
+  lives on the `StrategyInstance`/`StrategyHistory` dataclasses, not as
+  DataFrame columns — `StrategyHistory.history` stays a clean,
+  purely-numeric frame (`Date`, `Leg_1..Leg_N`, `Strategy`) for Module
+  5's analytics to consume directly.
+- `price_field` (default `"Close"`) is validated against a small
+  whitelist in `definitions.py`, not a hard-coded literal — adding
+  `"Open"`/`"VWAP"`/etc. later is a one-line change.
+- Single-market strategies only (`StrategyDefinition.market_key` is
+  singular) — cross-market relative-value legs are out of scope for
+  this module.
+- Test suite: 129/129 passing (97 pre-existing + 32 new) locally with
+  the pinned `requirements.txt` versions installed.
+
 ---
 
 # LSEG
@@ -210,19 +286,17 @@ SQLite market-data cache
 STATUS: COMPLETE
 
 Module 3
-Data service / integration
-STATUS: NEXT
+Strategy engine
+STATUS: COMPLETE
 
 Module 4
-Strategy engine
+Range-bound analytics
+STATUS: NEXT
 
 Module 5
-Range-bound analytics
-
-Module 6
 Streamlit application
 
-Module 7
+Module 6
 Deployment architecture
 
 ---
