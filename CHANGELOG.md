@@ -32,9 +32,12 @@
 ### Added
 - Strategy Engine (`strategy_engine/definitions.py`,
   `strategy_engine/combinations.py`, `strategy_engine/pricing.py`)
-- Generic multi-leg strategy model (`StrategyDefinition` — market,
-  offsets, weights, interval, price field; no per-strategy-name
-  calculation paths)
+- Generic strategy model (`StrategyDefinition` — market, offsets,
+  weights, interval, price field; no per-strategy-name calculation
+  paths), supporting single-leg outrights through arbitrary multi-leg
+  structures
+- Selectable canonical price field (`Open`/`High`/`Low`/`Close`,
+  default `Close`)
 - Rolling contract-combination generation (`generate_instances`,
   built on `core.futures_calendar`)
 - Historical strategy pricing (`build_history`, `generate_histories`

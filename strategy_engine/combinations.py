@@ -39,6 +39,10 @@ def generate_instances(
     definition's offsets across them via futures_calendar.rolling_windows.
     Returns an empty list (not an error) if the window doesn't contain
     enough contracts to fill the largest offset span.
+
+    A single-leg outright definition (offsets=(0,)) needs no special
+    handling: rolling_windows with a span of 0 produces one 1-tuple per
+    listed contract, i.e. every contract becomes its own instance.
     """
     contracts = futures_calendar.generate_contracts(
         definition.market_key, contract_start, contract_end

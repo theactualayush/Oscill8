@@ -12,6 +12,21 @@ from strategy_engine.combinations import generate_instances
 from strategy_engine.definitions import StrategyDefinition
 
 
+def test_generate_instances_for_outright():
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1,), interval=BarInterval.DAILY,
+    )
+    instances = generate_instances(definition, "2026-01-01", "2026-12-31")
+
+    # A span of 0 means every listed contract is its own outright instance.
+    assert [inst.rics for inst in instances] == [
+        ("SRAH26",),
+        ("SRAM26",),
+        ("SRAU26",),
+        ("SRAZ26",),
+    ]
+
+
 def test_generate_instances_for_sofr_fly():
     definition = StrategyDefinition(
         market_key="SOFR", offsets=(0, 1, 2), weights=(1, -2, 1), interval=BarInterval.DAILY,

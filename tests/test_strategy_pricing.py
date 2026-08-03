@@ -10,12 +10,10 @@ database.get_history.
 
 from __future__ import annotations
 
-import ast
-import inspect
-
 import pandas as pd
 import pytest
 
+import core.downloader as downloader_module
 from core.config import BarInterval
 from strategy_engine import pricing
 from strategy_engine.combinations import StrategyInstance
@@ -70,6 +68,49 @@ def test_build_history_computes_weighted_sum_when_fully_aligned(mocker):
     assert result.history["Strategy"].tolist() == pytest.approx(expected_strategy)
     assert result.instance is instance
     assert result.price_field == "Close"
+
+
+def test_build_history_applies_weight_to_single_leg_outright(mocker):
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(-3,), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26",))
+    dates = ["2026-01-02", "2026-01-05"]
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        return_value=_leg_df(dates, [96.80, 96.82]),
+    )
+
+    result = pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert result.history["Leg_1"].tolist() == [96.80, 96.82]
+    assert result.history["Strategy"].tolist() == pytest.approx([-3 * 96.80, -3 * 96.82])
+
+
+def test_build_history_uses_non_close_price_field(mocker):
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
+        price_field="High",
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26", "SRAM26"))
+    dates = ["2026-01-02"]
+
+    def _leg_with_distinct_fields(high: float) -> pd.DataFrame:
+        df = _leg_df(dates, [999.0])  # Close deliberately wrong, must be ignored
+        df["High"] = [high]
+        return df
+
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[_leg_with_distinct_fields(96.90), _leg_with_distinct_fields(96.70)],
+    )
+
+    result = pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert result.price_field == "High"
+    assert result.history["Leg_1"].tolist() == [96.90]
+    assert result.history["Leg_2"].tolist() == [96.70]
+    assert result.history["Strategy"].tolist() == pytest.approx([96.90 - 96.70])
 
 
 def test_build_history_drops_timestamp_missing_from_any_leg(mocker):
@@ -145,17 +186,36 @@ def test_generate_histories_fetches_each_distinct_leg_once(mocker):
     assert mock_get_history.call_count == 3
 
 
-def test_pricing_module_never_imports_lseg_or_downloader():
-    # Parses actual import statements rather than substring-matching the
-    # whole source, since the module's own docstring legitimately
-    # mentions "LSEG"/"core.downloader" when explaining why it avoids them.
-    tree = ast.parse(inspect.getsource(pricing))
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
+def test_pricing_namespace_never_binds_downloader_functions():
+    """Structural boundary check: inspects strategy_engine.pricing's live
+    module namespace for the actual core.downloader function objects
+    (identity, not name/string matching) -- would catch even a renamed
+    import (e.g. `from core.downloader import download_history as x`),
+    unlike a source-text search."""
+    pricing_values = list(vars(pricing).values())
+    assert downloader_module.download_history not in pricing_values
+    assert downloader_module.open_lseg_session not in pricing_values
+    assert downloader_module.close_lseg_session not in pricing_values
 
-    assert not any("lseg" in name for name in imported)
-    assert not any(name.endswith("downloader") for name in imported)
+
+def test_build_history_never_calls_core_downloader_directly(mocker):
+    """Behavioral boundary check: patches the real core.downloader.
+    download_history to raise if called at all, then exercises
+    build_history with database.get_history separately mocked. Would
+    fail loudly if pricing ever bypassed database.get_history and
+    reached into core.downloader directly."""
+    mock_download = mocker.patch(
+        "core.downloader.download_history",
+        side_effect=AssertionError(
+            "strategy_engine.pricing must never call core.downloader directly"
+        ),
+    )
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        return_value=_leg_df(["2026-01-02"], [96.80]),
+    )
+
+    instance = _fly_instance()
+    pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    mock_download.assert_not_called()

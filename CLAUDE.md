@@ -130,10 +130,11 @@ Key design points a future session needs:
 
 COMPLETED AND TESTED.
 
-Turns individual futures contracts into historical multi-leg strategy
-price series (spreads, flies, condors, and arbitrary custom weight/
-offset structures), generically rather than through per-strategy-name
-calculation paths. Retrieves all historical prices exclusively through
+Turns individual futures contracts into historical strategy price
+series — from a single outright contract to arbitrary multi-leg
+structures (spreads, flies, condors, custom weight/offset shapes) —
+generically rather than through per-strategy-name calculation paths.
+Retrieves all historical prices exclusively through
 `database.get_history` — never calls `core.downloader` or `lseg.data`
 directly.
 
@@ -152,10 +153,13 @@ tests/
 Key design points a future session needs:
 
 - A strategy is represented purely as data — `market_key`, `offsets`,
-  `weights`, `interval`, `price_field` — never as a named "spread"/
-  "fly"/"condor" code path. `StrategyDefinition.__post_init__` validates
-  eagerly: offsets must start at 0 and be strictly increasing, offsets/
-  weights must match in length (>= 2 legs), weights can't all be zero.
+  `weights`, `interval`, `price_field` — never as a named "outright"/
+  "spread"/"fly"/"condor" code path. `StrategyDefinition.__post_init__`
+  validates eagerly: offsets must start at 0 and be strictly increasing,
+  offsets/weights must match in length (>= 1 leg — single-leg outrights,
+  e.g. `offsets=(0,)`/`weights=(1,)`, are first-class so outright
+  range/volatility behavior can later be benchmarked against multi-leg
+  strategies through the same pipeline), weights can't all be zero.
 - `generate_instances(definition, contract_start, contract_end)`
   produces rolling `StrategyInstance`s (concrete RIC tuples) by
   delegating entirely to `core.futures_calendar.generate_contracts` +
@@ -193,13 +197,32 @@ Key design points a future session needs:
   DataFrame columns — `StrategyHistory.history` stays a clean,
   purely-numeric frame (`Date`, `Leg_1..Leg_N`, `Strategy`) for Module
   5's analytics to consume directly.
-- `price_field` (default `"Close"`) is validated against a small
-  whitelist in `definitions.py`, not a hard-coded literal — adding
-  `"Open"`/`"VWAP"`/etc. later is a one-line change.
+- `price_field` (default `"Close"`) is validated against a whitelist in
+  `definitions.py` — `{"Open", "High", "Low", "Close"}`, all four
+  already present in `database.get_history`'s canonical output, so
+  selecting any of them is pure column selection with no data-layer
+  change. `VWAP`/settlement/bid-ask are deliberately excluded (not in
+  that schema); adding a genuinely new field later means a data-layer
+  change first, then a one-line whitelist addition here.
+- The `core.downloader`/`lseg.data` boundary is enforced structurally,
+  not via a source-text/string-matching test (rejected as brittle — it
+  false-positives on this module's own docstrings and proves nothing
+  about actual behavior): one test inspects `strategy_engine.pricing`'s
+  live module namespace for the actual `core.downloader` function
+  objects by identity (catches even a renamed import), and another
+  patches `core.downloader.download_history` to raise if called at all
+  while exercising `build_history`/`generate_histories` with
+  `database.get_history` separately mocked.
 - Single-market strategies only (`StrategyDefinition.market_key` is
   singular) — cross-market relative-value legs are out of scope for
   this module.
-- Test suite: 129/129 passing (97 pre-existing + 32 new) locally with
+- `core.config.ListingCycle` has no serial/hybrid support (a pre-existing
+  config.py TODO — CME SOFR also lists monthly serials alongside
+  quarterlies, unsupported today). Module 3 deliberately does not solve
+  this: it uses whatever `listing_cycle` each market currently declares
+  in `core.config.MARKETS` as-is. Adding a hybrid cycle is an orthogonal
+  `core.config`/`core.futures_calendar` change, out of scope here.
+- Test suite: 139/139 passing (97 pre-existing + 42 new) locally with
   the pinned `requirements.txt` versions installed.
 
 ---

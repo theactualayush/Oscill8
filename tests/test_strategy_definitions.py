@@ -12,6 +12,14 @@ from core.config import BarInterval
 from strategy_engine.definitions import StrategyDefinition
 
 
+def test_outright_definition_is_valid():
+    d = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1,), interval=BarInterval.DAILY,
+    )
+    assert d.offsets == (0,)
+    assert d.weights == (1,)
+
+
 def test_spread_definition_is_valid():
     d = StrategyDefinition(
         market_key="SOFR", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
@@ -70,9 +78,9 @@ def test_mismatched_offsets_and_weights_length_raises():
         )
 
 
-def test_single_leg_raises():
+def test_zero_legs_raises():
     with pytest.raises(ValueError):
-        StrategyDefinition(market_key="SOFR", offsets=(0,), weights=(1,), interval=BarInterval.DAILY)
+        StrategyDefinition(market_key="SOFR", offsets=(), weights=(), interval=BarInterval.DAILY)
 
 
 def test_offsets_not_starting_at_zero_raises():
@@ -94,6 +102,23 @@ def test_all_zero_weights_raises():
         StrategyDefinition(
             market_key="SOFR", offsets=(0, 1), weights=(0, 0), interval=BarInterval.DAILY
         )
+
+
+def test_single_zero_weight_outright_raises():
+    with pytest.raises(ValueError):
+        StrategyDefinition(market_key="SOFR", offsets=(0,), weights=(0,), interval=BarInterval.DAILY)
+
+
+@pytest.mark.parametrize("price_field", ["Open", "High", "Low", "Close"])
+def test_supported_price_fields_are_valid(price_field):
+    d = StrategyDefinition(
+        market_key="SOFR",
+        offsets=(0, 1),
+        weights=(1, -1),
+        interval=BarInterval.DAILY,
+        price_field=price_field,
+    )
+    assert d.price_field == price_field
 
 
 def test_unsupported_price_field_raises():
