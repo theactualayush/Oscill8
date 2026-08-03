@@ -63,17 +63,46 @@ def test_price_bar_allows_same_datetime_different_ric(db_session):
 # Nullability
 # ---------------------------------------------------------------------
 
-def test_price_bar_missing_required_field_raises_on_flush(db_session):
+def test_price_bar_allows_missing_ohlcv_field(db_session):
+    # LSEG can legitimately return a bar (e.g. a thin HOURLY bar with no
+    # trade printed) where some OHLCV fields have no value while others
+    # do -- individually nullable, not dropped or fabricated.
     bar = PriceBar(
         ric="SRAZ26",
-        interval="DAILY",
+        interval="HOURLY",
         datetime=datetime(2026, 1, 1),
         open=100.0,
         high=101.0,
         low=99.0,
-        close=None,  # missing required field
+        close=None,  # e.g. no trade printed in this hour
         volume=1000.0,
     )
+    db_session.add(bar)
+    db_session.commit()  # should not raise
+
+    stored = db_session.query(PriceBar).one()
+    assert stored.close is None
+    assert stored.open == 100.0
+
+
+def test_price_bar_allows_all_ohlcv_fields_missing(db_session):
+    bar = PriceBar(
+        ric="SRAZ26",
+        interval="HOURLY",
+        datetime=datetime(2026, 1, 1),
+        open=None,
+        high=None,
+        low=None,
+        close=None,
+        volume=None,
+    )
+    db_session.add(bar)
+    db_session.commit()  # should not raise
+
+
+@pytest.mark.parametrize("missing_field", ["ric", "interval", "datetime"])
+def test_price_bar_identity_fields_remain_mandatory(db_session, missing_field):
+    bar = _make_bar(**{missing_field: None})
     db_session.add(bar)
     with pytest.raises(IntegrityError):
         db_session.commit()

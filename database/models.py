@@ -30,6 +30,22 @@ class PriceBar(Base):
     RIC + interval + datetime is unique at the database level (not just
     application logic) so duplicate bars can never be created, even if
     caller-side range bookkeeping has a bug.
+
+    open/high/low/close/volume are individually nullable: LSEG can
+    legitimately return an hourly (or synthesized 4H) bar where some
+    OHLCV fields have no value (e.g. no trade printed within that hour)
+    while others do -- a bar with a valid Close but missing Open/High/
+    Low is still real and usable (e.g. for a Close-based strategy), so
+    it is persisted with SQL NULL in the missing fields rather than
+    dropped or filled with a fabricated value. ric/interval/datetime
+    remain mandatory -- a bar's identity must always be complete.
+
+    MIGRATION NOTE: this nullability was tightened from NOT NULL to
+    NULLABLE. database.connection.init_db() only creates missing
+    tables (SQLAlchemy's create_all does not alter existing ones), so
+    any pre-existing local data/oscill8.db created under the old NOT
+    NULL schema must be deleted and rebuilt once -- it is a pure LSEG
+    cache and fully re-fetchable, so this loses no real data.
     """
 
     __tablename__ = "price_bars"
@@ -38,11 +54,11 @@ class PriceBar(Base):
     ric: Mapped[str] = mapped_column(String(32), nullable=False)
     interval: Mapped[str] = mapped_column(String(8), nullable=False)
     datetime: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    open: Mapped[float] = mapped_column(Float, nullable=False)
-    high: Mapped[float] = mapped_column(Float, nullable=False)
-    low: Mapped[float] = mapped_column(Float, nullable=False)
-    close: Mapped[float] = mapped_column(Float, nullable=False)
-    volume: Mapped[float] = mapped_column(Float, nullable=False)
+    open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("ric", "interval", "datetime", name="uq_price_bars_ric_interval_dt"),

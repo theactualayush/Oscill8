@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import pytest
+from sqlalchemy import select
 
 from database import cache
+from database.models import PriceBar
 
 _CANONICAL_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
 
@@ -81,6 +84,72 @@ def test_insert_bars_empty_dataframe_is_noop(db_session):
 
 
 # ---------------------------------------------------------------------
+# insert_bars: missing OHLCV fields (regression for the real HOURLY
+# SRAZ26 bug -- TypeError: float() argument ... not 'NAType')
+# ---------------------------------------------------------------------
+
+def test_insert_bars_persists_np_nan_as_sql_null(db_session):
+    df = _make_df(["2026-07-01"])
+    df.loc[0, "Open"] = np.nan
+
+    n = cache.insert_bars(db_session, "SRAZ26", "HOURLY", df)
+    assert n == 1
+
+    row = db_session.execute(select(PriceBar).where(PriceBar.ric == "SRAZ26")).scalar_one()
+    assert row.open is None  # SQL NULL, not a stored NaN float
+
+
+def test_insert_bars_persists_pd_na_as_sql_null(db_session):
+    df = _make_df(["2026-07-01"])
+    df["High"] = pd.array([pd.NA], dtype="Float64")
+
+    n = cache.insert_bars(db_session, "SRAZ26", "HOURLY", df)
+    assert n == 1
+
+    row = db_session.execute(select(PriceBar).where(PriceBar.ric == "SRAZ26")).scalar_one()
+    assert row.high is None
+
+
+def test_insert_bars_persists_none_as_sql_null(db_session):
+    df = _make_df(["2026-07-01"])
+    df["Low"] = df["Low"].astype(object)
+    df.loc[0, "Low"] = None
+
+    n = cache.insert_bars(db_session, "SRAZ26", "HOURLY", df)
+    assert n == 1
+
+    row = db_session.execute(select(PriceBar).where(PriceBar.ric == "SRAZ26")).scalar_one()
+    assert row.low is None
+
+
+def test_insert_bars_real_number_still_persists_normally(db_session):
+    df = _make_df(["2026-07-01"], seed=100.0)
+    cache.insert_bars(db_session, "SRAZ26", "HOURLY", df)
+
+    row = db_session.execute(select(PriceBar).where(PriceBar.ric == "SRAZ26")).scalar_one()
+    assert row.open == pytest.approx(100.0)
+
+
+def test_insert_bars_partial_ohlc_bar_with_valid_close_is_kept(db_session):
+    # The exact real-world shape from the bug report: an hourly bar with
+    # no trade printed (Open/High/Low missing) but a valid Close.
+    df = _make_df(["2026-07-01"])
+    df.loc[0, ["Open", "High", "Low"]] = np.nan
+
+    n = cache.insert_bars(db_session, "SRAZ26", "HOURLY", df)
+    assert n == 1  # the bar is kept, not dropped
+
+    out = cache.read_bars(
+        db_session, "SRAZ26", "HOURLY", datetime(2026, 7, 1), datetime(2026, 7, 1)
+    )
+    assert len(out) == 1
+    assert np.isnan(out["Open"].iloc[0])
+    assert np.isnan(out["High"].iloc[0])
+    assert np.isnan(out["Low"].iloc[0])
+    assert out["Close"].iloc[0] == pytest.approx(df["Close"].iloc[0])
+
+
+# ---------------------------------------------------------------------
 # read_bars
 # ---------------------------------------------------------------------
 
@@ -112,6 +181,39 @@ def test_read_bars_output_matches_downloader_canonical_schema(db_session):
     assert str(out["Date"].dtype) == "datetime64[ns]"
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         assert str(out[col].dtype) == "float64"
+
+
+def test_read_bars_sql_null_round_trips_to_np_nan_float64(db_session):
+    # Insert a row with a genuine SQL NULL directly via the ORM (bypassing
+    # insert_bars entirely) so this isolates read_bars' own reconstruction
+    # behavior: SQL NULL must come back as np.nan in a float64 column, not
+    # None/object dtype/pd.NA.
+    db_session.add(
+        PriceBar(
+            ric="SRAZ26",
+            interval="HOURLY",
+            datetime=datetime(2026, 7, 1, 9, 0),
+            open=None,
+            high=100.5,
+            low=None,
+            close=100.2,
+            volume=None,
+        )
+    )
+    db_session.commit()
+
+    out = cache.read_bars(
+        db_session, "SRAZ26", "HOURLY", datetime(2026, 7, 1), datetime(2026, 7, 1, 23, 59, 59)
+    )
+
+    assert len(out) == 1
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        assert out[col].dtype == np.float64
+    assert np.isnan(out["Open"].iloc[0])
+    assert np.isnan(out["Low"].iloc[0])
+    assert np.isnan(out["Volume"].iloc[0])
+    assert out["High"].iloc[0] == pytest.approx(100.5)
+    assert out["Close"].iloc[0] == pytest.approx(100.2)
 
 
 # ---------------------------------------------------------------------

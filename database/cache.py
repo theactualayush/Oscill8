@@ -60,6 +60,22 @@ def _upsert_statement(engine: Engine, records: list[dict]):
     return stmt.on_conflict_do_nothing(index_elements=["ric", "interval", "datetime"])
 
 
+def _to_nullable_float(value) -> float | None:
+    """Convert one OHLCV cell to a persistable value: None for any
+    representation of "missing" (np.nan, pd.NA, None -- pd.isna catches
+    all three), float(value) otherwise.
+
+    None is passed straight through to SQLAlchemy, which binds it as
+    SQL NULL -- the genuinely-correct representation of a missing
+    market-data field, distinct from a real (if unusual) float value.
+    Calling float() directly on a raw cell would raise TypeError on
+    pd.NA (it isn't a float subtype) and would silently store an
+    ordinary NaN float in what should be a NULL for a plain np.nan
+    input if this conversion weren't done explicitly.
+    """
+    return None if pd.isna(value) else float(value)
+
+
 def insert_bars(session: Session, ric: str, interval: str, df: pd.DataFrame) -> int:
     """Upsert canonical-schema OHLCV bars into price_bars.
 
@@ -88,11 +104,11 @@ def insert_bars(session: Session, ric: str, interval: str, df: pd.DataFrame) -> 
             "ric": ric,
             "interval": interval,
             "datetime": pd.Timestamp(row.Date).to_pydatetime(),
-            "open": float(row.Open),
-            "high": float(row.High),
-            "low": float(row.Low),
-            "close": float(row.Close),
-            "volume": float(row.Volume),
+            "open": _to_nullable_float(row.Open),
+            "high": _to_nullable_float(row.High),
+            "low": _to_nullable_float(row.Low),
+            "close": _to_nullable_float(row.Close),
+            "volume": _to_nullable_float(row.Volume),
         }
         for row in df.itertuples(index=False)
     ]

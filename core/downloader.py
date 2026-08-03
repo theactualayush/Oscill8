@@ -149,7 +149,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out[_CANONICAL_COLUMNS]
     out["Date"] = pd.to_datetime(out["Date"])
     for col in ["Open", "High", "Low", "Close", "Volume"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+        # pd.to_numeric preserves a pandas nullable extension dtype (e.g.
+        # "Float64") if the input already has one, which represents a
+        # missing value as pd.NA rather than np.nan. LSEG can legitimately
+        # return such a column for a thin intraday bar (e.g. an hourly
+        # bucket with no trade printed) -- explicitly cast to plain numpy
+        # float64 so every downstream consumer only ever sees np.nan for
+        # a missing value, never pd.NA. The missing value itself is
+        # preserved, not filled or dropped.
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
 
     return out.sort_values("Date").reset_index(drop=True)
 

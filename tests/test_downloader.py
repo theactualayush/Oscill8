@@ -15,6 +15,7 @@ from datetime import date
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -170,6 +171,44 @@ def test_normalize_columns_missing_field_raises_clear_error():
     raw = _make_lseg_df(["2026-07-01"]).drop(columns=["CLOSE"])
     with pytest.raises(ValueError, match="Could not find a column for 'Close'"):
         downloader._normalize_columns(raw)
+
+
+def test_normalize_columns_output_is_plain_float64():
+    # Regression: every OHLCV column must be plain numpy float64, never a
+    # pandas nullable extension dtype (which would carry pd.NA through to
+    # database.cache.insert_bars and crash it).
+    raw = _make_lseg_df(["2026-07-01", "2026-07-02"])
+    out = downloader._normalize_columns(raw)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        assert out[col].dtype == np.float64
+        assert not pd.api.types.is_extension_array_dtype(out[col])
+
+
+def test_normalize_columns_pd_na_becomes_np_nan_float64():
+    # Regression for the real HOURLY SRAZ26 bug: a thin intraday bar can
+    # legitimately have a missing OHLC field. If LSEG (or pandas) hands
+    # that back via a nullable extension dtype, the value arrives as
+    # pd.NA -- normalization must convert it to np.nan in a plain
+    # float64 column, not pass pd.NA through untouched.
+    raw = _make_lseg_df(["2026-07-01", "2026-07-02"])
+    raw["OPEN"] = pd.array([raw["OPEN"].iloc[0], pd.NA], dtype="Float64")
+
+    out = downloader._normalize_columns(raw)
+
+    assert out["Open"].dtype == np.float64
+    assert np.isnan(out["Open"].iloc[1])
+    assert not isinstance(out["Open"].iloc[1], type(pd.NA))
+
+
+def test_normalize_columns_preserves_missing_value_does_not_fill_or_drop():
+    raw = _make_lseg_df(["2026-07-01", "2026-07-02"])
+    raw["OPEN"] = pd.array([raw["OPEN"].iloc[0], pd.NA], dtype="Float64")
+
+    out = downloader._normalize_columns(raw)
+
+    assert len(out) == 2  # the bar with a missing Open is not dropped
+    assert np.isnan(out["Open"].iloc[1])  # not filled with a fabricated value
+    assert not np.isnan(out["Close"].iloc[1])  # other fields on that bar are untouched
 
 
 # ---------------------------------------------------------------------

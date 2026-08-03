@@ -112,6 +112,31 @@ def test_get_history_no_cache_downloads_full_range_and_persists(mocker, db_sessi
     assert len(ranges) == 1
 
 
+def test_get_history_persists_and_returns_a_partial_ohlc_bar(mocker, db_session):
+    # Regression, end-to-end: a bar with a legitimately missing field
+    # (e.g. an HOURLY bar with no trade printed) must not blow up
+    # persistence, and must still be marked as synced so it isn't
+    # re-downloaded forever.
+    partial = _make_df(["2020-01-01"])
+    partial.loc[0, "Open"] = float("nan")
+    mock_download = mocker.patch("database.service.download_history", return_value=partial)
+
+    result = service.get_history("SRAZ26", "DAILY", "2020-01-01", "2020-01-01")
+
+    assert mock_download.call_count == 1
+    assert len(result) == 1
+    assert pd.isna(result["Open"].iloc[0])
+    assert result["Close"].iloc[0] == pytest.approx(partial["Close"].iloc[0])
+
+    ranges = cache.get_sync_ranges(db_session, "SRAZ26", "DAILY")
+    assert len(ranges) == 1  # still marked as synced despite the missing field
+
+    mock_download.reset_mock()
+    cached = service.get_history("SRAZ26", "DAILY", "2020-01-01", "2020-01-01")
+    assert mock_download.call_count == 0  # served from cache, not re-downloaded
+    assert pd.isna(cached["Open"].iloc[0])
+
+
 # ---------------------------------------------------------------------
 # get_history: fully cached
 # ---------------------------------------------------------------------
