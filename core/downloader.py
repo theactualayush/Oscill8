@@ -57,11 +57,23 @@ def open_lseg_session() -> None:
     logger.info("Opening LSEG session (%s)...", config.LSEG_SESSION_TYPE)
     try:
         if config.LSEG_APP_KEY:
-            ld.open_session(name=config.LSEG_SESSION_TYPE, app_key=config.LSEG_APP_KEY)
+            session = ld.open_session(name=config.LSEG_SESSION_TYPE, app_key=config.LSEG_APP_KEY)
         else:
-            ld.open_session(name=config.LSEG_SESSION_TYPE)
+            session = ld.open_session(name=config.LSEG_SESSION_TYPE)
         _session_open = True
-        logger.info("LSEG session opened successfully.")
+
+        # open_session() doesn't always raise on a non-open result (e.g. a
+        # pending/closed state from a misconfigured Workspace connection),
+        # so only claim success once the session actually confirms it.
+        open_state = getattr(session, "open_state", None)
+        if open_state is not None and str(open_state) != "OpenState.Opened":
+            logger.warning(
+                "LSEG open_session() call completed but reported state=%s "
+                "(expected OpenState.Opened) -- session may not be usable.",
+                open_state,
+            )
+        else:
+            logger.info("LSEG session opened successfully.")
     except Exception:
         logger.exception("Failed to open LSEG session.")
         raise
@@ -84,9 +96,12 @@ def close_lseg_session() -> None:
 # --------------------------------------------------------------------------
 
 # LSEG historical-pricing summaries can return slightly different field
-# names depending on asset class / interval / library version. This map
-# covers the common variants and normalizes them to our canonical
-# schema: Date, Open, High, Low, Close, Volume.
+# names depending on asset class / interval / library version -- e.g. a
+# live pull for SRAZ26 (SOFR) returns OPEN_PRC/HIGH_1/LOW_1/TRDPRC_1/
+# ACVOL_UNS, not the generic OPEN/HIGH/LOW/CLOSE/VOLUME names. This map
+# covers the known variants and normalizes them to our canonical
+# schema: Date, Open, High, Low, Close, Volume. Add more aliases here as
+# other markets/instruments turn out to use yet other vendor field names.
 _COLUMN_ALIASES = {
     "Open": {"OPEN", "OPEN_PRC", "OPEN_1"},
     "High": {"HIGH", "HIGH_1"},
@@ -165,12 +180,16 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
     import lseg.data as ld
 
     logger.debug("Fetching %s [%s -> %s] interval=%s", ric, start, end, native_interval)
+    # Some instruments (e.g. SRAZ26) reject the generic OPEN/HIGH/LOW/
+    # CLOSE/VOLUME field names outright. Request LSEG's own default field
+    # set per instrument instead (fields=None) and let _normalize_columns'
+    # alias table map whatever vendor-specific names come back.
     df = ld.get_history(
         universe=ric,
         interval=native_interval,
         start=start.isoformat(),
         end=end.isoformat(),
-        fields=["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
+        fields=None,
     )
     if df is None or df.empty:
         logger.warning("No data returned for %s [%s -> %s]", ric, start, end)

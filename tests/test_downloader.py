@@ -46,6 +46,9 @@ def reset_session_state():
     fake_lseg_data.open_session.reset_mock(side_effect=True)
     fake_lseg_data.close_session.reset_mock()
     fake_lseg_data.get_history.reset_mock(side_effect=True)
+    # Default to a healthy session state; individual tests override this
+    # return_value to simulate a non-open state.
+    fake_lseg_data.open_session.return_value = SimpleNamespace(open_state="OpenState.Opened")
     yield
 
 
@@ -84,6 +87,48 @@ def test_close_session_only_closes_if_open():
     assert fake_lseg_data.close_session.call_count == 1
 
 
+def test_open_session_logs_success_when_state_is_opened(mocker):
+    mock_logger = mocker.patch.object(downloader, "logger")
+    downloader.open_lseg_session()
+
+    assert any(
+        call.args and "opened successfully" in call.args[0]
+        for call in mock_logger.info.call_args_list
+    )
+    assert mock_logger.warning.call_count == 0
+
+
+def test_open_session_logs_warning_when_state_is_not_opened(mocker):
+    fake_lseg_data.open_session.return_value = SimpleNamespace(open_state="OpenState.Closed")
+    mock_logger = mocker.patch.object(downloader, "logger")
+
+    downloader.open_lseg_session()
+
+    assert mock_logger.warning.call_count == 1
+    assert not any(
+        call.args and "opened successfully" in call.args[0]
+        for call in mock_logger.info.call_args_list
+    )
+    # Idempotency is unaffected: open_session() itself didn't raise, so we
+    # still shouldn't call it again on the next download.
+    assert downloader._session_open is True
+
+
+def test_open_session_logs_success_when_state_unavailable(mocker):
+    # Some session objects may not expose open_state at all -- fall back
+    # to treating "no exception raised" as success rather than warning.
+    fake_lseg_data.open_session.return_value = object()
+    mock_logger = mocker.patch.object(downloader, "logger")
+
+    downloader.open_lseg_session()
+
+    assert mock_logger.warning.call_count == 0
+    assert any(
+        call.args and "opened successfully" in call.args[0]
+        for call in mock_logger.info.call_args_list
+    )
+
+
 # ---------------------------------------------------------------------
 # Column normalization
 # ---------------------------------------------------------------------
@@ -102,6 +147,23 @@ def test_normalize_columns_alias_names():
     )
     out = downloader._normalize_columns(raw)
     assert list(out.columns) == ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+
+def test_normalize_columns_srax26_live_field_names():
+    # Exact field names observed from a live LSEG Workspace pull for
+    # SRAZ26 -- it rejects the generic OPEN/HIGH/LOW/CLOSE/VOLUME names.
+    raw = _make_lseg_df(["2026-01-01", "2026-01-02"]).rename(
+        columns={
+            "OPEN": "OPEN_PRC",
+            "HIGH": "HIGH_1",
+            "LOW": "LOW_1",
+            "CLOSE": "TRDPRC_1",
+            "VOLUME": "ACVOL_UNS",
+        }
+    )
+    out = downloader._normalize_columns(raw)
+    assert list(out.columns) == ["Date", "Open", "High", "Low", "Close", "Volume"]
+    assert len(out) == 2
 
 
 def test_normalize_columns_missing_field_raises_clear_error():
@@ -147,6 +209,32 @@ def test_download_history_daily_basic():
     _, kwargs = fake_lseg_data.get_history.call_args
     assert kwargs["universe"] == "SRAZ26"
     assert kwargs["interval"] == "daily"
+    # Generic field names (e.g. "OPEN") are rejected for some instruments
+    # (SRAZ26) -- request LSEG's own default fields instead of a fixed list.
+    assert kwargs["fields"] is None
+
+
+def test_download_history_srax26_live_field_names_end_to_end():
+    # Reproduces the real LSEG Workspace response for SRAZ26: a call made
+    # without explicit fields returns OPEN_PRC/HIGH_1/LOW_1/TRDPRC_1/
+    # ACVOL_UNS rather than the generic OHLCV names.
+    raw = _make_lseg_df(["2026-01-01", "2026-01-02"]).rename(
+        columns={
+            "OPEN": "OPEN_PRC",
+            "HIGH": "HIGH_1",
+            "LOW": "LOW_1",
+            "CLOSE": "TRDPRC_1",
+            "VOLUME": "ACVOL_UNS",
+        }
+    )
+    fake_lseg_data.get_history.return_value = raw
+
+    df = downloader.download_history("SRAZ26", "DAILY", "2026-01-01", "2026-01-02")
+
+    assert list(df.columns) == ["Date", "Open", "High", "Low", "Close", "Volume"]
+    assert len(df) == 2
+    _, kwargs = fake_lseg_data.get_history.call_args
+    assert kwargs["fields"] is None
 
 
 def test_download_history_empty_result_returns_empty_frame_not_error():
