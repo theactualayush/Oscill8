@@ -33,6 +33,13 @@ def get_engine(db_path: str | None = None) -> Engine:
     A module-level engine is cached and reused when db_path is not given,
     so repeated calls with no arguments share one connection pool. Passing
     an explicit db_path (e.g. in tests) always returns a fresh engine.
+
+    The schema is guaranteed to exist on the default engine before it's
+    ever handed back -- init_db() runs once, right here, the first time
+    the default engine is created in this process. This is what lets a
+    completely fresh installation "just work" without a manual init_db()
+    call: every get_session()/get_history() call goes through this
+    singleton, so the one-time cost is paid on first use, not per query.
     """
     global _engine
 
@@ -41,6 +48,7 @@ def get_engine(db_path: str | None = None) -> Engine:
 
     if _engine is None:
         _engine = create_engine(f"sqlite:///{config.SQLITE_DB_PATH}")
+        init_db(_engine)
 
     return _engine
 
