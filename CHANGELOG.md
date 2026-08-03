@@ -14,9 +14,13 @@
 
 ---
 
-## v0.2.0 (In Progress)
+## v0.2.0
 
-### Planned
-- SQLite Cache Layer
-- Database Service
-- Automatic History Updates
+### Added
+- SQLite Cache Layer (`database/models.py`, `database/connection.py`)
+- Database Service (`database/cache.py`, `database/service.py`,
+  `get_history(ric, interval, start, end)`)
+- Automatic History Updates (cache-first, missing-range-only LSEG
+  downloads, sync-range coverage tracking)
+- Unit Tests (`tests/test_connection.py`, `tests/test_models.py`,
+  `tests/test_cache.py`, `tests/test_service.py`)
