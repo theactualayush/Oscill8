@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-import config
+from core import config
 
 # Reverse lookup: month letter code -> month number (built once from config)
 _CODE_TO_MONTH: dict[str, int] = {v: k for k, v in config.FUTURES_MONTH_CODES.items()}

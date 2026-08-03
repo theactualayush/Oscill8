@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-import futures_calendar as fc
+from core import futures_calendar as fc
 
 
 # ---------------------------------------------------------------------

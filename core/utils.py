@@ -13,7 +13,7 @@ import sys
 from datetime import date, datetime
 from typing import Union
 
-import config
+from core import config
 
 DateLike = Union[str, date, datetime]
 

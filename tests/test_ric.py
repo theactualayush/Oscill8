@@ -10,7 +10,7 @@ from datetime import date
 
 import pytest
 
-import ric
+from core import ric
 
 
 def test_build_ric_sofr():

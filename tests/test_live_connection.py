@@ -22,10 +22,10 @@ from __future__ import annotations
 import sys
 from datetime import date, timedelta
 
-import config
-import ric
-from downloader import close_lseg_session, download_history, open_lseg_session
-from utils import get_logger
+from core import config
+from core import ric
+from core.downloader import close_lseg_session, download_history, open_lseg_session
+from core.utils import get_logger
 
 logger = get_logger(__name__)
 

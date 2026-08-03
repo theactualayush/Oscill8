@@ -27,9 +27,9 @@ from tenacity import (
     wait_exponential,
 )
 
-import config
-from config import BarInterval
-from utils import get_logger, to_date, DateLike
+from core import config
+from core.config import BarInterval
+from core.utils import get_logger, to_date, DateLike
 
 logger = get_logger(__name__)
 

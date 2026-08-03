@@ -34,9 +34,9 @@ fake_lseg_data.open_session = MagicMock()
 fake_lseg_data.close_session = MagicMock()
 fake_lseg_data.get_history = MagicMock()
 
-import config  # noqa: E402
-import downloader  # noqa: E402
-from config import BarInterval  # noqa: E402
+from core import config
+from core import downloader
+from core.config import BarInterval  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
