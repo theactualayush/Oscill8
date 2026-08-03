@@ -168,11 +168,20 @@ class MarketDefinition:
     tick_value: Value of one tick, in the contract's local currency.
         Used later by analytics/risk modules; not needed by the
         downloader itself.
+    bp_per_point: Price-point -> basis-point multiplier for this
+        market's quoting convention (e.g. 100.0 for a standard STIR
+        "100 - rate" quote, where 0.01 price points = 1bp). Required,
+        deliberately with no default -- range_analytics (Module 4)
+        converts price-unit diagnostics to bp via this field rather
+        than a hard-coded *100, and a market that forgets to state its
+        own convention should fail loudly at registration time rather
+        than silently inherit an assumption that may not hold for it.
     """
 
     name: str
     ric_root: str
     exchange: str
+    bp_per_point: float
     ric_year_digits: int = 2
     verified: bool = True
     listing_cycle: ListingCycle = ListingCycle.QUARTERLY
@@ -186,6 +195,7 @@ MARKETS: dict[str, MarketDefinition] = {
         name="SOFR (3M)",
         ric_root="SRA",
         exchange="CME",
+        bp_per_point=100.0,
         ric_year_digits=2,
         verified=True,
         listing_cycle=ListingCycle.QUARTERLY,
@@ -197,6 +207,7 @@ MARKETS: dict[str, MarketDefinition] = {
         name="Fed Funds (30-Day)",
         ric_root="FF",
         exchange="CME",
+        bp_per_point=100.0,
         ric_year_digits=2,
         verified=False,
         listing_cycle=ListingCycle.MONTHLY,
@@ -216,6 +227,7 @@ MARKETS: dict[str, MarketDefinition] = {
         name="SONIA (3M)",
         ric_root="SFI",
         exchange="ICE",
+        bp_per_point=100.0,
         ric_year_digits=1,
         verified=False,
         tick_value=12.50,
@@ -226,6 +238,7 @@ MARKETS: dict[str, MarketDefinition] = {
         name="CORRA (3M)",
         ric_root="CRA",
         exchange="MX",
+        bp_per_point=100.0,
         ric_year_digits=1,
         verified=False,
         tick_value=12.50,
@@ -236,6 +249,7 @@ MARKETS: dict[str, MarketDefinition] = {
         name="Euro Short-Term Rate (€STR)",
         ric_root="ESR",
         exchange="ICE",
+        bp_per_point=100.0,
         ric_year_digits=1,
         verified=False,
         tick_value=12.50,
