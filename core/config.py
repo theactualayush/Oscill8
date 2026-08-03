@@ -32,6 +32,15 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Repo root (parent of core/) and the SQLite market-data cache path (Module 2:
+# database/). Directory creation for the DB file is database/connection.py's
+# responsibility at call time, not a side effect of importing this module.
+REPO_ROOT_DIR = os.path.dirname(BASE_DIR)
+SQLITE_DB_PATH = os.environ.get(
+    "RBS_SQLITE_PATH",
+    os.path.join(REPO_ROOT_DIR, "data", "oscill8.db"),
+)
+
 
 # --------------------------------------------------------------------------
 # Database settings (PostgreSQL)
