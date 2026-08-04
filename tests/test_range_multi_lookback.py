@@ -291,7 +291,12 @@ def test_short_history_truncates_and_over_requested_lookbacks_collapse():
     # the three over-requested lookbacks all silently truncate to the same
     # 50-row window -- numerically identical results, not distinct
     # comparisons, exactly the risk lookbacks_effective exists to surface.
-    assert result.per_lookback[2] == result.per_lookback[3] == result.per_lookback[4]
+    # NaN-aware comparison: RangeAnalytics has no custom __eq__, so plain
+    # `==` on two otherwise-identical results fails whenever a field is
+    # genuinely NaN in both (e.g. ar1_r_squared, half_life for this
+    # perfectly-linear fixture), since NaN != NaN under IEEE 754.
+    assert _fields_equal(result.per_lookback[2], result.per_lookback[3])
+    assert _fields_equal(result.per_lookback[3], result.per_lookback[4])
 
 
 # ---------------------------------------------------------------------
