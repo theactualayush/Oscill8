@@ -1,40 +1,137 @@
-# Range Bound Strategy Scanner — Module 1: LSEG Downloader
+# Oscill8 — Range-Bound Strategy Scanner
 
-## Status: Built & unit-tested (32/32 passing). Live LSEG connectivity NOT yet verified — run `test_live_connection.py` on a machine with Workspace open.
+Oscill8 is an internal quantitative research application for discovering
+range-bound relative-value opportunities across global interest-rate
+futures markets (SOFR, Fed Funds, SONIA, CORRA, and Eurozone STIR / €STR).
 
-## Files in this module
-- `config.py`     — market registry (RICs), interval definitions, DB/session settings (pure data, no logic)
-- `ric.py`        — RIC construction (`build_ric`) and parsing (`parse_ric`)
-- `utils.py`      — logging + date helpers
-- `downloader.py` — `download_history(ric, interval, start, end)` -> DataFrame
-- `tests/test_downloader.py` — unit tests (LSEG mocked)
-- `tests/test_ric.py` — unit tests for RIC build/parse, incl. round-trip tests
-- `test_live_connection.py` — **run this manually** against live Workspace (not pytest)
+The system generates multi-leg strategy candidates (outrights, spreads,
+flies, condors, and arbitrary custom weight/offset shapes), builds their
+historical price series, measures range-bound behaviour, and — once the
+scanner layer lands — will let a trader filter and rank candidates through
+a grid-style interface before drilling into a chosen strategy's chart and
+analytics.
 
-## Changes since last review
-1. **SOFR RIC root fixed**: `SR3` → `SRA` (confirmed via your Workspace).
-2. **Fed Funds flagged for re-verification**: `verified=False` until you confirm the root the same way SOFR was confirmed — don't trust `FF` yet.
-3. **`ric.py` added**: `build_ric()` moved out of `config.py` (which now stays pure data), plus new `parse_ric()` for going RIC → (market, month, year). Handles both 1-digit and 2-digit year conventions, with sensible near-term disambiguation for 1-digit years.
-4. **`test_live_connection.py` added**: run it directly (`python test_live_connection.py`) on your machine. It opens a real session, builds a near-term quarterly RIC for each *verified* market, pulls DAILY/HOURLY/4H bars, and prints PASS/FAIL/WARN per market+interval. Unverified markets (currently Fed Funds, SONIA, CORRA, €STR) are automatically skipped with a clear message rather than tested against a guessed RIC.
+## Architecture
 
-## What's verified (via mocked/unit tests, no live session needed)
-- Session open/close is idempotent
-- Column normalization handles multiple LSEG field-name variants, fails loudly with actual columns received if none match
-- Date range chunking for intraday pulls is gapless and non-overlapping
-- Retry logic (3 attempts, exponential backoff)
-- 4H bars correctly synthesized from hourly bars (O=first, H=max, L=min, C=last, V=sum)
-- `build_ric` / `parse_ric` round-trip correctly for both 1- and 2-digit-year markets
+```
+LSEG Workspace
+      ↓
+LSEG Downloader        (core/)
+      ↓
+SQLite Cache            (database/)
+      ↓
+Strategy Engine         (strategy_engine/)
+      ↓
+Range-Bound Analytics   (range_analytics/)
+      ↓
+Template / Candidate Universe Engine   (template_scanner/)
+      ↓
+Scanner / UI            (planned)
+```
 
-## What YOU still need to do
-1. **Run `test_live_connection.py`** with Workspace open — confirms real connectivity end to end.
-2. **Confirm the Fed Funds RIC root** the same way you confirmed SOFR (`SRA`), then flip `verified=True` in `config.py`.
-3. **Verify SONIA / CORRA / €STR RIC roots** via `ld.discovery.search(...)` or chain search, same process.
-4. If `_normalize_columns` raises a `ValueError` naming unmatched columns, add the alias to `_COLUMN_ALIASES` in `downloader.py` — one-line fix.
+Only the data/downloader layer (`core/`) talks to LSEG. Every layer above
+it operates on normalized Pandas DataFrames and has no LSEG dependency —
+enforced by tests, not just convention.
 
-## Run tests
+## Completed modules
+
+- **Module 1 — LSEG Data Layer** (`core/`): `download_history(ric, interval,
+  start, end)` pulls historical OHLCV bars from LSEG Workspace, with RIC
+  construction/parsing (`ric.py`), the futures calendar (`futures_calendar.py`),
+  and the market registry (`config.py`).
+- **Module 2 — SQLite Market-Data Cache** (`database/`): `get_history(ric,
+  interval, start, end)` is the single public entry point — cache-first,
+  fetches only the missing range from LSEG, persists it, and returns the
+  complete series. Callers never need to know whether data came from LSEG
+  or SQLite.
+- **Module 3 — Strategy Engine** (`strategy_engine/`): turns individual
+  futures contracts into historical multi-leg strategy price series.
+  `StrategyDefinition` represents a strategy generically (market, leg
+  offsets, leg weights) rather than through per-strategy-name code paths —
+  a single-leg outright and an arbitrary N-leg structure go through the
+  same path. `generate_instances()` rolls a definition across a market's
+  contract curve; `build_history()` / `generate_histories()` fetch and
+  weight-combine each leg's price history via `database.get_history`.
+- **Module 4A — Range-Bound Analytics** (`range_analytics/`): `analyze_range()`
+  computes range/location, movement, oscillation, and mean-reversion
+  diagnostics for a `StrategyHistory` over a selected window.
+- **Module 4B — Multi-Lookback / Stability Analytics** (`range_analytics/`):
+  `analyze_multi_lookback()` re-runs Module 4A's measurements across
+  multiple lookback windows and describes how they move relative to each
+  other (dispersion, short-vs-long change, step structure).
+- **Module 5A — Template / Candidate Universe Engine** (`template_scanner/`):
+  see below.
+
+## Supported intervals
+
+- `DAILY`
+- `HOURLY`
+- `4H` (synthesized from `HOURLY` bars, not a native LSEG interval)
+
+## Module 5A: templates and candidate generation
+
+A strategy shape can be specified as a dense grid of per-position weights,
+where `0` means "no leg at this curve position" (a gap). Examples:
+
+```
+(1, -2, 1)          outright fly
+(1, -1)              outright spread
+(1, 0, -2, 0, 1)     gapped fly
+(1, -3, 3, -1)       condor-style shape
+(2, 0, -1, 0, -1)    gapped, non-unit-ratio shape
+```
+
+`template_from_dense_weights()` translates a dense vector like these into
+a `StrategyDefinition` (sparse offsets + weights) — weights are preserved
+exactly as given and are **never normalized** (`(2, -4, 2)` stays
+`(2, -4, 2)`, distinct from `(1, -2, 1)`). `generate_candidates()` /
+`generate_candidate_universe()` then roll one or many templates across a
+market's eligible contracts (with optional curve-depth and eligible-RIC
+filters) into a deduplicated universe of candidate `StrategyInstance`s,
+ready to be priced by `strategy_engine` and measured by `range_analytics`.
+
+## Current limitations / deferred functionality
+
+- **Module 5B — Scanner/orchestration** (wiring candidates through pricing
+  and analytics, then filtering/ranking them) is not implemented yet.
+- **GENERIC continuous-curve mode** (curve-position history independent of
+  dated contracts) is not implemented — deliberately deferred until roll
+  semantics are approved.
+- **Intermarket strategies** (legs spanning more than one market) are not
+  implemented — deferred until cross-market contract alignment and
+  risk-normalization semantics are designed.
+- **Streamlit / UI** is not implemented yet.
+
+## Testing
+
 ```
 pip install -r requirements.txt
-pytest tests/ -v                    # unit tests, no live session needed
-python test_live_connection.py      # live smoke test, needs Workspace open
+pytest -v
 ```
 
+Current suite: **286 tests, all passing** (unit tests, LSEG fully mocked —
+no live session required). This is a snapshot from the module currently
+completed (5A); re-run the command above for the up-to-date count.
+
+`test_live_connection.py` is a manual smoke test, not part of the pytest
+suite — run it directly (`python test_live_connection.py`) on a machine
+with LSEG Workspace open. Only the `SOFR` market is currently marked
+`verified=True` in `core/config.py`; the other four markets' RIC roots are
+best-effort placeholders pending live verification.
+
+## Repository structure
+
+```
+core/              LSEG downloader, RIC build/parse, futures calendar, market config
+database/          SQLite cache (get_history) sitting between core and everything above it
+strategy_engine/   StrategyDefinition, rolling contract combinations, historical pricing
+range_analytics/   Range-bound (4A) and multi-lookback stability (4B) measurements
+template_scanner/  Dense-grid templates → candidate StrategyInstance universe (5A)
+tests/             Unit tests for every module above (pytest, LSEG mocked)
+```
+
+## Current status
+
+Module 5A (Template / Candidate Universe Engine) is complete and tested.
+**Module 5B — Scanner/orchestration** (candidate pricing, analytics, and
+filter/rank) is the next planned development step.
