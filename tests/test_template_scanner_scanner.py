@@ -1,0 +1,259 @@
+"""
+tests/test_template_scanner_scanner.py
+
+ScanRequest/run_scan()/analyze_histories() tested with
+database.get_history mocked at the strategy_engine.pricing boundary --
+the same pattern used in tests/test_strategy_pricing.py -- combined
+with real SOFR contract-calendar candidate generation (Module 5A,
+pure calendar arithmetic, no I/O) from tests/test_template_scanner_universe.py.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+
+import pandas as pd
+import pytest
+
+from core.config import BarInterval
+from strategy_engine.combinations import StrategyInstance
+from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.pricing import StrategyHistory
+from range_analytics import analyze_multi_lookback
+
+from template_scanner.scanner import ScanReport, ScanRequest, analyze_histories, run_scan
+from template_scanner.templates import template_from_dense_weights
+
+_DATES = pd.date_range("2020-01-01", periods=150, freq="D").strftime("%Y-%m-%d").tolist()
+_VALUES = ([0.98, 1.00, 1.02] * 60)[:150]
+
+
+def _leg_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Date": pd.to_datetime(_DATES),
+            "Open": _VALUES,
+            "High": _VALUES,
+            "Low": _VALUES,
+            "Close": _VALUES,
+            "Volume": [1000.0] * len(_DATES),
+        }
+    )
+
+
+def _spread():
+    return template_from_dense_weights("SOFR", (1, -1), BarInterval.DAILY)
+
+
+def _fly():
+    return template_from_dense_weights("SOFR", (1, -2, 1), BarInterval.DAILY)
+
+
+def _fields_equal(a, b) -> bool:
+    """NaN-tolerant equality for dataclasses/tuples/floats, same helper
+    pattern as tests/test_range_multi_lookback.py."""
+    if isinstance(a, float) and isinstance(b, float):
+        if math.isnan(a) and math.isnan(b):
+            return True
+        return a == b
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(_fields_equal(x, y) for x, y in zip(a, b))
+    if dataclasses.is_dataclass(a) and dataclasses.is_dataclass(b):
+        return all(
+            _fields_equal(getattr(a, f.name), getattr(b, f.name))
+            for f in dataclasses.fields(a)
+        )
+    return a == b
+
+
+# ---------------------------------------------------------------------
+# ScanRequest validation
+# ---------------------------------------------------------------------
+
+def test_scan_request_rejects_empty_definitions():
+    with pytest.raises(ValueError, match="definitions"):
+        ScanRequest(
+            definitions=(),
+            contract_start="2026-01-01", contract_end="2026-12-31",
+            price_start="2020-01-01", price_end="2020-06-30",
+        )
+
+
+def test_scan_request_rejects_price_start_after_price_end():
+    with pytest.raises(ValueError, match="price_start"):
+        ScanRequest(
+            definitions=(_spread(),),
+            contract_start="2026-01-01", contract_end="2026-12-31",
+            price_start="2020-06-30", price_end="2020-01-01",
+        )
+
+
+def test_scan_report_has_no_failures_field_in_v1():
+    # locks in the approved v1 simplification: exceptions propagate
+    # rather than being recorded, so ScanReport carries only results.
+    assert [f.name for f in dataclasses.fields(ScanReport)] == ["results"]
+
+
+# ---------------------------------------------------------------------
+# run_scan: candidate generation -> pricing -> analytics
+# ---------------------------------------------------------------------
+
+def test_run_scan_builds_one_result_per_deduped_candidate(mocker):
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20, 40),
+    )
+    report = run_scan(request)
+
+    # SOFR quarterly contracts in 2026: H26,M26,U26,Z26 -> 3 spread instances
+    assert len(report.results) == 3
+    assert {r.rics for r in report.results} == {
+        ("SRAH26", "SRAM26"), ("SRAM26", "SRAU26"), ("SRAU26", "SRAZ26"),
+    }
+
+
+def test_run_scan_preserves_exact_weights_for_scaled_and_unscaled_templates(mocker):
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    fly = _fly()
+    fly_2x = template_from_dense_weights("SOFR", (2, -4, 2), BarInterval.DAILY)
+    request = ScanRequest(
+        definitions=(fly, fly_2x),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    weight_sets = {r.weights for r in report.results}
+    assert weight_sets == {(1.0, -2.0, 1.0), (2.0, -4.0, 2.0)}
+
+
+def test_run_scan_dedupes_before_pricing(mocker):
+    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(_fly(), _fly()),  # identical template twice
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    # 2 unique fly instances (SRAH26-M26-U26, SRAM26-U26-Z26), each 3 legs,
+    # 2 legs shared between the two instances -> 4 distinct RICs total.
+    assert len(report.results) == 2
+    assert mock_get_history.call_count == 4
+
+
+def test_run_scan_shares_leg_cache_across_the_entire_scan(mocker):
+    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    run_scan(request)
+
+    # 3 spread instances over 4 quarterly contracts (H26,M26,U26,Z26) share
+    # M26/U26 across adjacent instances -> 4 distinct RICs fetched, not 6
+    # (3 instances x 2 legs) -- proves the leg_cache is shared, not
+    # per-instance.
+    assert mock_get_history.call_count == 4
+
+
+@pytest.mark.parametrize("interval", [BarInterval.DAILY, BarInterval.HOURLY, BarInterval.FOUR_HOUR])
+def test_run_scan_covers_all_supported_intervals(mocker, interval):
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(template_from_dense_weights("SOFR", (1, -1), interval),),
+        contract_start="2026-01-01", contract_end="2026-06-30",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    assert len(report.results) > 0
+    assert all(r.interval == interval for r in report.results)
+
+
+def test_run_scan_propagates_build_history_exceptions_uncaught(mocker):
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[_leg_df(), RuntimeError("simulated LSEG failure")],
+    )
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    with pytest.raises(RuntimeError, match="simulated LSEG failure"):
+        run_scan(request)
+
+
+def test_run_scan_no_data_candidate_is_a_result_not_an_exception(mocker):
+    empty = pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    mocker.patch("strategy_engine.pricing.get_history", return_value=empty)
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    assert len(report.results) == 3
+    assert all(math.isnan(r.multi_lookback.per_lookback[0].current_price) for r in report.results)
+
+
+# ---------------------------------------------------------------------
+# analyze_histories: mode-agnostic core, no drift from Module 4
+# ---------------------------------------------------------------------
+
+def test_analyze_histories_requires_no_io():
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1.0,), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26",))
+    history = StrategyHistory(
+        instance=instance,
+        price_field="Close",
+        history=pd.DataFrame(
+            {"Date": pd.to_datetime(_DATES), "Leg_1": _VALUES, "Strategy": _VALUES}
+        ),
+    )
+
+    report = analyze_histories([history], lookbacks=(20, 40))
+
+    assert len(report.results) == 1
+    assert report.results[0].rics == ("SRAH26",)
+
+
+def test_analyze_histories_matches_direct_analyze_multi_lookback_call():
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0, 1), weights=(1.0, -1.0), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26", "SRAM26"))
+    history = StrategyHistory(
+        instance=instance,
+        price_field="Close",
+        history=pd.DataFrame(
+            {"Date": pd.to_datetime(_DATES), "Leg_1": _VALUES, "Leg_2": _VALUES, "Strategy": _VALUES}
+        ),
+    )
+
+    via_scanner = analyze_histories([history], lookbacks=(20, 40, 60)).results[0].multi_lookback
+    direct = analyze_multi_lookback(history, lookbacks=(20, 40, 60))
+
+    assert _fields_equal(via_scanner, direct)
