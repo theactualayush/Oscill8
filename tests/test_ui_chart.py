@@ -81,6 +81,35 @@ def test_build_strategy_chart_title_reflects_lookback():
     assert "40 bars" in fig.layout.title.text
 
 
+def test_build_strategy_chart_title_reflects_percentile_range():
+    history = _history(100)
+    analytics = analyze_range(history, lookback=40, lower_percentile=25.0, upper_percentile=75.0)
+
+    fig = build_strategy_chart(history.history, lookback=40, analytics=analytics)
+
+    assert "P25-P75" in fig.layout.title.text
+
+
+def test_build_strategy_chart_default_percentile_range_in_title():
+    history = _history(100)
+    analytics = analyze_range(history, lookback=40)
+
+    fig = build_strategy_chart(history.history, lookback=40, analytics=analytics)
+
+    assert "P5-P95" in fig.layout.title.text
+
+
+def test_build_strategy_chart_includes_a_subtle_mean_line():
+    history = _history(100)
+    analytics = analyze_range(history, lookback=20)
+
+    fig = build_strategy_chart(history.history, lookback=20, analytics=analytics)
+
+    mean_lines = [s for s in fig.layout.shapes if s.type == "line"]
+    # at least Robust Low, Median, Robust High, Mean -- 4 hline shapes
+    assert len(mean_lines) >= 4
+
+
 def test_build_strategy_chart_handles_empty_window_gracefully():
     history = _history(0)
     analytics = analyze_range(history, lookback=20)  # NaN low/median/high on an empty window

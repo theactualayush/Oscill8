@@ -331,6 +331,24 @@ def test_analyze_multi_lookback_forbidden_classification_fields_are_absent():
 # 14. lookbacks validation
 # ---------------------------------------------------------------------
 
+def test_analyze_multi_lookback_forwards_percentiles_to_every_per_lookback_result():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+
+    result = analyze_multi_lookback(
+        history, lookbacks=(20, 40, 60), lower_percentile=25.0, upper_percentile=75.0
+    )
+
+    for r in result.per_lookback:
+        assert r.lower_percentile == 25.0
+        assert r.upper_percentile == 75.0
+
+    # cross-check against a direct analyze_range call at one lookback --
+    # the batched path must not silently diverge from the direct path.
+    direct = analyze_range(history, lookback=40, lower_percentile=25.0, upper_percentile=75.0)
+    assert _fields_equal(result.per_lookback[1], direct)
+
+
 def test_analyze_multi_lookback_rejects_empty_lookbacks():
     history = _history(_dates(10), [float(v) for v in range(10)])
     with pytest.raises(ValueError):

@@ -27,7 +27,12 @@ import streamlit as st
 
 from core.config import MARKETS, BarInterval
 
-from ui.formatting import CURVE_POSITION_HELP, PRIMARY_LOOKBACK_HELP, position_column
+from ui.formatting import (
+    CURVE_POSITION_HELP,
+    PERCENTILE_RANGE_HELP,
+    PRIMARY_LOOKBACK_HELP,
+    position_column,
+)
 
 _INTERVALS: tuple[BarInterval, ...] = (BarInterval.DAILY, BarInterval.HOURLY, BarInterval.FOUR_HOUR)
 _LOOKBACK_OPTIONS: tuple[int, ...] = (20, 40, 60, 90, 120)
@@ -35,6 +40,9 @@ _LOOKBACK_OPTIONS: tuple[int, ...] = (20, 40, 60, 90, 120)
 _DEFAULT_POSITIONS = 6
 _MIN_POSITIONS = 2
 _MAX_POSITIONS = 12
+
+_DEFAULT_LOWER_PERCENTILE = 5
+_DEFAULT_UPPER_PERCENTILE = 95
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,8 @@ class ScanSetup:
     price_end: date
     lookbacks: tuple[int, ...]
     display_lookback: int | None
+    lower_percentile: float
+    upper_percentile: float
     grid_rows: list[dict]
     position_columns: tuple[str, ...]
     run_clicked: bool
@@ -100,7 +110,7 @@ def render_scan_setup() -> ScanSetup:
 def _render_scan_bar() -> dict:
     today = date.today()
 
-    row1 = st.columns([1, 1, 2, 2])
+    row1 = st.columns([1, 1, 2, 2, 1.4])
     with row1[0]:
         market_key = st.selectbox(
             "Market", list(MARKETS.keys()), format_func=lambda k: MARKETS[k].name, key="oscill8_market"
@@ -133,6 +143,19 @@ def _render_scan_bar() -> dict:
         with h2:
             price_end = st.date_input(
                 "End", value=today, key="oscill8_price_end", label_visibility="collapsed",
+            )
+    with row1[4]:
+        st.caption("Percentile Range", help=PERCENTILE_RANGE_HELP)
+        p1, p2 = st.columns(2)
+        with p1:
+            lower_percentile = st.number_input(
+                "Lower", min_value=0, max_value=100, value=_DEFAULT_LOWER_PERCENTILE, step=1,
+                key="oscill8_lower_percentile", help=PERCENTILE_RANGE_HELP,
+            )
+        with p2:
+            upper_percentile = st.number_input(
+                "Upper", min_value=0, max_value=100, value=_DEFAULT_UPPER_PERCENTILE, step=1,
+                key="oscill8_upper_percentile", help=PERCENTILE_RANGE_HELP,
             )
 
     row2 = st.columns([3, 1.5, 1.5])
@@ -167,6 +190,8 @@ def _render_scan_bar() -> dict:
         "price_end": price_end,
         "lookbacks": lookbacks_sorted,
         "display_lookback": display_lookback,
+        "lower_percentile": float(lower_percentile),
+        "upper_percentile": float(upper_percentile),
         "run_clicked": run_clicked,
     }
 

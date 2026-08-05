@@ -63,6 +63,8 @@ def handle_run_scan(setup: ScanSetup) -> None:
             price_start=setup.price_start,
             price_end=setup.price_end,
             lookbacks=setup.lookbacks,
+            lower_percentile=setup.lower_percentile,
+            upper_percentile=setup.upper_percentile,
         )
     except ValueError as exc:
         st.error(str(exc))

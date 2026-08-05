@@ -125,6 +125,48 @@ def test_rank_results_no_composite_score_attribute_exists():
     assert field_names == {"accessor", "ascending"}
 
 
+# ---------------------------------------------------------------------
+# Z-score / absolute Z-score ranking
+# ---------------------------------------------------------------------
+
+# A noisy (non-degenerate) 19-bar background -- a single-outlier tail on
+# an otherwise-CONSTANT background has a known quirk where |Z| converges
+# to the same magnitude regardless of the outlier's size (an artifact of
+# the in-sample formula on a zero-variance background), so a genuinely
+# noisy background is used here to get real, distinguishable |Z| values.
+_NOISY_BACKGROUND = [99.0, 101.0] * 9 + [99.0]  # 19 bars
+
+
+def test_rank_results_by_z_score_ascending_and_descending():
+    below_mean = _candidate(_NOISY_BACKGROUND + [60.0], ("SRAH29",), lookbacks=(20,))
+    above_mean = _candidate(_NOISY_BACKGROUND + [130.0], ("SRAM29",), lookbacks=(20,))
+
+    accessor = at_lookback("z_score", 20)
+    z_below = accessor(below_mean)
+    z_above = accessor(above_mean)
+    assert z_below < 0 < z_above  # sanity check on the fixtures
+
+    ascending = rank_results([above_mean, below_mean], [SortKey(accessor, ascending=True)])
+    assert ascending == [below_mean, above_mean]
+
+    descending = rank_results([above_mean, below_mean], [SortKey(accessor, ascending=False)])
+    assert descending == [above_mean, below_mean]
+
+
+def test_rank_results_by_absolute_z_score_surfaces_largest_dislocation_first():
+    mild = _candidate(_NOISY_BACKGROUND + [101.0], ("SRAU29",), lookbacks=(20,))
+    severe_negative = _candidate(_NOISY_BACKGROUND + [60.0], ("SRAZ29",), lookbacks=(20,))
+
+    accessor = at_lookback("abs_z_score", 20)
+    assert accessor(mild) < accessor(severe_negative)  # sanity check on the fixtures
+
+    ranked_desc = rank_results([mild, severe_negative], [SortKey(accessor, ascending=False)])
+    assert ranked_desc == [severe_negative, mild]  # largest |Z| dislocation ranked first
+
+    ranked_asc = rank_results([mild, severe_negative], [SortKey(accessor, ascending=True)])
+    assert ranked_asc == [mild, severe_negative]
+
+
 def test_rank_results_by_derived_metric_accessor():
     # Regression: ranking by a derived Module 5 metric (not a direct
     # RangeAnalytics field) works end-to-end now that at_lookback()

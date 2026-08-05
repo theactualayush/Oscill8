@@ -210,14 +210,17 @@ def render_selection_and_chart(display_lookback: int, scan_request: ScanRequest 
         st.subheader("Selected Strategy")
         rank_prefix = f"#{rank}  " if rank is not None else ""
         st.write(f"**{rank_prefix}{summary['rics']}**")
-        st.caption(f"{summary['weights']} · {summary['interval']}")
+        st.caption(f"{summary['weights']} · {summary['interval']} · Robust Range · {summary['percentile_range_label']}")
 
-        labels = ["Current", "Median", "Robust Range", "Position", "ER"]
+        labels = ["Current", "Mean", "Median", "Robust Low", "Robust High", "Position", "Z-Score", "ER"]
         values = [
             summary["current"],
+            summary["mean"],
             summary["median"],
-            summary["robust_range"],
+            summary["robust_low"],
+            summary["robust_high"],
             summary["position"],
+            summary["z_score"],
             summary["efficiency_ratio"],
         ]
         for col, label, value in zip(st.columns(len(labels)), labels, values):

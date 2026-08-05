@@ -19,6 +19,7 @@ no ranking. Those are out of scope for this package (reserved for a
 future Module 5 Template/Scanner layer).
 """
 
+from range_analytics.location import validate_percentiles
 from range_analytics.lookback import resolve_window
 from range_analytics.mean_reversion import AR1Fit, fit_ar1
 from range_analytics.multi_lookback import (
@@ -45,4 +46,5 @@ __all__ = [
     "LookbackStability",
     "range_to_volatility_ratio",
     "robust_to_full_width_ratio",
+    "validate_percentiles",
 ]

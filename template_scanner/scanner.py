@@ -36,6 +36,7 @@ import pandas as pd
 from core.downloader import MarketDataUnavailableError
 from core.utils import DateLike, get_logger
 
+from range_analytics.location import validate_percentiles
 from range_analytics.multi_lookback import analyze_multi_lookback
 
 from strategy_engine.combinations import StrategyInstance
@@ -69,6 +70,8 @@ class ScanRequest:
     eligible_rics: set[str] | None = None
     crossing_equilibrium: float | None = None
     crossing_threshold: float = 0.0
+    lower_percentile: float = 5.0
+    upper_percentile: float = 95.0
 
     def __post_init__(self) -> None:
         if not self.definitions:
@@ -77,6 +80,7 @@ class ScanRequest:
         end = pd.Timestamp(self.price_end)
         if start > end:
             raise ValueError(f"price_start ({start}) must be <= price_end ({end})")
+        validate_percentiles(self.lower_percentile, self.upper_percentile)
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,8 @@ def analyze_histories(
     lookbacks: tuple[int, ...],
     crossing_equilibrium: float | None = None,
     crossing_threshold: float = 0.0,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
 ) -> ScanReport:
     """Measure a list of already-built StrategyHistory objects.
 
@@ -129,6 +135,8 @@ def analyze_histories(
             lookbacks=lookbacks,
             crossing_equilibrium=crossing_equilibrium,
             crossing_threshold=crossing_threshold,
+            lower_percentile=lower_percentile,
+            upper_percentile=upper_percentile,
         )
         definition = history.instance.definition
         results.append(
@@ -213,5 +221,7 @@ def run_scan(request: ScanRequest) -> ScanReport:
         lookbacks=request.lookbacks,
         crossing_equilibrium=request.crossing_equilibrium,
         crossing_threshold=request.crossing_threshold,
+        lower_percentile=request.lower_percentile,
+        upper_percentile=request.upper_percentile,
     )
     return ScanReport(results=report.results, skipped=tuple(skipped))

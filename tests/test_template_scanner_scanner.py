@@ -96,6 +96,33 @@ def test_scan_request_rejects_price_start_after_price_end():
         )
 
 
+def test_scan_request_defaults_percentiles_to_5_95():
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+    )
+    assert request.lower_percentile == 5.0
+    assert request.upper_percentile == 95.0
+
+
+def test_scan_request_rejects_invalid_percentiles():
+    with pytest.raises(ValueError):
+        ScanRequest(
+            definitions=(_spread(),),
+            contract_start="2026-01-01", contract_end="2026-12-31",
+            price_start="2020-01-01", price_end="2020-06-30",
+            lower_percentile=95.0, upper_percentile=5.0,
+        )
+    with pytest.raises(ValueError):
+        ScanRequest(
+            definitions=(_spread(),),
+            contract_start="2026-01-01", contract_end="2026-12-31",
+            price_start="2020-01-01", price_end="2020-06-30",
+            lower_percentile=-1.0, upper_percentile=95.0,
+        )
+
+
 def test_scan_report_fields_are_results_and_skipped_only():
     # locks in the narrow contract: ScanReport never grows a general
     # failure bucket -- only results and skipped (confirmed
@@ -341,6 +368,25 @@ def test_run_scan_unrelated_exception_after_a_skip_still_aborts(mocker):
     )
     with pytest.raises(RuntimeError, match="simulated unrelated failure"):
         run_scan(request)
+
+
+def test_run_scan_carries_configured_percentiles_through_to_results(mocker):
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20, 40),
+        lower_percentile=25.0, upper_percentile=75.0,
+    )
+    report = run_scan(request)
+
+    assert report.results  # sanity: the scan actually produced candidates
+    for candidate in report.results:
+        for analytics in candidate.multi_lookback.per_lookback:
+            assert analytics.lower_percentile == 25.0
+            assert analytics.upper_percentile == 75.0
 
 
 # ---------------------------------------------------------------------

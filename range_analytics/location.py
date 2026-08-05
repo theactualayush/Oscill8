@@ -40,28 +40,53 @@ def range_width_full(series: pd.Series) -> float:
     return float(series.max() - series.min())
 
 
-def range_low_robust(series: pd.Series) -> float:
-    """5th percentile -- a robust range floor, resistant to a single
-    outlier print (e.g. a one-session FOMC/CPI-driven spike)."""
+def validate_percentiles(lower_percentile: float, upper_percentile: float) -> None:
+    """Shared validation for the configurable robust-range percentile
+    band: 0 <= lower_percentile < upper_percentile <= 100. Raises
+    ValueError early and clearly rather than letting an invalid pair
+    silently produce a degenerate/reversed band. Called once, from
+    every entry point that accepts a percentile pair (analyze_range,
+    analyze_multi_lookback, ScanRequest), so the rule is defined here
+    exactly once.
+    """
+    if not (0 <= lower_percentile < upper_percentile <= 100):
+        raise ValueError(
+            "percentile bounds must satisfy 0 <= lower_percentile < "
+            f"upper_percentile <= 100, got lower_percentile={lower_percentile}, "
+            f"upper_percentile={upper_percentile}"
+        )
+
+
+def range_low_robust(series: pd.Series, lower_percentile: float = 5.0) -> float:
+    """`lower_percentile`-th percentile -- a robust range floor,
+    resistant to a single outlier print (e.g. a one-session FOMC/CPI-
+    driven spike). Defaults to the 5th percentile, preserving prior
+    behaviour for any caller that doesn't configure it."""
     if series.empty:
         return _NAN
-    return float(series.quantile(0.05))
+    return float(series.quantile(lower_percentile / 100))
 
 
-def range_high_robust(series: pd.Series) -> float:
-    """95th percentile -- robust range ceiling."""
+def range_high_robust(series: pd.Series, upper_percentile: float = 95.0) -> float:
+    """`upper_percentile`-th percentile -- robust range ceiling.
+    Defaults to the 95th percentile, preserving prior behaviour for any
+    caller that doesn't configure it."""
     if series.empty:
         return _NAN
-    return float(series.quantile(0.95))
+    return float(series.quantile(upper_percentile / 100))
 
 
-def range_width_robust(series: pd.Series) -> float:
-    """P95 - P05. Trims 10% of the distribution (5% each tail) so a
+def range_width_robust(
+    series: pd.Series, lower_percentile: float = 5.0, upper_percentile: float = 95.0
+) -> float:
+    """upper_percentile - lower_percentile band width. Defaults to
+    P95 - P05, trimming 10% of the distribution (5% each tail) so a
     single historical outlier doesn't dominate the reported range the
-    way it can with max - min."""
+    way it can with max - min. A caller-selected band (e.g. P25/P75)
+    trims proportionally more/less of each tail instead."""
     if series.empty:
         return _NAN
-    return float(series.quantile(0.95) - series.quantile(0.05))
+    return float(series.quantile(upper_percentile / 100) - series.quantile(lower_percentile / 100))
 
 
 def range_position(current: float, low: float, high: float) -> float:

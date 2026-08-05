@@ -131,6 +131,8 @@ def analyze_multi_lookback(
     lookbacks: tuple[int, ...] = (20, 40, 60, 90, 120),
     crossing_equilibrium: float | None = None,
     crossing_threshold: float = 0.0,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
 ) -> MultiLookbackAnalytics:
     """Compute Module 4A diagnostics for `history` at each of `lookbacks`,
     plus threshold-free cross-lookback stability for the metrics where
@@ -144,8 +146,12 @@ def analyze_multi_lookback(
     own window's median as equilibrium, not one global value forced
     across window lengths -- forcing one lookback's reference point
     onto a different-length window would conflate two different
-    baselines. Both parameters are forwarded unchanged to every
-    analyze_range() call, mirroring analyze_range's own pattern.
+    baselines. `lower_percentile`/`upper_percentile` (default 5.0/95.0)
+    configure the robust-range band identically at every lookback, the
+    same one band applied consistently across window lengths. All four
+    are forwarded unchanged to every analyze_range() call, mirroring
+    analyze_range's own pattern; analyze_range validates the percentile
+    pair itself, so an invalid pair fails on the first per-lookback call.
 
     Calls analyze_range() once per lookback against the same in-memory
     `history` -- no I/O, no market-data access anywhere in this
@@ -162,6 +168,8 @@ def analyze_multi_lookback(
             lookback=lb,
             crossing_equilibrium=crossing_equilibrium,
             crossing_threshold=crossing_threshold,
+            lower_percentile=lower_percentile,
+            upper_percentile=upper_percentile,
         )
         for lb in lookbacks
     )

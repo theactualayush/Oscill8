@@ -45,11 +45,13 @@ from template_scanner.scan_results import ScanCandidateResult
 from template_scanner.scanner import ScanRequest
 
 from ui import state
+from ui.formatting import format_percentile_range
 
 _LINE_COLOR = "#4C9AFF"
 _MARKER_COLOR = "#FF6B6B"
 _BAND_COLOR = "#4C9AFF"
 _LEVEL_COLOR = "#8B93A7"
+_MEAN_COLOR = "#5A6274"
 _CHART_HEIGHT = 420
 
 
@@ -112,9 +114,23 @@ def build_strategy_chart(history: pd.DataFrame, lookback: int, analytics: RangeA
                 annotation_font_size=11,
             )
 
+    # Mean: a subtle reference line only -- thinner, more transparent, and
+    # distinct (dashdot, left-side label) from the Low/Median/High trio
+    # above so it reads as a secondary reference, not a fourth band edge.
+    if not math.isnan(analytics.mean):
+        fig.add_hline(
+            y=analytics.mean,
+            line=dict(color=_MEAN_COLOR, width=1, dash="dashdot"),
+            opacity=0.6,
+            annotation_text="Mean",
+            annotation_position="left",
+            annotation_font_size=10,
+        )
+
+    percentile_label = format_percentile_range(analytics.lower_percentile, analytics.upper_percentile)
     fig.update_layout(
         template="plotly_dark",
-        title=f"Selected Strategy History — {lookback} bars",
+        title=f"Selected Strategy History — {lookback} bars · {percentile_label}",
         showlegend=False,
         height=_CHART_HEIGHT,
         margin=dict(l=40, r=110, t=50, b=30),

@@ -76,12 +76,15 @@ def _candidate(
 def test_results_to_dataframe_empty_list_returns_empty_frame_with_curated_columns():
     df = results_to_dataframe([], display_lookback=20)
     assert df.empty
-    assert len(df.columns) == 46
+    assert len(df.columns) == 50
 
 
-def test_results_to_dataframe_column_set_has_exactly_46_curated_columns():
+def test_results_to_dataframe_column_set_has_exactly_50_curated_columns():
+    # 46 pre-existing + lower_percentile/upper_percentile/z_score/abs_z_score
+    # (the configurable robust-range percentiles and the conventional
+    # z-score/absolute z-score, exposed as canonical Module 5B metrics).
     df = results_to_dataframe([_candidate()], display_lookback=20)
-    assert len(df.columns) == 46
+    assert len(df.columns) == 50
 
 
 def test_results_to_dataframe_excludes_tuple_valued_stability_internals():

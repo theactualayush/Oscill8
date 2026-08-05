@@ -181,3 +181,50 @@ def test_at_lookback_direct_field_unaffected_by_metric_value_change():
     accessor = at_lookback("ar1_beta", 30)
     expected = _metrics_at_lookback(_TRENDING.multi_lookback, 30).ar1_beta
     assert accessor(_TRENDING) == pytest.approx(expected, nan_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Z-score / absolute Z-score filtering
+# ---------------------------------------------------------------------
+
+def test_at_lookback_resolves_z_score():
+    accessor = at_lookback("z_score", 30)
+    value = accessor(_TRENDING)
+    expected = _metrics_at_lookback(_TRENDING.multi_lookback, 30).z_score
+    assert value == pytest.approx(expected, nan_ok=True)
+
+
+def test_at_lookback_resolves_abs_z_score():
+    accessor = at_lookback("abs_z_score", 30)
+    z = at_lookback("z_score", 30)(_TRENDING)
+    assert accessor(_TRENDING) == pytest.approx(abs(z), nan_ok=True)
+
+
+def test_filter_criterion_with_z_score_min_and_max_bounds_a_range():
+    accessor = at_lookback("z_score", 30)
+    value = accessor(_TRENDING)
+    criterion = FilterCriterion("z band", accessor, min_value=value - 0.01, max_value=value + 0.01)
+    assert apply_filters([_TRENDING], [criterion]) == [_TRENDING]
+
+    too_narrow = FilterCriterion("z band exclusive", accessor, min_value=value + 1.0)
+    assert apply_filters([_TRENDING], [too_narrow]) == []
+
+
+def test_filter_criterion_with_abs_z_score_min():
+    accessor = at_lookback("abs_z_score", 30)
+    value = accessor(_TRENDING)
+    assert not math.isnan(value)
+
+    passes = FilterCriterion("|Z| min", accessor, min_value=value)
+    assert apply_filters([_TRENDING], [passes]) == [_TRENDING]
+
+    fails = FilterCriterion("|Z| min too high", accessor, min_value=value + 1.0)
+    assert apply_filters([_TRENDING], [fails]) == []
+
+
+def test_filter_criterion_z_score_nan_fails_only_that_filter():
+    accessor = at_lookback("z_score", 30)
+    criterion = FilterCriterion("z", accessor, min_value=0.0)
+    filtered = apply_filters([_SHORT], [criterion])
+    assert filtered == []
+    assert apply_filters([_SHORT]) == [_SHORT]

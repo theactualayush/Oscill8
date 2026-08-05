@@ -57,6 +57,8 @@ class RangeAnalytics:
     range_low_robust: float
     range_high_robust: float
     range_width_robust: float
+    lower_percentile: float
+    upper_percentile: float
 
     range_position_full: float
     range_position_robust: float
@@ -87,6 +89,8 @@ def analyze_range(
     end: DateLike | None = None,
     crossing_equilibrium: float | None = None,
     crossing_threshold: float = 0.0,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
 ) -> RangeAnalytics:
     """Compute RangeAnalytics for one StrategyHistory over a window.
 
@@ -102,7 +106,30 @@ def analyze_range(
     (always threshold=0.0) and `hysteresis_crossing_count` (uses
     `crossing_threshold`), so a caller can compare conventions
     empirically before any one is adopted.
+
+    `lower_percentile`/`upper_percentile` (default 5.0/95.0, preserving
+    prior behaviour) configure the robust-range band -- validated via
+    location.validate_percentiles() before any computation, so an
+    invalid pair (lower >= upper, or outside [0, 100]) fails immediately
+    rather than producing a degenerate range. Both are also recorded on
+    the returned RangeAnalytics so a caller (e.g. the UI) always knows
+    exactly which band produced range_low_robust/range_high_robust/
+    range_width_robust/range_position_robust, without having to thread
+    the ScanRequest/config alongside the result separately.
+
+    Z-score window semantics (documented here since it is easy to get
+    wrong): `current` is `series.iloc[-1]` -- the most recent
+    observation of the SAME window (of exactly `lookback` valid
+    observations, or fewer if history is short) that `mean`/`std` are
+    also computed over. That is, `current` is INCLUDED in the sample
+    used for `mean` and `std` -- this is an in-sample z-score
+    (Z = (X_n - mean(X_1..X_n)) / std(X_1..X_n)), not an out-of-sample
+    one comparing `current` against the *other* N-1 observations. This
+    is the established, tested convention (see
+    tests/test_range_analytics.py) and is preserved unchanged here.
     """
+    location.validate_percentiles(lower_percentile, upper_percentile)
+
     window = resolve_window(history.history, lookback=lookback, start=start, end=end)
     series = window["Strategy"]
     n = len(series)
@@ -121,9 +148,9 @@ def analyze_range(
     low_full = location.range_low_full(series)
     high_full = location.range_high_full(series)
     width_full = location.range_width_full(series)
-    low_robust = location.range_low_robust(series)
-    high_robust = location.range_high_robust(series)
-    width_robust = location.range_width_robust(series)
+    low_robust = location.range_low_robust(series, lower_percentile)
+    high_robust = location.range_high_robust(series, upper_percentile)
+    width_robust = location.range_width_robust(series, lower_percentile, upper_percentile)
 
     position_full = location.range_position(current, low_full, high_full)
     position_robust = location.range_position(current, low_robust, high_robust)
@@ -164,6 +191,8 @@ def analyze_range(
         range_low_robust=low_robust,
         range_high_robust=high_robust,
         range_width_robust=width_robust,
+        lower_percentile=lower_percentile,
+        upper_percentile=upper_percentile,
         range_position_full=position_full,
         range_position_robust=position_robust,
         distance_from_mean=distance,

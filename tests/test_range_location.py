@@ -24,6 +24,62 @@ def test_range_robust_matches_5th_and_95th_percentile():
     )
 
 
+# ---------------------------------------------------------------------
+# Configurable robust-range percentiles
+# ---------------------------------------------------------------------
+
+def test_range_robust_default_matches_5_95_explicitly():
+    # Same fixture/assertions as the pre-existing default test, but
+    # calling with explicit lower_percentile=5.0/upper_percentile=95.0
+    # -- proves the new parameters' defaults reproduce prior behaviour
+    # exactly, not just "close enough".
+    s = pd.Series(list(range(1, 101)), dtype=float)
+    assert location.range_low_robust(s, lower_percentile=5.0) == pytest.approx(s.quantile(0.05))
+    assert location.range_high_robust(s, upper_percentile=95.0) == pytest.approx(s.quantile(0.95))
+    assert location.range_width_robust(
+        s, lower_percentile=5.0, upper_percentile=95.0
+    ) == pytest.approx(s.quantile(0.95) - s.quantile(0.05))
+
+
+def test_range_robust_25_75_matches_expected_quantiles():
+    s = pd.Series(list(range(1, 101)), dtype=float)
+    assert location.range_low_robust(s, lower_percentile=25.0) == pytest.approx(s.quantile(0.25))
+    assert location.range_high_robust(s, upper_percentile=75.0) == pytest.approx(s.quantile(0.75))
+    assert location.range_width_robust(
+        s, lower_percentile=25.0, upper_percentile=75.0
+    ) == pytest.approx(s.quantile(0.75) - s.quantile(0.25))
+
+
+def test_range_robust_10_90_matches_expected_quantiles():
+    s = pd.Series(list(range(1, 101)), dtype=float)
+    assert location.range_low_robust(s, lower_percentile=10.0) == pytest.approx(s.quantile(0.10))
+    assert location.range_high_robust(s, upper_percentile=90.0) == pytest.approx(s.quantile(0.90))
+    assert location.range_width_robust(
+        s, lower_percentile=10.0, upper_percentile=90.0
+    ) == pytest.approx(s.quantile(0.90) - s.quantile(0.10))
+
+
+def test_validate_percentiles_accepts_default_and_common_bands():
+    location.validate_percentiles(5.0, 95.0)
+    location.validate_percentiles(10.0, 90.0)
+    location.validate_percentiles(25.0, 75.0)
+    location.validate_percentiles(0.0, 100.0)
+
+
+def test_validate_percentiles_rejects_lower_greater_or_equal_to_upper():
+    with pytest.raises(ValueError):
+        location.validate_percentiles(95.0, 5.0)
+    with pytest.raises(ValueError):
+        location.validate_percentiles(50.0, 50.0)
+
+
+def test_validate_percentiles_rejects_out_of_range_values():
+    with pytest.raises(ValueError):
+        location.validate_percentiles(-1.0, 95.0)
+    with pytest.raises(ValueError):
+        location.validate_percentiles(5.0, 101.0)
+
+
 def test_robust_range_is_narrower_than_full_range_with_an_outlier():
     s = pd.Series([10.0] * 20 + [1000.0])
     assert location.range_width_robust(s) < location.range_width_full(s)

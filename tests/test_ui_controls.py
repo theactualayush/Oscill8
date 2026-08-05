@@ -10,7 +10,9 @@ is exercised via the browser smoke test instead, per the project's
 
 from __future__ import annotations
 
-from ui.controls import _default_grid
+import dataclasses
+
+from ui.controls import _DEFAULT_LOWER_PERCENTILE, _DEFAULT_UPPER_PERCENTILE, ScanSetup, _default_grid
 from ui.formatting import position_column
 
 
@@ -39,3 +41,20 @@ def test_default_grid_column_count_matches_requested_positions():
     df = _default_grid(4)
     position_cols = [c for c in df.columns if c != "Label"]
     assert position_cols == [position_column(i) for i in range(1, 5)]
+
+
+# ---------------------------------------------------------------------
+# Percentile Range control -- ScanSetup carries lower/upper_percentile
+# ---------------------------------------------------------------------
+
+def test_default_percentile_constants_are_5_and_95():
+    # The Streamlit number_input widgets default to these -- pinned here
+    # so a future edit that changes the trader-facing default is a
+    # visible, deliberate test change, not silent.
+    assert _DEFAULT_LOWER_PERCENTILE == 5
+    assert _DEFAULT_UPPER_PERCENTILE == 95
+
+
+def test_scan_setup_has_percentile_fields():
+    field_names = {f.name for f in dataclasses.fields(ScanSetup)}
+    assert {"lower_percentile", "upper_percentile"}.issubset(field_names)

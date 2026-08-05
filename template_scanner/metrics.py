@@ -75,6 +75,17 @@ def normalized_crossing_frequency(result: RangeAnalytics) -> float:
     return result.hysteresis_crossing_count / (n - 1)
 
 
+def abs_z_score(result: RangeAnalytics) -> float:
+    """abs(z_score) -- the conventional z-score's magnitude, useful for
+    ranking/filtering on dislocation size regardless of direction. NaN
+    propagates automatically (abs(nan) == nan): every NaN rule for
+    z_score itself (zero/undefined std, insufficient observations) is
+    defined exactly once, in range_analytics.location.z_score -- this
+    is a pure, no-branching wrapper, not a second implementation.
+    """
+    return abs(result.z_score)
+
+
 # Derived metrics: functions of a RangeAnalytics, not attributes of it.
 # Kept as one explicit dict (not auto-discovered) so growth of the
 # resolvable metric set is a visible, deliberate choice -- the same
@@ -83,6 +94,7 @@ _DERIVED_METRICS: dict[str, Callable[[RangeAnalytics], float]] = {
     "normalized_crossing_frequency": normalized_crossing_frequency,
     "range_to_volatility_ratio": range_to_volatility_ratio,
     "robust_to_full_width_ratio": robust_to_full_width_ratio,
+    "abs_z_score": abs_z_score,
 }
 
 

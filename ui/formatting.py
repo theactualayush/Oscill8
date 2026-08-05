@@ -48,6 +48,43 @@ PRIMARY_LOOKBACK_HELP = (
     "to measure stability."
 )
 
+PERCENTILE_RANGE_HELP = (
+    "Defines the historical range used for Low, High and Position. Example: "
+    "25 / 75 uses the middle 50% of observations."
+)
+
+Z_SCORE_HELP = "Current distance from the lookback mean, measured in standard deviations."
+
+ABS_Z_SCORE_HELP = (
+    "Absolute value of Z-Score -- useful for ranking dislocations regardless of direction."
+)
+
+RANGE_POSITION_HELP = (
+    "Current location relative to the selected percentile range. 0% = Low, 100% = High. "
+    "Values outside this range indicate the strategy is beyond the selected historical band."
+)
+
+
+def format_percentile(value: float) -> str:
+    """Render a percentile as a compact label: whole numbers drop the
+    decimal ("25"), fractional ones keep it ("12.5") -- the Streamlit
+    controls default to integer-step input, but the backend/API accepts
+    any float, so this must handle both without showing "25.0" for the
+    common case."""
+    if _is_nan(value):
+        return "—"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def format_percentile_range(lower_percentile: float, upper_percentile: float) -> str:
+    """"P{lower}-P{upper}", e.g. "P25-P75" -- the active percentile band,
+    read directly off an already-computed RangeAnalytics (never
+    recomputed), so it always matches whichever band Low/High/Position
+    were actually computed from."""
+    return f"P{format_percentile(lower_percentile)}-P{format_percentile(upper_percentile)}"
+
 
 def position_column(index: int) -> str:
     """Name of the data_editor column for curve position `index` (1-based)
@@ -181,6 +218,9 @@ FILTER_SPECS: tuple[FilterSpec, ...] = (
         "ar1_r_squared_min", "AR(1) R² (min)", "ar1_r_squared", "min",
         "How well the simple mean-reversion model explains historical movements.",
     ),
+    FilterSpec("z_score_min", "Z-Score (min)", "z_score", "min", Z_SCORE_HELP),
+    FilterSpec("z_score_max", "Z-Score (max)", "z_score", "max", Z_SCORE_HELP),
+    FilterSpec("abs_z_score_min", "Absolute Z-Score (min)", "abs_z_score", "min", ABS_Z_SCORE_HELP),
 )
 
 # One stability filter (Module 4B): bounds how much a candidate's
@@ -243,6 +283,8 @@ RANK_METRIC_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Realized Vol (bp)", "realized_vol_bp"),
     ("Range/Volatility Ratio", "range_to_volatility_ratio"),
     ("Robust/Full Width Ratio", "robust_to_full_width_ratio"),
+    ("Z-Score", "z_score"),
+    ("Absolute Z-Score", "abs_z_score"),
 )
 
 NO_SECONDARY_RANK = "(none)"
@@ -304,35 +346,37 @@ def format_ranked_by(rank_state: dict) -> str:
 # (display_label, source_column, kind) -- source_column matches
 # template_scanner.scan_results.results_to_dataframe()'s existing
 # columns exactly; nothing here recomputes a value that module doesn't
-# already provide. Curated to the trader-facing subset -- Robust Low/
-# High, Realized Vol (bp), and AR(1) R² stay reachable via the selected
-# candidate rather than as primary-table columns.
+# already provide. Curated to the trader-facing subset -- Robust Range
+# Width and AR(1) Beta stay available for filtering/ranking (see
+# FILTER_SPECS/RANK_METRIC_OPTIONS above) and via the selected candidate,
+# but are deliberately left out of the default table to keep it compact.
 DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("Strategy", "rics", "rics"),
     ("Ratio", "weights", "weights"),
     ("Current", "current_price", "number"),
+    ("Low", "range_low_robust", "number"),
     ("Median", "median", "number"),
-    ("Pos", "range_position_robust", "percent"),
-    ("Width", "range_width_robust", "number"),
+    ("High", "range_high_robust", "number"),
+    ("Position", "range_position_robust", "percent"),
+    ("Z", "z_score", "number"),
+    ("|Z|", "abs_z_score", "number"),
     ("ER", "efficiency_ratio", "number"),
     ("Cross Freq", "normalized_crossing_frequency", "percent"),
     ("Half-Life", "half_life", "number"),
-    ("AR1 β", "ar1_beta", "number"),
 )
 
 # Tooltip text for the result-grid column headers with a non-obvious
 # meaning -- shown via st.column_config's `help=`. Same wording as the
 # matching FilterSpec.help_text where one exists.
 RESULT_COLUMN_HELP: dict[str, str] = {
-    "Pos": (
-        "Current level's position within the estimated robust range. "
-        "0% is near the lower bound; 100% is near the upper bound."
-    ),
-    "Width": "Width of the strategy's typical historical trading range.",
+    "Low": "Lower bound of the selected percentile range.",
+    "High": "Upper bound of the selected percentile range.",
+    "Position": RANGE_POSITION_HELP,
+    "Z": Z_SCORE_HELP,
+    "|Z|": ABS_Z_SCORE_HELP,
     "ER": "Lower means the strategy moved less directionally and oscillated more.",
     "Cross Freq": "Higher means the strategy crossed its equilibrium more frequently.",
     "Half-Life": "Estimated time for a deviation from equilibrium to decay by half.",
-    "AR1 β": "Lower generally indicates faster mean reversion.",
 }
 
 RANK_COLUMN = "Rank"
@@ -398,10 +442,11 @@ def add_rank_column(display_df: pd.DataFrame) -> pd.DataFrame:
 
 def selected_strategy_summary(candidate: ScanCandidateResult, display_lookback: int) -> dict[str, str]:
     """Format the headline stats for the Selected Strategy panel:
-    identity, ratio, interval, current level, robust range (combined
-    low-high), median, range position, and efficiency ratio -- all read
-    directly off the candidate's already-computed RangeAnalytics at
-    `display_lookback`, nothing recomputed.
+    identity, ratio, interval, current level, mean, median, robust low/
+    high, range position, z-score, efficiency ratio, and the active
+    percentile-range label -- all read directly off the candidate's
+    already-computed RangeAnalytics at `display_lookback`, nothing
+    recomputed.
     """
     analytics = metrics_at_lookback(candidate.multi_lookback, display_lookback)
     return {
@@ -409,8 +454,15 @@ def selected_strategy_summary(candidate: ScanCandidateResult, display_lookback: 
         "weights": " / ".join(fmt_number(w, 2) for w in candidate.weights),
         "interval": candidate.interval.value,
         "current": fmt_number(analytics.current_price),
-        "robust_range": f"{fmt_number(analytics.range_low_robust)} – {fmt_number(analytics.range_high_robust)}",
+        "mean": fmt_number(analytics.mean),
         "median": fmt_number(analytics.median),
+        "robust_low": fmt_number(analytics.range_low_robust),
+        "robust_high": fmt_number(analytics.range_high_robust),
+        "robust_range": f"{fmt_number(analytics.range_low_robust)} – {fmt_number(analytics.range_high_robust)}",
         "position": fmt_percent(analytics.range_position_robust),
+        "z_score": fmt_number(analytics.z_score, 2),
         "efficiency_ratio": fmt_number(analytics.efficiency_ratio),
+        "percentile_range_label": format_percentile_range(
+            analytics.lower_percentile, analytics.upper_percentile
+        ),
     }

@@ -21,7 +21,12 @@ from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 
-from template_scanner.metrics import at_lookback, metric_value, normalized_crossing_frequency
+from template_scanner.metrics import (
+    abs_z_score,
+    at_lookback,
+    metric_value,
+    normalized_crossing_frequency,
+)
 
 
 def _history(dates: list[str], values: list[float]) -> StrategyHistory:
@@ -128,6 +133,89 @@ def test_metric_value_resolves_robust_to_full_width_ratio():
     assert metric_value(analytics, "robust_to_full_width_ratio") == pytest.approx(
         robust_to_full_width_ratio(analytics), nan_ok=True
     )
+
+
+# ---------------------------------------------------------------------
+# z_score / abs_z_score: deterministic synthetic data, hand-verifiable
+# ---------------------------------------------------------------------
+
+def test_metric_value_resolves_z_score_as_direct_field():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "z_score") == analytics.z_score
+
+
+def test_abs_z_score_positive_current_above_mean():
+    # A monotonic ramp: current (last value) is well above the window's
+    # mean -> positive z, and abs_z_score equals it exactly.
+    values = [float(v) for v in range(1, 21)]  # 1..20, current=20, mean=10.5
+    history = _history(_dates(20), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20,)).per_lookback[0]
+
+    series = pd.Series(values)
+    expected_z = (series.iloc[-1] - series.mean()) / series.std(ddof=1)
+    assert expected_z > 0
+    assert analytics.z_score == pytest.approx(expected_z)
+    assert abs_z_score(analytics) == pytest.approx(expected_z)
+    assert metric_value(analytics, "abs_z_score") == pytest.approx(expected_z)
+
+
+def test_abs_z_score_negative_current_below_mean():
+    # A monotonic decline: current (last value) is well below the mean
+    # -> negative z; abs_z_score flips the sign to positive.
+    values = [float(v) for v in range(20, 0, -1)]  # 20..1, current=1, mean=10.5
+    history = _history(_dates(20), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20,)).per_lookback[0]
+
+    series = pd.Series(values)
+    expected_z = (series.iloc[-1] - series.mean()) / series.std(ddof=1)
+    assert expected_z < 0
+    assert analytics.z_score == pytest.approx(expected_z)
+    assert abs_z_score(analytics) == pytest.approx(abs(expected_z))
+    assert metric_value(analytics, "abs_z_score") == pytest.approx(abs(expected_z))
+
+
+def test_z_score_zero_when_current_equals_mean():
+    # Symmetric series around its own mean, engineered so the LAST value
+    # (current) lands exactly on the mean -- deterministic, hand-verifiable.
+    values = [10.0, 8.0, 12.0, 9.0, 11.0, 10.0]  # mean == 10.0, last == 10.0
+    history = _history(_dates(6), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(6,)).per_lookback[0]
+
+    assert analytics.mean == pytest.approx(10.0)
+    assert analytics.current_price == pytest.approx(10.0)
+    assert analytics.z_score == pytest.approx(0.0)
+    assert abs_z_score(analytics) == pytest.approx(0.0)
+
+
+def test_abs_z_score_nan_propagates_from_z_score():
+    # Single observation -> std undefined -> z_score NaN -> abs_z_score
+    # must also be NaN (abs(nan) == nan), not raise or default to 0.
+    history = _history(_dates(1), [1.0])
+    analytics = analyze_multi_lookback(history, lookbacks=(1,)).per_lookback[0]
+
+    assert math.isnan(analytics.z_score)
+    assert math.isnan(abs_z_score(analytics))
+    assert math.isnan(metric_value(analytics, "abs_z_score"))
+
+
+def test_z_score_and_abs_z_score_computed_independently_per_lookback():
+    # A ramp with a late kink: the 20-bar window is dominated by the
+    # kink (current close to its own short-window mean -> small |Z|),
+    # while the 60-bar window's mean is pulled down by the earlier flat
+    # section (current further from that longer-window mean -> larger
+    # |Z|) -- z_score/abs_z_score must differ meaningfully per lookback,
+    # not be computed once and reused.
+    values = [100.0] * 40 + [100.0 + 0.5 * i for i in range(20)]
+    history = _history(_dates(60), values)
+    result = analyze_multi_lookback(history, lookbacks=(20, 60))
+
+    z20 = result.per_lookback[0].z_score
+    z60 = result.per_lookback[1].z_score
+    assert z20 != pytest.approx(z60)
+    assert abs_z_score(result.per_lookback[0]) != pytest.approx(abs_z_score(result.per_lookback[1]))
 
 
 def test_metric_value_unknown_field_raises_attribute_error():

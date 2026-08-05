@@ -26,8 +26,11 @@ from template_scanner.scan_results import ScanCandidateResult, results_to_datafr
 
 from ui.formatting import (
     ALL_FILTER_SPECS,
+    DISPLAY_COLUMNS,
     FILTER_SPECS,
     NO_SECONDARY_RANK,
+    RANK_METRIC_OPTIONS,
+    RESULT_COLUMN_HELP,
     STABILITY_FILTER_SPEC,
     add_rank_column,
     build_definitions_from_grid,
@@ -35,6 +38,8 @@ from ui.formatting import (
     build_sort_keys,
     fmt_number,
     fmt_percent,
+    format_percentile,
+    format_percentile_range,
     format_ranked_by,
     position_column,
     selected_strategy_summary,
@@ -202,6 +207,16 @@ def test_every_filter_spec_accessor_resolves_against_a_real_candidate(_scan_cand
         criterion.passes(_scan_candidate)
 
 
+def test_filter_specs_include_z_score_min_max_and_abs_z_score_min():
+    by_key = {spec.key: spec for spec in FILTER_SPECS}
+    assert by_key["z_score_min"].field == "z_score"
+    assert by_key["z_score_min"].bound == "min"
+    assert by_key["z_score_max"].field == "z_score"
+    assert by_key["z_score_max"].bound == "max"
+    assert by_key["abs_z_score_min"].field == "abs_z_score"
+    assert by_key["abs_z_score_min"].bound == "min"
+
+
 # ---------------------------------------------------------------------
 # build_sort_keys / format_ranked_by
 # ---------------------------------------------------------------------
@@ -270,6 +285,12 @@ def test_format_ranked_by_omits_secondary_when_none():
     assert "then" not in format_ranked_by(rank_state)
 
 
+def test_rank_metric_options_include_z_score_and_absolute_z_score():
+    fields = {field for _, field in RANK_METRIC_OPTIONS}
+    assert "z_score" in fields
+    assert "abs_z_score" in fields
+
+
 # ---------------------------------------------------------------------
 # Display formatting
 # ---------------------------------------------------------------------
@@ -309,6 +330,72 @@ def test_to_display_dataframe_preserves_row_order_and_formats_values(_scan_candi
     assert display.iloc[0]["Current"] != "—"
 
 
+def test_display_columns_include_low_high_z_and_absolute_z():
+    labels = [label for label, _, _ in DISPLAY_COLUMNS]
+    assert "Low" in labels
+    assert "High" in labels
+    assert "Z" in labels
+    assert "|Z|" in labels
+
+
+def test_display_columns_exclude_ar1_beta_and_width_from_default_table():
+    # Approved amendment: AR(1) Beta and Robust Width stay available for
+    # filtering/ranking (FILTER_SPECS/RANK_METRIC_OPTIONS) but are not
+    # shown in the default, compact results table.
+    labels = [label for label, _, _ in DISPLAY_COLUMNS]
+    assert "AR1 β" not in labels
+    assert "Width" not in labels
+
+
+def test_display_columns_match_approved_column_order():
+    labels = [label for label, _, _ in DISPLAY_COLUMNS]
+    assert labels == [
+        "Strategy", "Ratio", "Current", "Low", "Median", "High",
+        "Position", "Z", "|Z|", "ER", "Cross Freq", "Half-Life",
+    ]
+
+
+def test_result_column_help_covers_every_new_column():
+    for label in ("Low", "High", "Position", "Z", "|Z|"):
+        assert RESULT_COLUMN_HELP[label]
+
+
+def test_to_display_dataframe_shows_low_high_z_for_a_real_candidate(_scan_candidate):
+    results_df = results_to_dataframe([_scan_candidate], display_lookback=20)
+    display = to_display_dataframe(results_df)
+    row = display.iloc[0]
+
+    assert row["Low"] != "—"
+    assert row["High"] != "—"
+    assert row["Z"] != "—"
+    assert row["|Z|"] != "—"
+
+
+def test_to_display_dataframe_z_renders_nan_as_dash():
+    # A single-observation candidate: z_score/abs_z_score are NaN (std
+    # undefined below 2 observations) -- must render as the dash, not
+    # "nan" or a crash.
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1.0,), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26",))
+    history = StrategyHistory(
+        instance=instance, price_field="Close",
+        history=pd.DataFrame({"Date": pd.to_datetime(["2024-01-01"]), "Leg_1": [100.0], "Strategy": [100.0]}),
+    )
+    multi_lookback = analyze_multi_lookback(history, lookbacks=(20,))
+    candidate = ScanCandidateResult(
+        market_key="SOFR", rics=("SRAH26",), weights=(1.0,), offsets=(0,),
+        interval=BarInterval.DAILY, price_field="Close", instance=instance, multi_lookback=multi_lookback,
+    )
+
+    results_df = results_to_dataframe([candidate], display_lookback=20)
+    display = to_display_dataframe(results_df)
+    row = display.iloc[0]
+    assert row["Z"] == "—"
+    assert row["|Z|"] == "—"
+
+
 def test_add_rank_column_prepends_sequential_rank():
     df = pd.DataFrame({"Strategy": ["A", "B", "C"]})
     ranked = add_rank_column(df)
@@ -326,6 +413,47 @@ def test_selected_strategy_summary_fields(_scan_candidate):
     assert summary["interval"] == "DAILY"
     assert "–" in summary["robust_range"]  # combined "low – high" string
     assert summary["current"] != "—"
+
+
+def test_selected_strategy_summary_includes_mean_robust_bounds_and_z_score(_scan_candidate):
+    summary = selected_strategy_summary(_scan_candidate, display_lookback=20)
+
+    analytics = _scan_candidate.multi_lookback.per_lookback[
+        _scan_candidate.multi_lookback.lookbacks_requested.index(20)
+    ]
+    assert summary["mean"] == fmt_number(analytics.mean)
+    assert summary["median"] == fmt_number(analytics.median)
+    assert summary["robust_low"] == fmt_number(analytics.range_low_robust)
+    assert summary["robust_high"] == fmt_number(analytics.range_high_robust)
+    assert summary["z_score"] == fmt_number(analytics.z_score, 2)
+    assert summary["efficiency_ratio"] == fmt_number(analytics.efficiency_ratio)
+
+
+def test_selected_strategy_summary_includes_percentile_range_label(_scan_candidate):
+    summary = selected_strategy_summary(_scan_candidate, display_lookback=20)
+    assert summary["percentile_range_label"] == "P5-P95"
+
+
+# ---------------------------------------------------------------------
+# Percentile formatting: integer-style default, decimal preserved when needed
+# ---------------------------------------------------------------------
+
+def test_format_percentile_renders_whole_numbers_without_decimal():
+    assert format_percentile(5.0) == "5"
+    assert format_percentile(95.0) == "95"
+    assert format_percentile(0.0) == "0"
+
+
+def test_format_percentile_renders_fractional_values_with_decimal():
+    assert format_percentile(12.5) == "12.5"
+
+
+def test_format_percentile_range_default_band():
+    assert format_percentile_range(5.0, 95.0) == "P5-P95"
+
+
+def test_format_percentile_range_custom_band():
+    assert format_percentile_range(25.0, 75.0) == "P25-P75"
 
 
 # ---------------------------------------------------------------------
