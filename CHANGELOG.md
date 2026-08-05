@@ -227,3 +227,41 @@
   sections wrapped in bordered panels for visual grouping.
 - `tests/test_ui_formatting.py` extended, `tests/test_ui_controls.py`
   added.
+
+---
+
+## v0.10.1
+
+### Fixed
+- **SONIA `DAILY` Close silently NaN (live LSEG finding).** SONIA's
+  `DAILY` response has `TRDPRC_1`/`OPEN_PRC`/`HIGH_1`/`LOW_1`/bid/ask
+  entirely NA; the real daily price is carried in `SETTLE`, which
+  `core/downloader.py::_normalize_columns` previously discarded
+  entirely during canonicalization. `_normalize_columns` now accepts a
+  `settle_fallback_for_close` flag (set only when the request's
+  top-level interval is `DAILY`); when set, a `SETTLE` column, if
+  present, row-wise fills only the NaN gaps remaining in `Close` after
+  the primary alias is coerced (`Close = Close.fillna(SETTLE)`) —
+  never a global replacement. SOFR/Fed Funds/€STR have both `TRDPRC_1`
+  and `SETTLE` populated (and they can differ slightly); their existing
+  `TRDPRC_1`-derived `Close` is unaffected. Open/High/Low are never
+  fabricated from `SETTLE`. `HOURLY`/`4H` semantics are unchanged —
+  `SETTLE` is never consulted there. (`tests/test_downloader.py`)
+- **€STR (ESTR) RIC convention wrong (live LSEG finding).** The
+  configured root/year-digit convention (`ric_root="ESR"`,
+  `ric_year_digits=1`, e.g. `ESRU6`) returned LSEG error 70005 ("The
+  universe is not found"). Live testing confirmed the correct
+  convention is `ric_root="SRE"`, `ric_year_digits=2` (e.g. `SREU26`),
+  which returns full `TRDPRC_1`/OHLC/`SETTLE`/bid/ask data. Fixed
+  entirely via `core/config.py`'s `ESTR` `MarketDefinition` — no
+  change to `core.ric`/`core.futures_calendar`, confirming the
+  existing generic root+year-digit RIC builder already supports this
+  without per-market branching. (`tests/test_ric.py`,
+  `tests/test_strategy_combinations.py`)
+
+### Notes
+- CORRA's RIC convention (`CRAU6`, `CRAH7`, ...) was independently
+  confirmed correct and left unchanged — live testing found the
+  current LSEG account lacks entitlement for this universe
+  (`TS.Interday.UserNotPermission.70112`), a permissions issue, not an
+  Oscill8 RIC bug.

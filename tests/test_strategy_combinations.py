@@ -125,3 +125,18 @@ def test_generate_instances_for_sonia_spread_uses_corrected_root():
     instances = generate_instances(definition, "2026-01-01", "2027-12-31")
     assert instances[0].rics == ("SONH6", "SONM6")
     assert all(r.startswith("SON") for inst in instances for r in inst.rics)
+
+
+def test_generate_instances_for_estr_outright_uses_corrected_root_and_year_digits():
+    definition = StrategyDefinition(
+        market_key="ESTR", offsets=(0,), weights=(1,), interval=BarInterval.DAILY,
+    )
+    instances = generate_instances(definition, "2026-01-01", "2027-06-30")
+    assert [inst.rics for inst in instances] == [
+        ("SREH26",),
+        ("SREM26",),
+        ("SREU26",),
+        ("SREZ26",),
+        ("SREH27",),
+        ("SREM27",),
+    ]

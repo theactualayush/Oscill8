@@ -69,6 +69,49 @@ tests/
 The project was reorganized into packages and the test suite currently
 passes.
 
+**Live LSEG testing findings (market-data correctness patch):**
+
+- **RIC conventions per market** (`core.config.MARKETS`, all handled
+  generically by `core.ric.build_ric()` -- root + expiry-month code +
+  `ric_year_digits`-sliced year, no per-market branching):
+  - SOFR: root `SRA`, 2-digit year -- e.g. `SRAU26`. Confirmed working
+    live; `TRDPRC_1`/OHLC/`SETTLE` all populated.
+  - FED_FUNDS: root `FF`, 2-digit year -- e.g. `FFU26`. Confirmed
+    working live; same full field population as SOFR.
+  - SONIA: root `SON` (corrected from `SFI`), 1-digit year -- e.g.
+    `SONU6`. Confirmed working live at `DAILY`, but see the field-
+    population note below.
+  - CORRA: root `CRA`, 1-digit year -- e.g. `CRAU6`/`CRAH7`. RIC
+    construction is correct and unchanged. The current LSEG account
+    lacks entitlement for this universe (`TS.Interday.
+    UserNotPermission.70112`, "User does not have permission for this
+    universe") -- **a permissions issue, not an Oscill8 RIC bug.** Do
+    not alter CORRA's root/year-digit convention or add fallback
+    identifiers to work around this.
+  - ESTR (€STR): root `SRE` (corrected from `ESR`), 2-digit year
+    (corrected from 1) -- e.g. `SREU26`. The old `ESRU6`-style
+    convention returned LSEG error 70005 ("The universe is not
+    found"). Confirmed working live: `TRDPRC_1`/OHLC/`SETTLE`/bid/ask
+    all populated.
+- **DAILY-only SETTLE fallback for Close** (`core.downloader.
+  _normalize_columns`): live testing found SONIA's `DAILY` response has
+  `TRDPRC_1`/`OPEN_PRC`/`HIGH_1`/`LOW_1`/bid/ask entirely NA, while
+  `SETTLE` carries the real daily price -- previously discarded
+  entirely during canonicalization (not in `_CANONICAL_COLUMNS`),
+  producing an all-NaN `Close`. `_normalize_columns` now accepts
+  `settle_fallback_for_close` (set only when the top-level requested
+  interval is `DAILY`, i.e. `native_interval == "daily"` in
+  `_fetch_chunk` -- `FOUR_HOUR` also resolves to a native `"hourly"`
+  fetch, so it's correctly excluded too); when set, a `SETTLE` column
+  present in the raw response row-wise fills only the NaN gaps left in
+  `Close` after the primary alias (`TRDPRC_1`/`CLOSE`/`CLOSE_1`) is
+  coerced to numeric -- `Close = Close.fillna(SETTLE)`, never a global
+  replacement. SOFR/Fed Funds/€STR have both `TRDPRC_1` and `SETTLE`
+  populated (and they can differ slightly) -- their existing
+  `TRDPRC_1`-derived `Close` is completely unaffected. Open/High/Low
+  are never fabricated from `SETTLE`. Intraday (`HOURLY`) semantics are
+  unchanged -- `SETTLE` is never consulted there.
+
 Do not rewrite Module 1 unnecessarily.
 
 Preserve its public interfaces unless there is a compelling technical

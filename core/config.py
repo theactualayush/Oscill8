@@ -260,14 +260,17 @@ MARKETS: dict[str, MarketDefinition] = {
     ),
     "ESTR": MarketDefinition(
         name="Euro Short-Term Rate (€STR)",
-        ric_root="ESR",
+        ric_root="SRE",
         exchange="ICE",
         bp_per_point=100.0,
-        ric_year_digits=1,
+        ric_year_digits=2,
         verified=False,
         tick_value=12.50,
         currency="EUR",
-        description="3-Month €STR futures (VERIFY RIC ROOT)",
+        description="3-Month €STR futures (RIC root 'SRE', 2-digit year, "
+                     "confirmed via live LSEG pull -- SREU26 returned full "
+                     "daily OHLC/SETTLE/BID/ASK; not yet re-verified via a "
+                     "live chain/search)",
     ),
 }
 

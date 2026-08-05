@@ -237,6 +237,89 @@ def test_normalize_columns_preserves_missing_value_does_not_fill_or_drop():
 
 
 # ---------------------------------------------------------------------
+# Column normalization: DAILY SETTLE -> Close fallback
+#
+# Live LSEG testing found SONIA (SONU6) returns TRDPRC_1/OPEN_PRC/
+# HIGH_1/LOW_1/BID/ASK entirely NA at DAILY, but SETTLE populated with
+# the real daily price. SOFR/Fed Funds have both TRDPRC_1 and SETTLE
+# populated (and they can differ slightly) -- their existing
+# TRDPRC_1-derived Close must be completely unaffected.
+# ---------------------------------------------------------------------
+
+def _make_sonia_like_df(dates: list[str], settle: list[float]) -> pd.DataFrame:
+    """Shaped like the live SONU6 DAILY response: TRDPRC_1/OPEN_PRC/
+    HIGH_1/LOW_1 entirely NA, SETTLE populated."""
+    idx = pd.to_datetime(dates)
+    n = len(dates)
+    return pd.DataFrame(
+        {
+            "OPEN_PRC": [float("nan")] * n,
+            "HIGH_1": [float("nan")] * n,
+            "LOW_1": [float("nan")] * n,
+            "TRDPRC_1": [float("nan")] * n,
+            "ACVOL_UNS": [0] * n,
+            "SETTLE": settle,
+        },
+        index=idx,
+    )
+
+
+def test_normalize_columns_settle_fills_missing_daily_close():
+    raw = _make_sonia_like_df(["2026-07-02", "2026-07-03"], [96.235, 96.240])
+    out = downloader._normalize_columns(raw, settle_fallback_for_close=True)
+
+    assert out["Close"].tolist() == pytest.approx([96.235, 96.240])
+    assert out["Close"].dtype == np.float64
+
+
+def test_normalize_columns_settle_fallback_does_not_override_populated_close():
+    # SOFR-like: TRDPRC_1 and SETTLE both populated and slightly
+    # different -- existing TRDPRC_1-derived Close must win, unchanged.
+    raw = _make_lseg_df(["2026-07-06", "2026-07-09"]).rename(columns={"CLOSE": "TRDPRC_1"})
+    raw["TRDPRC_1"] = [96.135, 96.120]
+    raw["SETTLE"] = [96.130, 96.125]
+
+    out = downloader._normalize_columns(raw, settle_fallback_for_close=True)
+
+    assert out["Close"].tolist() == pytest.approx([96.135, 96.120])
+
+
+def test_normalize_columns_settle_fallback_partial_row_missingness():
+    # Row-wise: some rows have a populated primary Close, others don't --
+    # each row is resolved independently, not an all-or-nothing choice.
+    raw = _make_lseg_df(["2026-07-01", "2026-07-02", "2026-07-03"]).rename(
+        columns={"CLOSE": "TRDPRC_1"}
+    )
+    raw["TRDPRC_1"] = [100.02, float("nan"), 100.04]
+    raw["SETTLE"] = [200.0, 96.240, 200.0]
+
+    out = downloader._normalize_columns(raw, settle_fallback_for_close=True)
+
+    assert out["Close"].tolist() == pytest.approx([100.02, 96.240, 100.04])
+
+
+def test_normalize_columns_settle_fallback_disabled_leaves_close_nan():
+    # Intraday path: even if SETTLE is present, it must never be
+    # consulted unless settle_fallback_for_close=True is explicitly
+    # passed (i.e. never for HOURLY/4H).
+    raw = _make_sonia_like_df(["2026-07-02"], [96.235])
+    out = downloader._normalize_columns(raw)  # default False
+
+    assert np.isnan(out["Close"].iloc[0])
+
+
+def test_normalize_columns_settle_fallback_no_settle_column_present():
+    # Absence of both the primary Close source and SETTLE must preserve
+    # existing behaviour -- Close stays NaN, no crash.
+    raw = _make_lseg_df(["2026-07-01"]).rename(columns={"CLOSE": "TRDPRC_1"})
+    raw["TRDPRC_1"] = [float("nan")]
+
+    out = downloader._normalize_columns(raw, settle_fallback_for_close=True)
+
+    assert np.isnan(out["Close"].iloc[0])
+
+
+# ---------------------------------------------------------------------
 # Chunking
 # ---------------------------------------------------------------------
 
@@ -311,6 +394,30 @@ def test_download_history_empty_result_returns_empty_frame_not_error():
 def test_download_history_invalid_date_range_raises():
     with pytest.raises(ValueError, match="must be <="):
         downloader.download_history("SRAZ26", "DAILY", "2026-07-10", "2026-07-01")
+
+
+def test_download_history_daily_sonia_settle_fallback_end_to_end():
+    # Reproduces the live SONU6 DAILY bug report end-to-end: TRDPRC_1/
+    # OHLC entirely NA, SETTLE populated -- download_history's Close
+    # must come from SETTLE, not NaN.
+    fake_lseg_data.get_history.return_value = _make_sonia_like_df(
+        ["2026-07-02", "2026-07-03"], [96.235, 96.240]
+    )
+    df = downloader.download_history("SONU6", "DAILY", "2026-07-02", "2026-07-03")
+
+    assert df["Close"].tolist() == pytest.approx([96.235, 96.240])
+
+
+def test_download_history_hourly_settle_present_does_not_fill_close():
+    # Same shape as the DAILY SONIA case, but requested at HOURLY --
+    # intraday semantics must be completely unchanged: SETTLE is never
+    # consulted, Close stays NaN.
+    fake_lseg_data.get_history.return_value = _make_sonia_like_df(
+        ["2026-07-02"], [96.235]
+    )
+    df = downloader.download_history("SONU6", "HOURLY", "2026-07-02", "2026-07-02")
+
+    assert np.isnan(df["Close"].iloc[0])
 
 
 # ---------------------------------------------------------------------

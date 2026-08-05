@@ -118,6 +118,39 @@ Lookback windows (see [Current UI](#current-ui)) are counted in
 lookback of 60 on a `4H` scan spans a different amount of wall-clock time
 than 60 on `DAILY`.
 
+## Market RIC conventions & data-field differences
+
+Each market's exact LSEG RIC convention (root + expiry-year digit count) is
+declared entirely as data on `core.config.MarketDefinition` — `core.ric.
+build_ric()` is the single, generic RIC builder and contains no per-market
+branching:
+
+| Market | RIC root | Year digits | Example (Sep-2026) |
+|---|---|---|---|
+| SOFR | `SRA` | 2 | `SRAU26` |
+| FED_FUNDS | `FF` | 2 | `FFU26` |
+| SONIA | `SON` | 1 | `SONU6` |
+| CORRA | `CRA` | 1 | `CRAU6` |
+| ESTR (€STR) | `SRE` | 2 | `SREU26` |
+
+Live LSEG testing also found genuine field-population differences across
+markets at the `DAILY` interval, handled entirely inside `core.downloader.
+_normalize_columns` (never a per-market special case):
+
+- **SOFR / Fed Funds / €STR** — `TRDPRC_1` (canonical `Close`) and `SETTLE`
+  are both populated, and can differ slightly. `Close` is always derived
+  from `TRDPRC_1`; `SETTLE` is never consulted for these markets.
+- **SONIA** — `TRDPRC_1`/`OPEN_PRC`/`HIGH_1`/`LOW_1`/bid/ask are entirely NA
+  at `DAILY`, but `SETTLE` is populated. `Close` row-wise falls back to
+  `SETTLE` only where the primary source is missing (`Close =
+  Close.fillna(SETTLE)`, never a global replacement), and only for `DAILY`
+  requests — never `HOURLY`/`4H`, and Open/High/Low are never fabricated
+  from `SETTLE`.
+- **CORRA** — RIC construction is correct (`CRAU6`, `CRAH7`, ...), but the
+  current LSEG account lacks entitlement for this universe
+  (`TS.Interday.UserNotPermission.70112`) — a permissions issue, not an
+  Oscill8 bug.
+
 ## Templates and candidate generation
 
 A strategy shape can be specified as a dense grid of per-position weights,
@@ -332,15 +365,23 @@ an already-selected candidate's chart never touch LSEG (see
 pytest -q
 ```
 
-Current suite: **399 tests passing** (unit tests, LSEG fully mocked — no
-live session required; this is a snapshot as of Module 6B — re-run the
-command above for the up-to-date count).
+Current suite: **422 tests** (421 passing, 1 known environment-specific
+failure — see below; unit tests, LSEG fully mocked — no live session
+required; this is a snapshot as of the market-data correctness patch
+described above — re-run the command above for the up-to-date count).
+`tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema`
+fails in environments with pandas >= 3.0 (asserts `datetime64[ns]`; newer
+pandas defaults to `datetime64[us]`) — pre-existing, unrelated to any
+market-data change, not fixed here.
 
 `test_live_connection.py` is a manual smoke test, not part of the pytest
 suite — run it directly (`python test_live_connection.py`) on a machine
 with LSEG Workspace open. Only the `SOFR` market is currently marked
-`verified=True` in `core/config.py`; the other four markets' RIC roots
-are best-effort placeholders pending live verification.
+`verified=True` in `core/config.py`; SONIA/CORRA/ESTR/FED_FUNDS RIC roots
+have since been confirmed via live LSEG data pulls (see [Market RIC
+conventions](#market-ric-conventions--data-field-differences) above), but
+`verified=True` is reserved specifically for a live chain/search
+confirmation and has not been flipped for them.
 
 ## Repository structure
 

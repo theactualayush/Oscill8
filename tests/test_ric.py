@@ -122,6 +122,14 @@ def test_build_then_parse_round_trip(market_key, month, year):
         ("SONIA", 9, 2027, "SONU7"),
         # FED_FUNDS: root "FF", 2-digit year.
         ("FED_FUNDS", 6, 2027, "FFM27"),
+        # ESTR (€STR): root corrected "ESR" -> "SRE"; year digits
+        # corrected 1 -> 2. Confirmed live: SREU26 returned full
+        # daily OHLC/SETTLE/BID/ASK; the old "ESRU6" convention
+        # returned LSEG error 70005 ("The universe is not found").
+        ("ESTR", 9, 2026, "SREU26"),
+        ("ESTR", 12, 2026, "SREZ26"),
+        ("ESTR", 3, 2027, "SREH27"),
+        ("ESTR", 6, 2027, "SREM27"),
     ],
 )
 def test_build_ric_market_specific_conventions(market_key, month, year, expected):

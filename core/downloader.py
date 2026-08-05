@@ -175,16 +175,37 @@ _COLUMN_ALIASES = {
     "Volume": {"VOLUME", "ACVOL_UNS", "VOLUME_1"},
 }
 
+# SETTLE is not part of the canonical schema and is never a *required*
+# field (unlike _COLUMN_ALIASES above, its absence is not an error) --
+# it's an optional DAILY-only fallback source for Close. Some STIR
+# markets (e.g. SONIA at DAILY) return TRDPRC_1 entirely NA while
+# SETTLE carries the real daily price; others (SOFR, Fed Funds) have
+# both populated, and can differ slightly -- for those, the existing
+# TRDPRC_1-derived Close must remain the source of truth. Add more
+# aliases here if another market's live response uses a different
+# settlement-field name.
+_SETTLE_ALIASES = {"SETTLE"}
+
 _CANONICAL_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_columns(df: pd.DataFrame, *, settle_fallback_for_close: bool = False) -> pd.DataFrame:
     """Rename whatever columns LSEG returned to our canonical schema.
 
     Raises a clear, actionable error (listing the actual columns seen)
     if a required field can't be matched -- this is meant to be a fast
     fix the first time this runs against a live session, not a silent
     guess.
+
+    settle_fallback_for_close: when True (DAILY interval only -- see
+    _fetch_chunk), a "SETTLE" column, if present, row-wise fills any
+    NaN remaining in canonical Close after the primary Close alias
+    (TRDPRC_1/CLOSE/CLOSE_1) is coerced to numeric. It never overwrites
+    an already-populated Close value -- markets whose primary Close
+    source is fully populated (SOFR, Fed Funds) are unaffected even
+    though they also carry a populated SETTLE column. Never applied for
+    HOURLY/4H fetches -- SETTLE is a daily-only LSEG concept and
+    intraday semantics are unchanged.
     """
     rename_map = {}
     upper_cols = {c: str(c).upper() for c in df.columns}
@@ -200,6 +221,18 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
                 f"Update _COLUMN_ALIASES in downloader.py to add the missing alias."
             )
         rename_map[match] = canonical
+
+    settle_values = None
+    if settle_fallback_for_close:
+        settle_col = next(
+            (orig for orig, up in upper_cols.items() if up in _SETTLE_ALIASES), None
+        )
+        if settle_col is not None:
+            # Captured from the original (pre-rename/reset_index) frame,
+            # whose row order is preserved unchanged all the way through
+            # to the positional fillna below -- the chronological sort
+            # only happens on the final return line.
+            settle_values = pd.to_numeric(df[settle_col], errors="coerce").astype("float64").to_numpy()
 
     out = df.rename(columns=rename_map)
     out = out.reset_index().rename(columns={out.index.name or "index": "Date", "Date": "Date"})
@@ -223,6 +256,9 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         # a missing value, never pd.NA. The missing value itself is
         # preserved, not filled or dropped.
         out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+
+    if settle_values is not None:
+        out["Close"] = out["Close"].fillna(pd.Series(settle_values, index=out.index))
 
     return out.sort_values("Date").reset_index(drop=True)
 
@@ -287,7 +323,11 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
         logger.warning("No data returned for %s [%s -> %s]", ric, start, end)
         return pd.DataFrame(columns=_CANONICAL_COLUMNS)
 
-    return _normalize_columns(df)
+    # native_interval is "daily" only when the caller's top-level requested
+    # BarInterval is DAILY (see config.LSEG_NATIVE_INTERVAL) -- FOUR_HOUR
+    # also resolves to a native "hourly" fetch, so this correctly excludes
+    # it too, unchanged.
+    return _normalize_columns(df, settle_fallback_for_close=(native_interval == "daily"))
 
 
 # --------------------------------------------------------------------------
