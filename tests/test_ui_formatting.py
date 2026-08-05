@@ -60,8 +60,12 @@ _POS4 = tuple(position_column(i) for i in (1, 2, 3, 4))
 
 
 def test_build_definitions_from_grid_translates_valid_rows():
+    # Grid cells arrive as TextColumn strings, not numbers -- see
+    # ui.controls' column_config (verified empirically that a numeric
+    # NumberColumn cell renders the literal text "None" when blank in
+    # this Streamlit build, regardless of dtype).
     rows = [
-        {"Label": "Fly", _POS3[0]: 1, _POS3[1]: -2, _POS3[2]: 1},
+        {"Label": "Fly", _POS3[0]: "1", _POS3[1]: "-2", _POS3[2]: "1"},
     ]
     results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
 
@@ -74,7 +78,7 @@ def test_build_definitions_from_grid_translates_valid_rows():
 
 def test_build_definitions_from_grid_handles_gapped_ratio():
     # (2, -3, 0, 1) -- matches the CLAUDE.md-documented live-tested case.
-    rows = [{"Label": "Gapped", _POS4[0]: 2, _POS4[1]: -3, _POS4[2]: 0, _POS4[3]: 1}]
+    rows = [{"Label": "Gapped", _POS4[0]: "2", _POS4[1]: "-3", _POS4[2]: "0", _POS4[3]: "1"}]
     results = build_definitions_from_grid(rows, _POS4, "SOFR", BarInterval.DAILY)
 
     assert len(results) == 1
@@ -85,12 +89,33 @@ def test_build_definitions_from_grid_handles_gapped_ratio():
 
 def test_build_definitions_from_grid_multiple_rows():
     rows = [
-        {"Label": "Fly", _POS3[0]: 1, _POS3[1]: -2, _POS3[2]: 1},
-        {"Label": "Spread", _POS3[0]: 1, _POS3[1]: -1, _POS3[2]: 0},
+        {"Label": "Fly", _POS3[0]: "1", _POS3[1]: "-2", _POS3[2]: "1"},
+        {"Label": "Spread", _POS3[0]: "1", _POS3[1]: "-1", _POS3[2]: "0"},
     ]
     results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
     assert len(results) == 2
     assert [r.label for r in results] == ["Fly", "Spread"]
+
+
+def test_build_definitions_from_grid_treats_blank_text_cell_as_zero():
+    # An empty string is how an unpopulated TextColumn cell arrives --
+    # equivalent to an explicit 0 (skip this position), not an error.
+    rows = [{"Label": "Spread", _POS3[0]: "1", _POS3[1]: "-1", _POS3[2]: ""}]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
+    assert len(results) == 1
+    assert results[0].definition.offsets == (0, 1)
+    assert results[0].definition.weights == (1.0, -1.0)
+
+
+def test_build_definitions_from_grid_treats_incomplete_number_as_zero():
+    # A lone "-" or "." is a valid intermediate typing state under the
+    # grid's numeric-pattern validator but not a complete number --
+    # treated as blank/0 rather than raised as an error.
+    rows = [{"Label": "Spread", _POS3[0]: "1", _POS3[1]: "-1", _POS3[2]: "-"}]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
+    assert len(results) == 1
+    assert results[0].definition.offsets == (0, 1)
+    assert results[0].definition.weights == (1.0, -1.0)
 
 
 def test_build_definitions_from_grid_skips_all_zero_rows():

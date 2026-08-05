@@ -1,11 +1,12 @@
 """
 app.py
 
-Module 6A entry point: compact scan bar + strategy grid -> Run Scan ->
-Range-Bound Opportunities (status, ranking/filters, ranked result grid,
-skipped candidates) -> Selected Strategy summary. Thin orchestration
-only -- every analytics, filtering, and ranking computation is delegated
-to strategy_engine / range_analytics / template_scanner, unmodified.
+Module 6A/6B entry point: compact scan panel + strategy grid -> Run Scan
+-> Range-Bound Opportunities (status, ranking/filters, ranked result
+grid, skipped candidates) -> Selected Strategy summary -> Selected
+Strategy history chart. Thin orchestration only -- every analytics,
+filtering, ranking, and pricing computation is delegated to
+strategy_engine / range_analytics / template_scanner, unmodified.
 
 Run with: streamlit run ui/app.py
 """
@@ -41,8 +42,9 @@ render_scan_error()
 
 report = state.get_scan_report()
 display_lookback = state.get_display_lookback()
+scan_request = state.get_scan_request()
 
 if report is None:
     st.info("Configure a scan above and press **Run Scan**.")
 else:
-    render_results(report, display_lookback)
+    render_results(report, display_lookback, scan_request)

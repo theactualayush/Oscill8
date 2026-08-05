@@ -39,8 +39,13 @@ from template_scanner.templates import template_from_dense_weights
 _NAN = float("nan")
 
 CURVE_POSITION_HELP = (
-    "The ratio is rolled across all eligible contracts in the selected universe. "
-    "Use 0 to skip a curve position."
+    "Columns are consecutive curve positions (contract offsets). Templates roll "
+    "across the selected contract universe; blank cells are ignored."
+)
+
+PRIMARY_LOOKBACK_HELP = (
+    "Headline range metrics use this horizon. Other selected lookbacks are used "
+    "to measure stability."
 )
 
 
@@ -48,19 +53,41 @@ def position_column(index: int) -> str:
     """Name of the data_editor column for curve position `index` (1-based)
     -- shared by ui.controls (which builds the grid) and this module
     (which reads it back), so both sides agree on the naming without
-    duplicating the format string."""
+    duplicating the format string. This is the internal DataFrame column
+    key only; the column's displayed header is the bare number (see
+    ui.controls' column_config) -- CURVE_POSITION_HELP explains the
+    "curve position" terminology once, rather than repeating it in
+    every header."""
     return f"Curve Position {index}"
 
 
 def _cell_to_float(value: object) -> float:
-    """A blank/cleared data_editor cell arrives as None or NaN, not 0 --
-    treat both as 0 (an explicitly skipped curve position), matching the
-    grid's stated convention."""
+    """Parse one grid cell into a dense-weight float.
+
+    Position cells are Streamlit TextColumns (constrained client-side to
+    a numeric-looking pattern) rather than NumberColumns, specifically
+    so an unpopulated cell can render as genuinely blank -- verified
+    empirically that Streamlit 1.60.0's NumberColumn renders a blank/NaN
+    numeric cell as the literal text "None", regardless of dtype
+    (float64 NaN, object None, or pandas' nullable Float64 + pd.NA all
+    reproduce it), while TextColumn with an empty string renders
+    correctly blank.
+
+    Blank text, or an incomplete number left mid-edit (a lone "-" or
+    "."), means "skip this position" -- 0.0, same as an explicitly
+    typed 0.
+    """
     if value is None:
         return 0.0
     if isinstance(value, float) and math.isnan(value):
         return 0.0
-    return float(value)
+    text = str(value).strip()
+    if not text or text in ("-", ".", "-."):
+        return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -89,9 +116,12 @@ def build_definitions_from_grid(
     empty extra row in a dynamic grid) is silently skipped -- not an
     error. All strategy-shape validation (offsets/weights, market,
     interval, price_field) is delegated to template_from_dense_weights()
-    / StrategyDefinition -- never duplicated here. Because grid cells are
-    numeric-only (Streamlit's NumberColumn), the non-numeric-input error
-    case that free-text ratio entry required no longer applies here.
+    / StrategyDefinition -- never duplicated here. Grid cells are
+    constrained client-side to a numeric-looking pattern (see
+    ui.controls' TextColumn `validate` regex), and _cell_to_float()
+    treats anything that still isn't a clean number as blank/0 rather
+    than raising, so the non-numeric-input error case that free-text
+    ratio entry required does not apply here either.
     """
     results: list[TemplateRowResult] = []
     for i, row in enumerate(rows):

@@ -1,21 +1,20 @@
 """
 controls.py
 
-The compact scan bar (market/interval/dates/lookbacks/Run Scan) and the
-strategy grid (curve positions as columns, one row per template).
-Renders raw Streamlit controls and returns their current values as a
-plain ScanSetup -- it builds no StrategyDefinition/ScanRequest itself;
-that translation belongs to ui.scan_view + ui.formatting.
+The compact scan configuration panel (market/interval/dates/lookbacks/
+Run Scan) and the strategy grid (curve positions as columns, one row
+per template). Renders raw Streamlit controls and returns their current
+values as a plain ScanSetup -- it builds no StrategyDefinition/
+ScanRequest itself; that translation belongs to ui.scan_view +
+ui.formatting.
 
-The grid's column headers are plain curve-position numbers, not real
+The grid's column headers are bare curve-position numbers, not real
 contract codes: template_from_dense_weights() + generate_instances()
 roll a position-relative shape across every eligible starting point in
 the contract universe, so "position 1" is a different real RIC for each
 rolled instance -- there is no single fixed contract per column to show
-truthfully. An illustrative "first eligible combination" caption (pure
-core.futures_calendar calendar arithmetic, no LSEG call) gives a trader
-a concrete example without implying the grid represents one fixed set
-of real contracts.
+truthfully. See ui.formatting.CURVE_POSITION_HELP for the caption that
+explains this once, rather than repeating it per column.
 """
 
 from __future__ import annotations
@@ -26,22 +25,21 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from core import futures_calendar
 from core.config import MARKETS, BarInterval
 
-from ui.formatting import CURVE_POSITION_HELP, position_column
+from ui.formatting import CURVE_POSITION_HELP, PRIMARY_LOOKBACK_HELP, position_column
 
 _INTERVALS: tuple[BarInterval, ...] = (BarInterval.DAILY, BarInterval.HOURLY, BarInterval.FOUR_HOUR)
 _LOOKBACK_OPTIONS: tuple[int, ...] = (20, 40, 60, 90, 120)
 
-_DEFAULT_POSITIONS = 8
+_DEFAULT_POSITIONS = 6
 _MIN_POSITIONS = 2
 _MAX_POSITIONS = 12
 
 
 @dataclass(frozen=True)
 class ScanSetup:
-    """Everything the scan bar and strategy grid currently hold, read
+    """Everything the scan panel and strategy grid currently hold, read
     live from widget state -- not yet validated or translated into
     backend objects."""
 
@@ -61,37 +59,48 @@ class ScanSetup:
 def _clamp_session_value(key: str, valid_options: tuple, fallback) -> None:
     """Reset a widget's persisted session value if it's no longer among
     valid_options (e.g. the user deselected a lookback that was
-    previously chosen as the display lookback) -- avoids Streamlit
+    previously chosen as the primary lookback) -- avoids Streamlit
     raising on a selectbox whose stored value isn't in its options."""
     if st.session_state.get(key) not in valid_options:
         st.session_state[key] = fallback
 
 
 def _default_grid(n_positions: int) -> pd.DataFrame:
-    """One example row (a fly at the front of the curve) sized to
-    whatever position count is currently selected."""
-    base = [1.0, -2.0, 1.0] + [0.0] * max(0, n_positions - 3)
-    data = {"Label": ["Strategy 1"]}
+    """One example row (a fly at the front of the curve). Unpopulated
+    positions are an empty string, not a typed 0 -- position cells are
+    TextColumns (not NumberColumns; see _render_strategy_grid) so an
+    empty string renders as a genuinely blank cell instead of a
+    distracting row of zeros, while still meaning "skip this position"
+    once translated (see ui.formatting.build_definitions_from_grid).
+    """
+    base = ["1", "-2", "1"] + [""] * max(0, n_positions - 3)
+    data = {"Label": ["3M Fly"]}
     for i in range(1, n_positions + 1):
         data[position_column(i)] = [base[i - 1]]
     return pd.DataFrame(data)
 
 
-def _example_combination(market_key: str, contract_start, contract_end, n_positions: int) -> list[str]:
-    """Best-effort illustrative example only -- never blocks the grid.
-    Pure calendar arithmetic (core.futures_calendar), no LSEG call."""
-    try:
-        contracts = futures_calendar.generate_contracts(market_key, contract_start, contract_end)
-    except Exception:
-        return []
-    return contracts[:n_positions]
-
-
 def render_scan_setup() -> ScanSetup:
-    st.subheader("Oscill8 · Range-Bound Scanner")
+    main, _ = st.columns([5, 1])
+    with main:
+        with st.container(border=True):
+            st.subheader("Oscill8 — Range-Bound Scanner")
+            setup_values = _render_scan_bar()
 
+        with st.container(border=True):
+            grid_rows, position_columns = _render_strategy_grid()
+
+    return ScanSetup(
+        grid_rows=grid_rows,
+        position_columns=position_columns,
+        **setup_values,
+    )
+
+
+def _render_scan_bar() -> dict:
     today = date.today()
-    row1 = st.columns(6)
+
+    row1 = st.columns([1, 1, 2, 2])
     with row1[0]:
         market_key = st.selectbox(
             "Market", list(MARKETS.keys()), format_func=lambda k: MARKETS[k].name, key="oscill8_market"
@@ -101,31 +110,46 @@ def render_scan_setup() -> ScanSetup:
             "Interval", _INTERVALS, format_func=lambda i: i.value, key="oscill8_interval"
         )
     with row1[2]:
-        contract_start = st.date_input(
-            "Universe start", value=today - timedelta(days=730), key="oscill8_contract_start"
-        )
+        st.caption("Universe")
+        u1, u2 = st.columns(2)
+        with u1:
+            contract_start = st.date_input(
+                "Start", value=today - timedelta(days=730), key="oscill8_contract_start",
+                label_visibility="collapsed",
+            )
+        with u2:
+            contract_end = st.date_input(
+                "End", value=today + timedelta(days=730), key="oscill8_contract_end",
+                label_visibility="collapsed",
+            )
     with row1[3]:
-        contract_end = st.date_input(
-            "Universe end", value=today + timedelta(days=730), key="oscill8_contract_end"
-        )
-    with row1[4]:
-        price_start = st.date_input(
-            "History start", value=today - timedelta(days=1095), key="oscill8_price_start"
-        )
-    with row1[5]:
-        price_end = st.date_input("History end", value=today, key="oscill8_price_end")
+        st.caption("History")
+        h1, h2 = st.columns(2)
+        with h1:
+            price_start = st.date_input(
+                "Start", value=today - timedelta(days=1095), key="oscill8_price_start",
+                label_visibility="collapsed",
+            )
+        with h2:
+            price_end = st.date_input(
+                "End", value=today, key="oscill8_price_end", label_visibility="collapsed",
+            )
 
-    row2 = st.columns([4, 1.5, 1.5])
+    row2 = st.columns([3, 1.5, 1.5])
     with row2[0]:
         lookbacks = st.multiselect(
-            "Lookbacks", _LOOKBACK_OPTIONS, default=list(_LOOKBACK_OPTIONS), key="oscill8_lookbacks"
+            "Lookbacks (bars)", _LOOKBACK_OPTIONS, default=list(_LOOKBACK_OPTIONS), key="oscill8_lookbacks"
         )
     lookbacks_sorted = tuple(sorted(set(lookbacks)))
     with row2[1]:
         if lookbacks_sorted:
             _clamp_session_value("oscill8_display_lookback", lookbacks_sorted, lookbacks_sorted[0])
             display_lookback = st.selectbox(
-                "Display", lookbacks_sorted, key="oscill8_display_lookback"
+                "Primary Lookback",
+                lookbacks_sorted,
+                format_func=lambda n: f"{n} bars",
+                help=PRIMARY_LOOKBACK_HELP,
+                key="oscill8_display_lookback",
             )
         else:
             st.warning("Select a lookback")
@@ -134,22 +158,48 @@ def render_scan_setup() -> ScanSetup:
         st.write("")  # baseline-align the button with the selectboxes above
         run_clicked = st.button("▶ Run Scan", type="primary", width="stretch")
 
-    st.subheader("Strategy Templates")
-    n_positions = st.number_input(
-        "Positions",
-        min_value=_MIN_POSITIONS,
-        max_value=_MAX_POSITIONS,
-        value=_DEFAULT_POSITIONS,
-        step=1,
-        key="oscill8_positions",
-        help="How many curve positions to show. Changing this resets the grid below.",
-    )
+    return {
+        "market_key": market_key,
+        "interval": interval,
+        "contract_start": contract_start,
+        "contract_end": contract_end,
+        "price_start": price_start,
+        "price_end": price_end,
+        "lookbacks": lookbacks_sorted,
+        "display_lookback": display_lookback,
+        "run_clicked": run_clicked,
+    }
+
+
+def _render_strategy_grid() -> tuple[list[dict], tuple[str, ...]]:
+    header_col, positions_col = st.columns([4, 1])
+    with header_col:
+        st.subheader("Strategy Templates")
+    with positions_col:
+        n_positions = st.number_input(
+            "Positions",
+            min_value=_MIN_POSITIONS,
+            max_value=_MAX_POSITIONS,
+            value=_DEFAULT_POSITIONS,
+            step=1,
+            key="oscill8_positions",
+            help="How many curve positions to show. Changing this resets the grid below.",
+        )
+
     st.caption(CURVE_POSITION_HELP)
 
     position_columns = tuple(position_column(i) for i in range(1, n_positions + 1))
     column_config = {"Label": st.column_config.TextColumn("Label", width="small")}
-    for col in position_columns:
-        column_config[col] = st.column_config.NumberColumn(col, width="small", step=1)
+    for i, col in enumerate(position_columns, start=1):
+        # TextColumn, not NumberColumn: verified empirically that this
+        # Streamlit build renders an unpopulated/NaN NumberColumn cell as
+        # the literal text "None" regardless of dtype, while a TextColumn
+        # with an empty string renders correctly blank. The `validate`
+        # regex still constrains committed input to a numeric-looking
+        # pattern (optional sign, digits, optional decimal) or blank.
+        column_config[col] = st.column_config.TextColumn(
+            str(i), width="small", validate=r"^-?\d*\.?\d*$"
+        )
 
     edited = st.data_editor(
         _default_grid(n_positions),
@@ -159,20 +209,4 @@ def render_scan_setup() -> ScanSetup:
     )
     grid_rows = edited.to_dict("records")
 
-    example = _example_combination(market_key, contract_start, contract_end, n_positions)
-    if example:
-        st.caption(f"Example — first eligible combination in the selected universe: {' / '.join(example)}")
-
-    return ScanSetup(
-        market_key=market_key,
-        interval=interval,
-        contract_start=contract_start,
-        contract_end=contract_end,
-        price_start=price_start,
-        price_end=price_end,
-        lookbacks=lookbacks_sorted,
-        display_lookback=display_lookback,
-        grid_rows=grid_rows,
-        position_columns=position_columns,
-        run_clicked=run_clicked,
-    )
+    return grid_rows, position_columns
