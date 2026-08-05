@@ -1,13 +1,13 @@
 """
 formatting.py
 
-Pure helper functions for Module 6A's Streamlit UI: parsing user-entered
-ratio text into dense weight vectors, translating template-grid rows
-into strategy_engine.StrategyDefinition via the existing
+Pure helper functions for Module 6A's Streamlit UI: translating
+strategy-grid rows (curve position -> ratio) into
+strategy_engine.StrategyDefinition via the existing
 template_scanner.template_from_dense_weights(), constructing filter/
 ranking accessors from template_scanner's existing canonical metric
 resolution (FilterCriterion / SortKey / at_lookback / stability), and
-formatting values for the result grid.
+formatting values for the result grid and the selected-strategy summary.
 
 No analytics, filtering, or ranking value is computed here -- every
 number and every pass/fail or sort decision comes from strategy_engine /
@@ -19,7 +19,6 @@ display.
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -32,108 +31,136 @@ from strategy_engine.definitions import StrategyDefinition
 from template_scanner.filters import FilterCriterion
 from template_scanner.filters import at_lookback as filter_at_lookback
 from template_scanner.filters import stability as filter_stability
+from template_scanner.metrics import at_lookback as metrics_at_lookback
 from template_scanner.ranking import SortKey
+from template_scanner.scan_results import ScanCandidateResult
 from template_scanner.templates import template_from_dense_weights
 
-_RATIO_SPLIT_RE = re.compile(r"[|,\s]+")
 _NAN = float("nan")
 
+CURVE_POSITION_HELP = (
+    "The ratio is rolled across all eligible contracts in the selected universe. "
+    "Use 0 to skip a curve position."
+)
 
-def parse_dense_weights(ratio_text: str) -> list[float]:
-    """Parse a user-entered ratio string (e.g. "1 | -2 | 1") into a dense
-    weight vector, one weight per consecutive curve position. Accepts
-    '|', ',' or whitespace as separators.
 
-    Raises:
-        ValueError: the text is empty (after stripping separators) or
-            contains a non-numeric token.
-    """
-    tokens = [t for t in _RATIO_SPLIT_RE.split((ratio_text or "").strip()) if t]
-    if not tokens:
-        raise ValueError("Ratio is empty")
-    try:
-        return [float(t) for t in tokens]
-    except ValueError as exc:
-        raise ValueError(f"'{ratio_text}' contains a non-numeric value") from exc
+def position_column(index: int) -> str:
+    """Name of the data_editor column for curve position `index` (1-based)
+    -- shared by ui.controls (which builds the grid) and this module
+    (which reads it back), so both sides agree on the naming without
+    duplicating the format string."""
+    return f"Curve Position {index}"
+
+
+def _cell_to_float(value: object) -> float:
+    """A blank/cleared data_editor cell arrives as None or NaN, not 0 --
+    treat both as 0 (an explicitly skipped curve position), matching the
+    grid's stated convention."""
+    if value is None:
+        return 0.0
+    if isinstance(value, float) and math.isnan(value):
+        return 0.0
+    return float(value)
 
 
 @dataclass(frozen=True)
 class TemplateRowResult:
-    """One template-grid row's parse outcome -- either a StrategyDefinition
-    or a user-facing error message, never both."""
+    """One strategy-grid row's translation outcome -- either a
+    StrategyDefinition or a user-facing error message, never both."""
 
     row_index: int
-    ratio_text: str
+    label: str
     definition: StrategyDefinition | None
     error: str | None
 
 
-def build_definitions(
-    ratio_rows: Sequence[str],
+def build_definitions_from_grid(
+    rows: Sequence[dict],
+    position_columns: Sequence[str],
     market_key: str,
     interval: BarInterval,
     price_field: str = "Close",
 ) -> list[TemplateRowResult]:
-    """Translate template-grid ratio rows into StrategyDefinitions.
+    """Translate strategy-grid rows into StrategyDefinitions.
 
-    Blank rows (an empty extra row in a dynamic grid) are silently
-    skipped -- not an error. All strategy-shape validation
-    (offsets/weights, market, interval, price_field) is delegated to
-    template_from_dense_weights() / StrategyDefinition -- never
-    duplicated here.
+    `rows` is one dict per grid row (as returned by
+    `DataFrame.to_dict("records")`), each holding an optional "Label" and
+    a value per entry in `position_columns`. An all-zero/blank row (an
+    empty extra row in a dynamic grid) is silently skipped -- not an
+    error. All strategy-shape validation (offsets/weights, market,
+    interval, price_field) is delegated to template_from_dense_weights()
+    / StrategyDefinition -- never duplicated here. Because grid cells are
+    numeric-only (Streamlit's NumberColumn), the non-numeric-input error
+    case that free-text ratio entry required no longer applies here.
     """
     results: list[TemplateRowResult] = []
-    for i, ratio_text in enumerate(ratio_rows):
-        text = (ratio_text or "").strip()
-        if not text:
+    for i, row in enumerate(rows):
+        label = str(row.get("Label") or "").strip() or f"Strategy {i + 1}"
+        dense_weights = [_cell_to_float(row.get(col)) for col in position_columns]
+        if not any(w != 0 for w in dense_weights):
             continue
         try:
-            weights = parse_dense_weights(text)
-            definition = template_from_dense_weights(market_key, weights, interval, price_field)
-            results.append(TemplateRowResult(i, text, definition, None))
+            definition = template_from_dense_weights(market_key, dense_weights, interval, price_field)
+            results.append(TemplateRowResult(i, label, definition, None))
         except ValueError as exc:
-            results.append(TemplateRowResult(i, text, None, str(exc)))
+            results.append(TemplateRowResult(i, label, None, str(exc)))
     return results
 
 
 # ---------------------------------------------------------------------
-# Section E -- Range-Bound Filters
+# Range-Bound Filters
 # ---------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class FilterSpec:
     """One available filter: a label, the metric it resolves (via
-    template_scanner's canonical metric_value()/at_lookback()), and
-    which bound ("min" or "max") the user-entered threshold applies to."""
+    template_scanner's canonical metric_value()/at_lookback()), which
+    bound ("min" or "max") the user-entered threshold applies to, and a
+    short trader-oriented help string shown as a tooltip."""
 
     key: str
     label: str
     field: str
     bound: str  # "min" or "max"
+    help_text: str
 
 
 FILTER_SPECS: tuple[FilterSpec, ...] = (
-    FilterSpec("efficiency_ratio_max", "Efficiency Ratio (max)", "efficiency_ratio", "max"),
     FilterSpec(
-        "normalized_crossing_frequency_min",
-        "Normalized Crossing Frequency (min)",
-        "normalized_crossing_frequency",
-        "min",
+        "efficiency_ratio_max", "Efficiency Ratio (max)", "efficiency_ratio", "max",
+        "Lower means the strategy moved less directionally and oscillated more.",
     ),
-    FilterSpec("ar1_beta_max", "AR(1) Beta (max)", "ar1_beta", "max"),
-    FilterSpec("half_life_max", "Half-Life (max)", "half_life", "max"),
-    FilterSpec("range_width_robust_max", "Robust Range Width (max)", "range_width_robust", "max"),
-    FilterSpec("ar1_r_squared_min", "AR(1) R² (min)", "ar1_r_squared", "min"),
+    FilterSpec(
+        "normalized_crossing_frequency_min", "Normalized Crossing Frequency (min)",
+        "normalized_crossing_frequency", "min",
+        "Higher means the strategy crossed its equilibrium more frequently.",
+    ),
+    FilterSpec(
+        "ar1_beta_max", "AR(1) Beta (max)", "ar1_beta", "max",
+        "Lower generally indicates faster mean reversion.",
+    ),
+    FilterSpec(
+        "half_life_max", "Half-Life (max)", "half_life", "max",
+        "Estimated time for a deviation from equilibrium to decay by half.",
+    ),
+    FilterSpec(
+        "range_width_robust_max", "Robust Range Width (max)", "range_width_robust", "max",
+        "Width of the strategy's typical historical trading range.",
+    ),
+    FilterSpec(
+        "ar1_r_squared_min", "AR(1) R² (min)", "ar1_r_squared", "min",
+        "How well the simple mean-reversion model explains historical movements.",
+    ),
 )
 
-# One stability filter (Module 4B), per the Module 6A spec's "potentially
-# one useful stability filter if it integrates cleanly": bounds how much
-# a candidate's efficiency ratio moves across the requested lookbacks.
+# One stability filter (Module 4B): bounds how much a candidate's
+# efficiency ratio moves across the requested lookbacks.
 STABILITY_FILTER_SPEC = FilterSpec(
     "efficiency_ratio_stability_stdev_max",
     "Efficiency Ratio Stability, stdev (max)",
     "efficiency_ratio",
     "max",
+    "How consistent this metric has been across the requested lookback windows.",
 )
 
 ALL_FILTER_SPECS: tuple[FilterSpec, ...] = FILTER_SPECS + (STABILITY_FILTER_SPEC,)
@@ -172,7 +199,7 @@ def build_filter_criteria(
 
 
 # ---------------------------------------------------------------------
-# Section F -- Ranking
+# Ranking
 # ---------------------------------------------------------------------
 
 RANK_METRIC_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -198,7 +225,7 @@ def build_sort_keys(
     secondary_ascending: bool,
     display_lookback: int,
 ) -> list[SortKey]:
-    """Build the SortKey list for rank_results() from Section F's primary
+    """Build the SortKey list for rank_results() from the primary
     (required) and optional secondary ranking controls."""
     keys = [
         SortKey(accessor=filter_at_lookback(primary_field, display_lookback), ascending=primary_ascending)
@@ -213,30 +240,72 @@ def build_sort_keys(
     return keys
 
 
+def format_ranked_by(rank_state: dict) -> str:
+    """Render the current ranking as a trader-readable label, e.g.
+    "Ranked by: Efficiency Ratio ↑ · Lower is better, then AR(1) Beta ↓".
+
+    "Lower/Higher is better" follows mechanically from the sort
+    direction (ascending puts the smallest value at Rank #1) -- this is
+    a property of the sort itself, not a new domain judgment about any
+    particular metric.
+    """
+    label_by_field = {field: label for label, field in RANK_METRIC_OPTIONS}
+
+    def _describe(field: str, ascending: bool) -> str:
+        label = label_by_field.get(field, field)
+        arrow = "↑" if ascending else "↓"
+        return f"{label} {arrow}"
+
+    primary = _describe(rank_state["primary_field"], rank_state["primary_ascending"])
+    better = "Lower is better" if rank_state["primary_ascending"] else "Higher is better"
+    text = f"Ranked by: {primary} · {better}"
+
+    secondary_field = rank_state.get("secondary_field")
+    if secondary_field and secondary_field != NO_SECONDARY_RANK:
+        secondary = _describe(secondary_field, rank_state["secondary_ascending"])
+        text += f", then {secondary}"
+    return text
+
+
 # ---------------------------------------------------------------------
-# Section G -- Result grid formatting
+# Result grid formatting
 # ---------------------------------------------------------------------
 
 # (display_label, source_column, kind) -- source_column matches
 # template_scanner.scan_results.results_to_dataframe()'s existing
 # columns exactly; nothing here recomputes a value that module doesn't
-# already provide.
+# already provide. Curated to the trader-facing subset -- Robust Low/
+# High, Realized Vol (bp), and AR(1) R² stay reachable via the selected
+# candidate rather than as primary-table columns.
 DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("Strategy (RICs)", "rics", "rics"),
-    ("Weights", "weights", "weights"),
+    ("Strategy", "rics", "rics"),
+    ("Ratio", "weights", "weights"),
     ("Current", "current_price", "number"),
     ("Median", "median", "number"),
-    ("Robust Low", "range_low_robust", "number"),
-    ("Robust High", "range_high_robust", "number"),
-    ("Robust Width", "range_width_robust", "number"),
-    ("Range Position", "range_position_robust", "percent"),
-    ("Realized Vol (bp)", "realized_vol_bp", "number"),
-    ("Efficiency Ratio", "efficiency_ratio", "number"),
-    ("Norm. Crossing Freq", "normalized_crossing_frequency", "percent"),
-    ("AR(1) Beta", "ar1_beta", "number"),
+    ("Pos", "range_position_robust", "percent"),
+    ("Width", "range_width_robust", "number"),
+    ("ER", "efficiency_ratio", "number"),
+    ("Cross Freq", "normalized_crossing_frequency", "percent"),
     ("Half-Life", "half_life", "number"),
-    ("AR(1) R²", "ar1_r_squared", "number"),
+    ("AR1 β", "ar1_beta", "number"),
 )
+
+# Tooltip text for the result-grid column headers with a non-obvious
+# meaning -- shown via st.column_config's `help=`. Same wording as the
+# matching FilterSpec.help_text where one exists.
+RESULT_COLUMN_HELP: dict[str, str] = {
+    "Pos": (
+        "Current level's position within the estimated robust range. "
+        "0% is near the lower bound; 100% is near the upper bound."
+    ),
+    "Width": "Width of the strategy's typical historical trading range.",
+    "ER": "Lower means the strategy moved less directionally and oscillated more.",
+    "Cross Freq": "Higher means the strategy crossed its equilibrium more frequently.",
+    "Half-Life": "Estimated time for a deviation from equilibrium to decay by half.",
+    "AR1 β": "Lower generally indicates faster mean reversion.",
+}
+
+RANK_COLUMN = "Rank"
 
 
 def _is_nan(value: object) -> bool:
@@ -244,9 +313,9 @@ def _is_nan(value: object) -> bool:
 
 
 def fmt_number(value: float, decimals: int = 4) -> str:
-    """Format a scalar for display; NaN/None render as '—' -- Section
-    I's rule that insufficient-history/undefined metrics render
-    gracefully rather than as an exception or a raw 'nan'."""
+    """Format a scalar for display; NaN/None render as '—' rather than
+    raising or showing a raw 'nan' -- insufficient-history/undefined
+    metrics render gracefully."""
     if _is_nan(value):
         return "—"
     if isinstance(value, float):
@@ -265,10 +334,10 @@ def fmt_percent(value: float, decimals: int = 1) -> str:
 
 def to_display_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
     """Curate + format template_scanner.results_to_dataframe()'s output
-    into the trader-friendly subset from Section G. Row order/position
-    is preserved exactly (no sorting/filtering here) so it keeps mapping
-    to the same-position entry in the ranked ScanCandidateResult list
-    the caller built `results_df` from.
+    into the trader-friendly subset above. Row order/position is
+    preserved exactly (no sorting/filtering here) so it keeps mapping to
+    the same-position entry in the ranked ScanCandidateResult list the
+    caller built `results_df` from.
     """
     labels = [label for label, _, _ in DISPLAY_COLUMNS]
     if results_df.empty:
@@ -286,3 +355,32 @@ def to_display_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
         else:
             columns[label] = series.apply(fmt_number)
     return pd.DataFrame(columns)
+
+
+def add_rank_column(display_df: pd.DataFrame) -> pd.DataFrame:
+    """Prepend a `Rank` column (#1, #2, ...) reflecting the DataFrame's
+    current row order. Purely a display-layer position label over an
+    already-`rank_results()`-sorted list -- never a new metric."""
+    ranked = display_df.copy()
+    ranked.insert(0, RANK_COLUMN, [f"#{i + 1}" for i in range(len(ranked))])
+    return ranked
+
+
+def selected_strategy_summary(candidate: ScanCandidateResult, display_lookback: int) -> dict[str, str]:
+    """Format the headline stats for the Selected Strategy panel:
+    identity, ratio, interval, current level, robust range (combined
+    low-high), median, range position, and efficiency ratio -- all read
+    directly off the candidate's already-computed RangeAnalytics at
+    `display_lookback`, nothing recomputed.
+    """
+    analytics = metrics_at_lookback(candidate.multi_lookback, display_lookback)
+    return {
+        "rics": " / ".join(candidate.rics),
+        "weights": " / ".join(fmt_number(w, 2) for w in candidate.weights),
+        "interval": candidate.interval.value,
+        "current": fmt_number(analytics.current_price),
+        "robust_range": f"{fmt_number(analytics.range_low_robust)} – {fmt_number(analytics.range_high_robust)}",
+        "median": fmt_number(analytics.median),
+        "position": fmt_percent(analytics.range_position_robust),
+        "efficiency_ratio": fmt_number(analytics.efficiency_ratio),
+    }

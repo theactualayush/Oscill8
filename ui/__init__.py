@@ -11,11 +11,12 @@ display.
 
 app.py            Entry point / page orchestration.
 state.py          Session-state keys for the expensive scan result.
-controls.py       Section A/B widgets: scan setup + template grid.
-scan_view.py      Section C/D: builds ScanRequest, calls run_scan(),
-                   renders the skipped-candidates section.
-results_view.py   Section E/F/G: filters, ranking, result grid, and
-                   row -> ScanCandidateResult selection.
-formatting.py     Pure helpers: ratio parsing, template-row translation,
-                   filter/sort-key construction, display formatting.
+controls.py       Compact scan bar + strategy grid (curve positions as
+                   columns, one row per template).
+scan_view.py      Run Scan: builds ScanRequest, calls run_scan().
+results_view.py   "Range-Bound Opportunities": status, ranking/filters
+                   popovers, ranked result grid, row -> ScanCandidateResult
+                   selection, Selected Strategy summary, skipped candidates.
+formatting.py     Pure helpers: grid-row translation, filter/sort-key
+                   construction, ranked-by/rank-column/selection formatting.
 """

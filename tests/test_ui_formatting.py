@@ -1,11 +1,11 @@
 """
 test_ui_formatting.py
 
-Tests for Module 6A's pure UI helper logic (ui/formatting.py): ratio
-parsing, template-row translation, filter/sort-key construction, and
-display formatting. No Streamlit rendering is exercised here -- these
-are plain functions operating on plain data, backed by the real,
-unmodified strategy_engine/template_scanner objects.
+Tests for Module 6A's pure UI helper logic (ui/formatting.py):
+strategy-grid-row translation, filter/sort-key construction, and result/
+selection display formatting. No Streamlit rendering is exercised here
+-- these are plain functions operating on plain data, backed by the
+real, unmodified strategy_engine/template_scanner objects.
 """
 
 from __future__ import annotations
@@ -29,88 +29,94 @@ from ui.formatting import (
     FILTER_SPECS,
     NO_SECONDARY_RANK,
     STABILITY_FILTER_SPEC,
-    build_definitions,
+    add_rank_column,
+    build_definitions_from_grid,
     build_filter_criteria,
     build_sort_keys,
     fmt_number,
     fmt_percent,
-    parse_dense_weights,
+    format_ranked_by,
+    position_column,
+    selected_strategy_summary,
     to_display_dataframe,
 )
 
 
 # ---------------------------------------------------------------------
-# parse_dense_weights
+# position_column
 # ---------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("1 | -2 | 1", [1.0, -2.0, 1.0]),
-        ("1,-2,1", [1.0, -2.0, 1.0]),
-        ("1 -2 1", [1.0, -2.0, 1.0]),
-        ("2, -3, 0, 1", [2.0, -3.0, 0.0, 1.0]),
-        (" 1  |  -1 ", [1.0, -1.0]),
-    ],
-)
-def test_parse_dense_weights_accepts_common_separators(text, expected):
-    assert parse_dense_weights(text) == expected
-
-
-@pytest.mark.parametrize("text", ["", "   ", "|||"])
-def test_parse_dense_weights_rejects_empty(text):
-    with pytest.raises(ValueError, match="empty"):
-        parse_dense_weights(text)
-
-
-def test_parse_dense_weights_rejects_non_numeric_token():
-    with pytest.raises(ValueError, match="non-numeric"):
-        parse_dense_weights("1 | abc | 1")
+def test_position_column_naming():
+    assert position_column(1) == "Curve Position 1"
+    assert position_column(8) == "Curve Position 8"
 
 
 # ---------------------------------------------------------------------
-# build_definitions
+# build_definitions_from_grid
 # ---------------------------------------------------------------------
 
-def test_build_definitions_translates_valid_rows():
-    results = build_definitions(["1 | -2 | 1", "2, -3, 0, 1"], "SOFR", BarInterval.DAILY)
+_POS3 = tuple(position_column(i) for i in (1, 2, 3))
+_POS4 = tuple(position_column(i) for i in (1, 2, 3, 4))
 
-    assert len(results) == 2
-    assert all(r.error is None for r in results)
 
+def test_build_definitions_from_grid_translates_valid_rows():
+    rows = [
+        {"Label": "Fly", _POS3[0]: 1, _POS3[1]: -2, _POS3[2]: 1},
+    ]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
+
+    assert len(results) == 1
+    assert results[0].error is None
     fly = results[0].definition
     assert fly.offsets == (0, 1, 2)
     assert fly.weights == (1.0, -2.0, 1.0)
 
+
+def test_build_definitions_from_grid_handles_gapped_ratio():
     # (2, -3, 0, 1) -- matches the CLAUDE.md-documented live-tested case.
-    gapped = results[1].definition
+    rows = [{"Label": "Gapped", _POS4[0]: 2, _POS4[1]: -3, _POS4[2]: 0, _POS4[3]: 1}]
+    results = build_definitions_from_grid(rows, _POS4, "SOFR", BarInterval.DAILY)
+
+    assert len(results) == 1
+    gapped = results[0].definition
     assert gapped.offsets == (0, 1, 3)
     assert gapped.weights == (2.0, -3.0, 1.0)
 
 
-def test_build_definitions_skips_blank_rows():
-    results = build_definitions(["1 | -2 | 1", "", "   ", None], "SOFR", BarInterval.DAILY)
-    assert len(results) == 1
-    assert results[0].definition is not None
-
-
-def test_build_definitions_reports_invalid_rows_without_blocking_others():
-    results = build_definitions(["1 | -2 | 1", "abc"], "SOFR", BarInterval.DAILY)
-
+def test_build_definitions_from_grid_multiple_rows():
+    rows = [
+        {"Label": "Fly", _POS3[0]: 1, _POS3[1]: -2, _POS3[2]: 1},
+        {"Label": "Spread", _POS3[0]: 1, _POS3[1]: -1, _POS3[2]: 0},
+    ]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
     assert len(results) == 2
-    valid = [r for r in results if r.error is None]
-    invalid = [r for r in results if r.error is not None]
-    assert len(valid) == 1
-    assert len(invalid) == 1
-    assert invalid[0].ratio_text == "abc"
-    assert invalid[0].definition is None
+    assert [r.label for r in results] == ["Fly", "Spread"]
 
 
-def test_build_definitions_reports_all_zero_ratio_as_error():
-    results = build_definitions(["0 | 0"], "SOFR", BarInterval.DAILY)
+def test_build_definitions_from_grid_skips_all_zero_rows():
+    rows = [
+        {"Label": "Fly", _POS3[0]: 1, _POS3[1]: -2, _POS3[2]: 1},
+        {"Label": "Blank", _POS3[0]: 0, _POS3[1]: 0, _POS3[2]: 0},
+    ]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
     assert len(results) == 1
-    assert results[0].error is not None
-    assert results[0].definition is None
+    assert results[0].label == "Fly"
+
+
+def test_build_definitions_from_grid_treats_missing_and_nan_cells_as_zero():
+    rows = [
+        {"Label": "Spread", _POS3[0]: 1, _POS3[1]: float("nan")},  # third column absent entirely
+    ]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
+    assert len(results) == 1
+    assert results[0].definition.offsets == (0,)
+    assert results[0].definition.weights == (1.0,)
+
+
+def test_build_definitions_from_grid_defaults_label_when_blank():
+    rows = [{"Label": "", _POS3[0]: 1, _POS3[1]: -1, _POS3[2]: 0}]
+    results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
+    assert results[0].label == "Strategy 1"
 
 
 # ---------------------------------------------------------------------
@@ -154,6 +160,11 @@ def test_build_filter_criteria_includes_stability_filter_when_enabled():
     assert criteria[0].max_value == 0.1
 
 
+def test_every_filter_spec_has_help_text():
+    for spec in ALL_FILTER_SPECS:
+        assert spec.help_text
+
+
 def test_every_filter_spec_accessor_resolves_against_a_real_candidate(_scan_candidate):
     filter_state = {
         spec.key: {"enabled": True, "value": 10_000.0} for spec in FILTER_SPECS
@@ -167,7 +178,7 @@ def test_every_filter_spec_accessor_resolves_against_a_real_candidate(_scan_cand
 
 
 # ---------------------------------------------------------------------
-# build_sort_keys
+# build_sort_keys / format_ranked_by
 # ---------------------------------------------------------------------
 
 def test_build_sort_keys_primary_only():
@@ -188,6 +199,50 @@ def test_build_sort_keys_with_secondary():
 def test_build_sort_keys_secondary_none_field_omitted():
     keys = build_sort_keys("efficiency_ratio", True, None, True, display_lookback=20)
     assert len(keys) == 1
+
+
+def test_format_ranked_by_primary_only_ascending():
+    rank_state = {
+        "primary_field": "efficiency_ratio",
+        "primary_ascending": True,
+        "secondary_field": None,
+        "secondary_ascending": True,
+    }
+    text = format_ranked_by(rank_state)
+    assert text == "Ranked by: Efficiency Ratio ↑ · Lower is better"
+
+
+def test_format_ranked_by_descending_says_higher_is_better():
+    rank_state = {
+        "primary_field": "ar1_r_squared",
+        "primary_ascending": False,
+        "secondary_field": None,
+        "secondary_ascending": True,
+    }
+    text = format_ranked_by(rank_state)
+    assert "↓" in text
+    assert "Higher is better" in text
+
+
+def test_format_ranked_by_includes_secondary_when_set():
+    rank_state = {
+        "primary_field": "efficiency_ratio",
+        "primary_ascending": True,
+        "secondary_field": "ar1_beta",
+        "secondary_ascending": False,
+    }
+    text = format_ranked_by(rank_state)
+    assert "then AR(1) Beta ↓" in text
+
+
+def test_format_ranked_by_omits_secondary_when_none():
+    rank_state = {
+        "primary_field": "efficiency_ratio",
+        "primary_ascending": True,
+        "secondary_field": NO_SECONDARY_RANK,
+        "secondary_ascending": True,
+    }
+    assert "then" not in format_ranked_by(rank_state)
 
 
 # ---------------------------------------------------------------------
@@ -223,10 +278,29 @@ def test_to_display_dataframe_preserves_row_order_and_formats_values(_scan_candi
     display = to_display_dataframe(results_df)
 
     assert len(display) == 1
-    assert display.iloc[0]["Strategy (RICs)"] == " / ".join(_scan_candidate.rics)
-    assert display.iloc[0]["Weights"] == "1.00 / -2.00 / 1.00"
+    assert display.iloc[0]["Strategy"] == " / ".join(_scan_candidate.rics)
+    assert display.iloc[0]["Ratio"] == "1.00 / -2.00 / 1.00"
     # current_price is a real float for this fixture -- never the NaN dash.
     assert display.iloc[0]["Current"] != "—"
+
+
+def test_add_rank_column_prepends_sequential_rank():
+    df = pd.DataFrame({"Strategy": ["A", "B", "C"]})
+    ranked = add_rank_column(df)
+    assert list(ranked.columns)[0] == "Rank"
+    assert list(ranked["Rank"]) == ["#1", "#2", "#3"]
+    # Row order/content otherwise untouched.
+    assert list(ranked["Strategy"]) == ["A", "B", "C"]
+
+
+def test_selected_strategy_summary_fields(_scan_candidate):
+    summary = selected_strategy_summary(_scan_candidate, display_lookback=20)
+
+    assert summary["rics"] == " / ".join(_scan_candidate.rics)
+    assert summary["weights"] == "1.00 / -2.00 / 1.00"
+    assert summary["interval"] == "DAILY"
+    assert "–" in summary["robust_range"]  # combined "low – high" string
+    assert summary["current"] != "—"
 
 
 # ---------------------------------------------------------------------

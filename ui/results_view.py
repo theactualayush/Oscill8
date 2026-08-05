@@ -1,17 +1,19 @@
 """
 results_view.py
 
-Section E (Range-Bound Filters), Section F (Ranking), and Section G
-(Result Grid + selection). Operates entirely on a ScanReport already in
-session state -- never calls run_scan()/build_history()/get_history.
-Filtering and ranking read directly off the ALREADY-COMPUTED Module 4
-analytics and recompute on every rerun (Section H): only the scan itself
-is expensive and gated behind Run Scan in scan_view.py.
+The dominant post-scan section: "Range-Bound Opportunities" (status +
+ranking/filters + the ranked result grid), the Selected Strategy summary,
+and the skipped-candidates detail -- all operating purely on a ScanReport
+already in session state. Never calls run_scan()/build_history()/
+get_history(). Filtering and ranking read directly off the ALREADY-
+COMPUTED Module 4 analytics and recompute on every rerun: only the scan
+itself is expensive and gated behind Run Scan in ui.scan_view.
 
-Pipeline order matters (Section G): filter and rank the Python
-ScanCandidateResult objects FIRST, then build the DataFrame, so row
-position in the displayed grid maps back to the same-position entry in
-the ranked candidate list.
+Pipeline order matters: filter and rank the Python ScanCandidateResult
+objects FIRST, then build the DataFrame, so row position in the
+displayed grid maps back to the same-position entry in the ranked
+candidate list -- the Rank column and the click-to-select mapping both
+depend on this order being preserved end to end.
 """
 
 from __future__ import annotations
@@ -28,58 +30,36 @@ from ui.formatting import (
     ALL_FILTER_SPECS,
     NO_SECONDARY_RANK,
     RANK_METRIC_OPTIONS,
+    RESULT_COLUMN_HELP,
+    add_rank_column,
     build_filter_criteria,
     build_sort_keys,
+    format_ranked_by,
+    selected_strategy_summary,
     to_display_dataframe,
 )
 
-
-def render_filters() -> dict[str, dict]:
-    st.subheader("Range-Bound Filters")
-    filter_state: dict[str, dict] = {}
-    for spec in ALL_FILTER_SPECS:
-        col_enable, col_value = st.columns([2, 1])
-        with col_enable:
-            enabled = st.checkbox(spec.label, key=f"oscill8_filter_enabled_{spec.key}")
-        with col_value:
-            value = st.number_input(
-                spec.label,
-                key=f"oscill8_filter_value_{spec.key}",
-                value=0.0,
-                disabled=not enabled,
-                label_visibility="collapsed",
-            )
-        filter_state[spec.key] = {"enabled": enabled, "value": value if enabled else None}
-    return filter_state
+_TABLE_HEIGHT = 520
 
 
-def render_ranking() -> dict:
-    st.subheader("Ranking")
+def _render_ranking_popover() -> dict:
     labels = [label for label, _ in RANK_METRIC_OPTIONS]
     field_by_label = dict(RANK_METRIC_OPTIONS)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        primary_label = st.selectbox("Primary metric", labels, key="oscill8_rank_primary")
+    with st.popover("Ranking ▾"):
+        st.caption("Primary")
+        primary_label = st.selectbox("Metric", labels, key="oscill8_rank_primary")
         primary_ascending = (
-            st.radio(
-                "Primary direction",
-                ["Ascending", "Descending"],
-                key="oscill8_rank_primary_dir",
-                horizontal=True,
-            )
+            st.radio("Direction", ["Ascending", "Descending"], key="oscill8_rank_primary_dir", horizontal=True)
             == "Ascending"
         )
-    with col2:
+        st.caption("Secondary (optional)")
         secondary_label = st.selectbox(
-            "Secondary metric", [NO_SECONDARY_RANK] + labels, key="oscill8_rank_secondary"
+            "Metric ", [NO_SECONDARY_RANK] + labels, key="oscill8_rank_secondary"
         )
         secondary_ascending = (
             st.radio(
-                "Secondary direction",
-                ["Ascending", "Descending"],
-                key="oscill8_rank_secondary_dir",
-                horizontal=True,
+                "Direction ", ["Ascending", "Descending"], key="oscill8_rank_secondary_dir", horizontal=True
             )
             == "Ascending"
         )
@@ -92,23 +72,67 @@ def render_ranking() -> dict:
     }
 
 
-def render_results(
-    report: ScanReport,
-    display_lookback: int,
-    filter_state: dict[str, dict],
-    rank_state: dict,
-) -> None:
-    st.subheader("Results")
+def _render_filters_popover() -> dict[str, dict]:
+    filter_state: dict[str, dict] = {}
+    with st.popover("Filters ▾"):
+        for spec in ALL_FILTER_SPECS:
+            col_enable, col_value = st.columns([2, 1])
+            with col_enable:
+                enabled = st.checkbox(
+                    spec.label, key=f"oscill8_filter_enabled_{spec.key}", help=spec.help_text
+                )
+            with col_value:
+                value = st.number_input(
+                    spec.label,
+                    key=f"oscill8_filter_value_{spec.key}",
+                    value=0.0,
+                    disabled=not enabled,
+                    label_visibility="collapsed",
+                )
+            filter_state[spec.key] = {"enabled": enabled, "value": value if enabled else None}
+    return filter_state
+
+
+def _render_skipped_expander(report: ScanReport) -> None:
+    if not report.skipped:
+        return
+    with st.expander(f"Skipped candidates ({len(report.skipped)})"):
+        for item in report.skipped:
+            rics = " / ".join(item.instance.rics)
+            st.write(f"**{rics}** — unavailable: `{item.unavailable_ric}` — {item.message}")
+
+
+def render_results(report: ScanReport, display_lookback: int) -> None:
+    analyzed = len(report.results)
+    skipped = len(report.skipped)
 
     if not report.results:
+        st.subheader("Range-Bound Opportunities")
+        st.caption(f"{analyzed} analyzed · {skipped} skipped · 0 shown")
         st.info("No candidates were successfully analyzed for this scan.")
+        _render_skipped_expander(report)
         return
+
+    left, right = st.columns([2, 1])
+    with right:
+        ranking_col, filters_col = st.columns(2)
+        with ranking_col:
+            rank_state = _render_ranking_popover()
+        with filters_col:
+            filter_state = _render_filters_popover()
 
     criteria = build_filter_criteria(filter_state, display_lookback)
     filtered = apply_filters(report.results, criteria)
 
+    with left:
+        st.subheader("Range-Bound Opportunities")
+        st.caption(f"{analyzed} analyzed · {skipped} skipped · {len(filtered)} shown")
+
+    st.caption(format_ranked_by(rank_state))
+
     if not filtered:
-        st.info(f"{len(report.results)} candidate(s) analyzed — none passed the selected filters.")
+        st.info(f"{analyzed} candidate(s) analyzed — none passed the selected filters.")
+        _render_skipped_expander(report)
         return
 
     sort_keys = build_sort_keys(
@@ -121,27 +145,51 @@ def render_results(
     ranked = rank_results(filtered, sort_keys)
 
     results_df = results_to_dataframe(ranked, display_lookback)
-    display_df = to_display_dataframe(results_df)
+    display_df = add_rank_column(to_display_dataframe(results_df))
+
+    column_config = {
+        label: st.column_config.Column(label, help=help_text)
+        for label, help_text in RESULT_COLUMN_HELP.items()
+    }
 
     event = st.dataframe(
         display_df,
         hide_index=True,
-        use_container_width=True,
+        height=_TABLE_HEIGHT,
         on_select="rerun",
         selection_mode="single-row",
+        column_config=column_config,
         key="oscill8_result_grid",
     )
 
     selected_rows = list(event.selection.rows) if event is not None else []
     state.set_selected_candidate(ranked[selected_rows[0]] if selected_rows else None)
+    st.caption("Click a row's checkbox to select it.")
 
-    render_selection()
+    render_selection(display_lookback)
+    _render_skipped_expander(report)
 
 
-def render_selection() -> None:
+def render_selection(display_lookback: int) -> None:
     candidate = state.get_selected_candidate()
     if candidate is None:
-        st.caption("Select a row above to inspect a strategy.")
         return
-    rics = " / ".join(candidate.rics)
-    st.success(f"Selected: {rics}")
+
+    summary = selected_strategy_summary(candidate, display_lookback)
+
+    st.subheader("Selected Strategy")
+    st.write(f"**{summary['rics']}**")
+    st.caption(f"{summary['weights']} · {summary['interval']}")
+
+    labels = ["Current", "Robust Range", "Median", "Position", "ER"]
+    values = [
+        summary["current"],
+        summary["robust_range"],
+        summary["median"],
+        summary["position"],
+        summary["efficiency_ratio"],
+    ]
+    for col, label, value in zip(st.columns(len(labels)), labels, values):
+        with col:
+            st.caption(label)
+            st.write(f"**{value}**")
