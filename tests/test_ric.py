@@ -23,7 +23,7 @@ def test_build_ric_fed_funds():
 
 def test_build_ric_one_digit_year_market():
     # SONIA uses ric_year_digits=1
-    assert ric.build_ric("SONIA", 3, 2027) == "SFIH7"
+    assert ric.build_ric("SONIA", 3, 2027) == "SONH7"
 
 
 def test_build_ric_invalid_month_raises():
@@ -52,7 +52,7 @@ def test_parse_ric_fed_funds():
 
 def test_parse_ric_one_digit_year_near_term():
     # reference date in 2026 -> "7" should resolve to 2027, not 2037
-    parsed = ric.parse_ric("SFIH7", reference_date=date(2026, 1, 1))
+    parsed = ric.parse_ric("SONH7", reference_date=date(2026, 1, 1))
     assert parsed.market_key == "SONIA"
     assert parsed.month == 3
     assert parsed.year == 2027
@@ -61,7 +61,7 @@ def test_parse_ric_one_digit_year_near_term():
 def test_parse_ric_one_digit_year_wraps_to_next_decade():
     # reference date late in a decade -> should still resolve forward,
     # not accidentally pick a year in the past.
-    parsed = ric.parse_ric("SFIH1", reference_date=date(2029, 6, 1))
+    parsed = ric.parse_ric("SONH1", reference_date=date(2029, 6, 1))
     assert parsed.year == 2031
 
 
@@ -93,3 +93,36 @@ def test_build_then_parse_round_trip(market_key, month, year):
     assert parsed.market_key == market_key
     assert parsed.month == month
     assert parsed.year == year
+
+
+# ---------------------------------------------------------------------
+# Market-specific RIC convention regression coverage.
+#
+# Locks down each market's exact, trader-confirmed RIC convention
+# (root + year-digit count) against known real-world examples, so a
+# future change to one market's ric_root/ric_year_digits can never
+# silently alter another market's output. See CLAUDE.md's Module 1
+# notes for the underlying trader-supplied spec.
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "market_key,month,year,expected",
+    [
+        # SOFR: root "SRA", 2-digit year.
+        ("SOFR", 9, 2026, "SRAU26"),
+        ("SOFR", 3, 2027, "SRAH27"),
+        # CORRA: root "CRA", 1-digit year -- unchanged, already correct
+        # on main (see the market-specific-ric-construction audit).
+        ("CORRA", 9, 2026, "CRAU6"),
+        ("CORRA", 12, 2026, "CRAZ6"),
+        ("CORRA", 3, 2027, "CRAH7"),
+        # SONIA: root corrected "SFI" -> "SON"; 1-digit year unchanged.
+        ("SONIA", 9, 2026, "SONU6"),
+        ("SONIA", 3, 2027, "SONH7"),
+        ("SONIA", 9, 2027, "SONU7"),
+        # FED_FUNDS: root "FF", 2-digit year.
+        ("FED_FUNDS", 6, 2027, "FFM27"),
+    ],
+)
+def test_build_ric_market_specific_conventions(market_key, month, year, expected):
+    assert ric.build_ric(market_key, month, year) == expected

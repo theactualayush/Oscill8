@@ -96,3 +96,32 @@ def test_too_few_contracts_returns_empty_list_not_error():
     # 4 legs a condor needs.
     instances = generate_instances(definition, "2026-01-01", "2026-06-30")
     assert instances == []
+
+
+# ---------------------------------------------------------------------
+# Market-specific RIC conventions flow through unchanged, with no
+# scanner/strategy_engine-specific special casing -- generate_instances
+# only ever delegates to core.futures_calendar, so a market's own
+# ric_root/ric_year_digits configuration is all that's needed.
+# ---------------------------------------------------------------------
+
+def test_generate_instances_for_corra_outright_one_digit_year_rics():
+    definition = StrategyDefinition(
+        market_key="CORRA", offsets=(0,), weights=(1,), interval=BarInterval.DAILY,
+    )
+    instances = generate_instances(definition, "2026-01-01", "2026-12-31")
+    assert [inst.rics for inst in instances] == [
+        ("CRAH6",),
+        ("CRAM6",),
+        ("CRAU6",),
+        ("CRAZ6",),
+    ]
+
+
+def test_generate_instances_for_sonia_spread_uses_corrected_root():
+    definition = StrategyDefinition(
+        market_key="SONIA", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
+    )
+    instances = generate_instances(definition, "2026-01-01", "2027-12-31")
+    assert instances[0].rics == ("SONH6", "SONM6")
+    assert all(r.startswith("SON") for inst in instances for r in inst.rics)

@@ -156,6 +156,17 @@ class MarketDefinition:
         CME 3M SOFR futures -> contracts look like "SR3Z26").
     ric_year_digits: 1 or 2. Most LSEG STIR futures use a 2-digit year
         (e.g. "SR3Z26"); some legacy chains use 1 digit ("SR3Z6").
+        Known limitation (documented, not solved): a 1-digit-year
+        market's RIC string collides across decades -- e.g. Sep-2026
+        and Sep-2036 both encode to the same "...U6" suffix; build_ric()
+        does not disambiguate this at construction time (parse_ric()'s
+        reference_date-based disambiguation only helps when reading an
+        already-received RIC back, not when generating two of them).
+        Not a live issue today: no market in this registry lists
+        contracts anywhere near a decade out, so generate_contracts()/
+        generate_instances() never actually reach the collision in
+        practice. Revisit only if a market's practical
+        contract-generation horizon ever approaches ~10 years.
     exchange: Informational only (used in UI labels).
     verified: Whether the ric_root has been confirmed against a live
         LSEG chain/search on a Workspace terminal. Markets with
@@ -225,14 +236,16 @@ MARKETS: dict[str, MarketDefinition] = {
     # once verified -- no other code depends on it.
     "SONIA": MarketDefinition(
         name="SONIA (3M)",
-        ric_root="SFI",
+        ric_root="SON",
         exchange="ICE",
         bp_per_point=100.0,
         ric_year_digits=1,
         verified=False,
         tick_value=12.50,
         currency="GBP",
-        description="ICE 3-Month SONIA futures (VERIFY RIC ROOT)",
+        description="ICE 3-Month SONIA futures (RIC root 'SON' confirmed "
+                     "by trader spec; not yet verified via live LSEG "
+                     "Workspace chain/search)",
     ),
     "CORRA": MarketDefinition(
         name="CORRA (3M)",

@@ -709,6 +709,18 @@ because they're listed here as being considered):
   stability, z-score).
 - Saved scans / export workflow.
 - Cloud/server deployment and any non-desktop LSEG authentication.
+- EURIBOR market (`root="FEI"`, `ric_year_digits=1`, QUARTERLY) — RIC
+  convention confirmed by the trader, but `MarketDefinition.exchange`
+  and `MarketDefinition.bp_per_point` (both mandatory, no default) have
+  not been supplied and must not be invented (`bp_per_point` in
+  particular drives `range_analytics`' bp conversions — a wrong/guessed
+  value would silently corrupt every bp-denominated metric for this
+  market). Add once that metadata is supplied; no other change needed —
+  `core.ric`/`core.futures_calendar` already support it generically.
+- One-digit-year RIC collision across decades for 1-digit-year markets
+  (SONIA/CORRA/€STR) — see `core/config.py`'s `MarketDefinition.
+  ric_year_digits` docstring. Documented, not solved; not a live issue
+  at today's practical STIR contract-generation horizon.
 
 ---
 

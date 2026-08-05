@@ -59,9 +59,9 @@ def parse_ric(ric: str, reference_date: date | None = None) -> ParsedRic:
     """Parse a RIC back into (market_key, month, year).
 
     Args:
-        ric: e.g. "SRAZ26" or "SFIH7".
+        ric: e.g. "SRAZ26" or "SONH7".
         reference_date: used only to disambiguate 1-digit-year roots
-            (e.g. "SFIH7" -> year could be 2027 or 2037). Defaults to
+            (e.g. "SONH7" -> year could be 2027 or 2037). Defaults to
             today. The nearest year to reference_date whose last digit
             matches is chosen, preferring a year within the next 9
             years over one in the past.
