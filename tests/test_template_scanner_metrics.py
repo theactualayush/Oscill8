@@ -16,11 +16,12 @@ import pytest
 
 from core.config import BarInterval
 from range_analytics import analyze_multi_lookback
+from range_analytics.multi_lookback import range_to_volatility_ratio, robust_to_full_width_ratio
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 
-from template_scanner.metrics import at_lookback, normalized_crossing_frequency
+from template_scanner.metrics import at_lookback, metric_value, normalized_crossing_frequency
 
 
 def _history(dates: list[str], values: list[float]) -> StrategyHistory:
@@ -84,3 +85,55 @@ def test_normalized_crossing_frequency_matches_stability_source_values():
 
     recomputed = tuple(normalized_crossing_frequency(r) for r in result.per_lookback)
     assert recomputed == result.normalized_crossing_frequency_stability.values
+
+
+# ---------------------------------------------------------------------
+# metric_value: canonical direct-field / derived-metric resolver
+# ---------------------------------------------------------------------
+
+def test_metric_value_resolves_direct_field():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "efficiency_ratio") == analytics.efficiency_ratio
+    assert metric_value(analytics, "ar1_beta") == pytest.approx(analytics.ar1_beta, nan_ok=True)
+
+
+def test_metric_value_resolves_normalized_crossing_frequency():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "normalized_crossing_frequency") == pytest.approx(
+        normalized_crossing_frequency(analytics), nan_ok=True
+    )
+
+
+def test_metric_value_resolves_range_to_volatility_ratio():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "range_to_volatility_ratio") == pytest.approx(
+        range_to_volatility_ratio(analytics), nan_ok=True
+    )
+
+
+def test_metric_value_resolves_robust_to_full_width_ratio():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "robust_to_full_width_ratio") == pytest.approx(
+        robust_to_full_width_ratio(analytics), nan_ok=True
+    )
+
+
+def test_metric_value_unknown_field_raises_attribute_error():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20,)).per_lookback[0]
+
+    with pytest.raises(AttributeError):
+        metric_value(analytics, "not_a_real_metric")

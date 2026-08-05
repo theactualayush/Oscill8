@@ -20,6 +20,7 @@ from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 
 from template_scanner.filters import FilterCriterion, apply_filters, at_lookback, stability
+from template_scanner.metrics import at_lookback as _metrics_at_lookback
 from template_scanner.scan_results import ScanCandidateResult
 
 
@@ -126,3 +127,57 @@ def test_filter_on_stability_accessor():
     criterion = FilterCriterion("stable ER", accessor, max_value=value)
     result = apply_filters([_TRENDING], [criterion])
     assert result == [_TRENDING]
+
+
+# ---------------------------------------------------------------------
+# Derived-metric filtering (regression for the reported Module 5B
+# integration gap: at_lookback() previously raised AttributeError for
+# any metric that isn't a direct RangeAnalytics field)
+# ---------------------------------------------------------------------
+
+def test_at_lookback_resolves_derived_metric_without_raising():
+    # Previously: AttributeError('RangeAnalytics' object has no
+    # attribute 'normalized_crossing_frequency') -- it's a derived
+    # Module 5 metric, not a RangeAnalytics field.
+    accessor = at_lookback("normalized_crossing_frequency", 30)
+    value = accessor(_TRENDING)  # must not raise
+    assert isinstance(value, float)
+
+
+def test_filter_using_normalized_crossing_frequency():
+    accessor = at_lookback("normalized_crossing_frequency", 30)
+    value_oscillating = accessor(_OSCILLATING)
+    value_trending = accessor(_TRENDING)
+    assert not math.isnan(value_oscillating)
+    assert value_trending < value_oscillating  # sanity check on the fixtures
+
+    criterion = FilterCriterion("high crossing freq", accessor, min_value=value_oscillating)
+    result = apply_filters([_TRENDING, _OSCILLATING], [criterion])
+    assert _OSCILLATING in result
+    assert _TRENDING not in result
+
+
+def test_filter_using_range_to_volatility_ratio():
+    accessor = at_lookback("range_to_volatility_ratio", 30)
+    value = accessor(_OSCILLATING)
+    assert not math.isnan(value)
+
+    criterion = FilterCriterion("R2V exact", accessor, min_value=value, max_value=value)
+    result = apply_filters([_OSCILLATING], [criterion])
+    assert result == [_OSCILLATING]
+
+
+def test_filter_using_robust_to_full_width_ratio():
+    accessor = at_lookback("robust_to_full_width_ratio", 30)
+    value = accessor(_OSCILLATING)
+    assert not math.isnan(value)
+
+    criterion = FilterCriterion("R2FW exact", accessor, min_value=value, max_value=value)
+    result = apply_filters([_OSCILLATING], [criterion])
+    assert result == [_OSCILLATING]
+
+
+def test_at_lookback_direct_field_unaffected_by_metric_value_change():
+    accessor = at_lookback("ar1_beta", 30)
+    expected = _metrics_at_lookback(_TRENDING.multi_lookback, 30).ar1_beta
+    assert accessor(_TRENDING) == pytest.approx(expected, nan_ok=True)

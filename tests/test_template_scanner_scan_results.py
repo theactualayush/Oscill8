@@ -20,6 +20,7 @@ from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 
+from template_scanner.filters import at_lookback as filter_at_lookback
 from template_scanner.metrics import at_lookback, normalized_crossing_frequency
 from template_scanner.scan_results import ScanCandidateResult, results_to_dataframe
 
@@ -159,3 +160,22 @@ def test_scan_candidate_result_retains_full_multi_lookback_object():
 def test_results_to_dataframe_dtype_of_interval_is_plain_string():
     df = results_to_dataframe([_candidate(interval=BarInterval.HOURLY)], display_lookback=20)
     assert df.iloc[0]["interval"] == "HOURLY"
+
+
+def test_results_to_dataframe_and_filter_accessor_agree_on_derived_metrics():
+    # Cross-consistency proof: results_to_dataframe() and
+    # filters.at_lookback() both resolve derived metrics through the
+    # same template_scanner.metrics.metric_value() -- so a scanner-grid
+    # column and a filter/rank accessor built from the same metric name
+    # and lookback must agree exactly, not merely by convention.
+    candidate = _candidate(lookbacks=(20, 40, 60))
+    df = results_to_dataframe([candidate], display_lookback=40)
+    row = df.iloc[0]
+
+    for field in (
+        "normalized_crossing_frequency",
+        "range_to_volatility_ratio",
+        "robust_to_full_width_ratio",
+    ):
+        accessor_value = filter_at_lookback(field, 40)(candidate)
+        assert row[field] == pytest.approx(accessor_value, nan_ok=True)

@@ -18,6 +18,7 @@ import pandas as pd
 from core.utils import get_logger
 
 from template_scanner.metrics import at_lookback as _range_analytics_at_lookback
+from template_scanner.metrics import metric_value
 from template_scanner.scan_results import ScanCandidateResult
 
 logger = get_logger(__name__)
@@ -69,12 +70,21 @@ def apply_filters(
 
 
 def at_lookback(field: str, lookback: int) -> Callable[[ScanCandidateResult], float]:
-    """Accessor factory: reads `field` off the RangeAnalytics computed
-    at exactly `lookback` (see template_scanner.metrics.at_lookback)."""
+    """Accessor factory: resolves `field` on the RangeAnalytics computed
+    at exactly `lookback` (see template_scanner.metrics.at_lookback).
+
+    `field` may be a direct RangeAnalytics attribute (e.g.
+    "efficiency_ratio", "ar1_beta") or a derived Module 5 metric (e.g.
+    "normalized_crossing_frequency", "range_to_volatility_ratio",
+    "robust_to_full_width_ratio") -- resolved via
+    template_scanner.metrics.metric_value(), the same resolver
+    results_to_dataframe() uses, so filtering/ranking and the scanner
+    DataFrame always agree on what a metric name means.
+    """
 
     def accessor(result: ScanCandidateResult) -> float:
         analytics = _range_analytics_at_lookback(result.multi_lookback, lookback)
-        return getattr(analytics, field)
+        return metric_value(analytics, field)
 
     return accessor
 

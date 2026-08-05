@@ -36,12 +36,21 @@ market data at all -- skips the affected candidate (recorded on
 ScanReport.skipped as a SkippedCandidate), and continues the scan.
 Every other exception still propagates uncaught -- see scanner.py's
 module docstring.
+
+Metric resolution: metric_value() (metrics.py) is the single canonical
+resolver for "a scalar metric by name on a RangeAnalytics" -- a direct
+attribute (e.g. "efficiency_ratio") or a derived Module 5 metric (e.g.
+"normalized_crossing_frequency", "range_to_volatility_ratio",
+"robust_to_full_width_ratio"). results_to_dataframe() and
+filters.at_lookback() both resolve metrics through it, so a metric name
+means the same thing in the scanner DataFrame and in filter/rank
+accessors.
 """
 
 from template_scanner.filters import FilterCriterion, apply_filters
 from template_scanner.filters import at_lookback as filter_at_lookback
 from template_scanner.filters import stability as filter_stability
-from template_scanner.metrics import at_lookback, normalized_crossing_frequency
+from template_scanner.metrics import at_lookback, metric_value, normalized_crossing_frequency
 from template_scanner.ranking import SortKey, rank_results
 from template_scanner.scan_results import ScanCandidateResult, results_to_dataframe
 from template_scanner.scanner import (
@@ -73,6 +82,7 @@ __all__ = [
     "ScanCandidateResult",
     "results_to_dataframe",
     "at_lookback",
+    "metric_value",
     "normalized_crossing_frequency",
     "FilterCriterion",
     "apply_filters",

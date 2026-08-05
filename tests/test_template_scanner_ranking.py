@@ -123,3 +123,20 @@ def test_rank_results_no_composite_score_attribute_exists():
     import dataclasses
     field_names = {f.name for f in dataclasses.fields(SortKey)}
     assert field_names == {"accessor", "ascending"}
+
+
+def test_rank_results_by_derived_metric_accessor():
+    # Regression: ranking by a derived Module 5 metric (not a direct
+    # RangeAnalytics field) works end-to-end now that at_lookback()
+    # resolves it via metric_value().
+    calm = _candidate([100.0] * 10, ("SRAH28",), lookbacks=(10,))
+    busy = _candidate(
+        [99.0, 101.0, 99.0, 101.0, 99.0, 101.0, 99.0, 101.0, 99.0, 101.0],
+        ("SRAM28",), lookbacks=(10,),
+    )
+
+    accessor = at_lookback("normalized_crossing_frequency", 10)
+    assert accessor(calm) < accessor(busy)  # sanity check on the fixtures
+
+    ranked = rank_results([busy, calm], [SortKey(accessor, ascending=True)])
+    assert ranked == [calm, busy]

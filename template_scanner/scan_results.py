@@ -18,15 +18,11 @@ import pandas as pd
 from core.config import BarInterval
 from core.utils import get_logger
 
-from range_analytics.multi_lookback import (
-    MultiLookbackAnalytics,
-    range_to_volatility_ratio,
-    robust_to_full_width_ratio,
-)
+from range_analytics.multi_lookback import MultiLookbackAnalytics
 
 from strategy_engine.combinations import StrategyInstance
 
-from template_scanner.metrics import at_lookback, normalized_crossing_frequency
+from template_scanner.metrics import at_lookback, metric_value
 
 logger = get_logger(__name__)
 
@@ -175,9 +171,9 @@ def results_to_dataframe(
             "efficiency_ratio": headline.efficiency_ratio,
             "raw_crossing_count": headline.raw_crossing_count,
             "hysteresis_crossing_count": headline.hysteresis_crossing_count,
-            "normalized_crossing_frequency": normalized_crossing_frequency(headline),
-            "range_to_volatility_ratio": range_to_volatility_ratio(headline),
-            "robust_to_full_width_ratio": robust_to_full_width_ratio(headline),
+            "normalized_crossing_frequency": metric_value(headline, "normalized_crossing_frequency"),
+            "range_to_volatility_ratio": metric_value(headline, "range_to_volatility_ratio"),
+            "robust_to_full_width_ratio": metric_value(headline, "robust_to_full_width_ratio"),
             "ar1_beta": headline.ar1_beta,
             "ar1_r_squared": headline.ar1_r_squared,
             "half_life": headline.half_life,
