@@ -186,6 +186,24 @@ def test_generate_histories_fetches_each_distinct_leg_once(mocker):
     assert mock_get_history.call_count == 3
 
 
+def test_build_history_propagates_market_data_unavailable_error_unchanged(mocker):
+    # No Module 3 handling for this exception -- it's typed and raised
+    # entirely inside core.downloader (Module 5B.1); build_history must
+    # propagate it exactly like any other database.get_history exception.
+    instance = _fly_instance()
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=downloader_module.MarketDataUnavailableError(
+            "SRAH26", "The universe is not found"
+        ),
+    )
+
+    with pytest.raises(downloader_module.MarketDataUnavailableError) as exc_info:
+        pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert exc_info.value.ric == "SRAH26"
+
+
 def test_pricing_namespace_never_binds_downloader_functions():
     """Structural boundary check: inspects strategy_engine.pricing's live
     module namespace for the actual core.downloader function objects

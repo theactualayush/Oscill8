@@ -29,8 +29,13 @@ analyze_histories() is the mode-agnostic core it delegates to, taking
 already-built StrategyHistory objects so a future candidate source
 could call it directly.
 
-v1 exception policy: build_history() failures inside run_scan()
-propagate uncaught -- see scanner.py's module docstring.
+Module 5B.1 -- Data Availability Hardening. run_scan() catches exactly
+one typed exception around build_history() -- core.downloader.
+MarketDataUnavailableError, LSEG's own confirmation that a RIC has no
+market data at all -- skips the affected candidate (recorded on
+ScanReport.skipped as a SkippedCandidate), and continues the scan.
+Every other exception still propagates uncaught -- see scanner.py's
+module docstring.
 """
 
 from template_scanner.filters import FilterCriterion, apply_filters
@@ -42,6 +47,7 @@ from template_scanner.scan_results import ScanCandidateResult, results_to_datafr
 from template_scanner.scanner import (
     ScanReport,
     ScanRequest,
+    SkippedCandidate,
     analyze_histories,
     run_scan,
 )
@@ -61,6 +67,7 @@ __all__ = [
     # Module 5B
     "ScanRequest",
     "ScanReport",
+    "SkippedCandidate",
     "run_scan",
     "analyze_histories",
     "ScanCandidateResult",

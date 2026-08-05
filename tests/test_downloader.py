@@ -53,6 +53,31 @@ def reset_session_state():
     yield
 
 
+def _make_ld_error(message: str) -> Exception:
+    """Build an exception shaped exactly like the real lseg.data._errors.
+    LDError observed in live Module 5B validation: module
+    "lseg.data._errors", class name "LDError", a `.message` attribute,
+    `.code` is None, and `.args` is empty -- confirmed empirically (see
+    the Module 5B.1 design review) rather than assumed. No real
+    lseg.data import needed to construct this -- __module__ is set
+    directly on the locally-defined class."""
+
+    class LDError(Exception):
+        def __init__(self, msg: str):
+            super().__init__()
+            self.message = msg
+            self.code = None
+
+    LDError.__module__ = "lseg.data._errors"
+    return LDError(message)
+
+
+_UNIVERSE_NOT_FOUND_MESSAGE = (
+    "No data to return, please check errors: ERROR: No successful response. "
+    "(TS.Interday.UserRequestError.70005, The universe is not found)"
+)
+
+
 def _make_lseg_df(dates: list[str], seed: float = 100.0) -> pd.DataFrame:
     """Build a fake DataFrame shaped like what lseg.data.get_history returns."""
     idx = pd.to_datetime(dates)
@@ -335,6 +360,102 @@ def test_download_history_raises_after_exhausting_retries():
     with pytest.raises(ConnectionError):
         downloader.download_history("SRAZ26", "DAILY", "2026-07-01", "2026-07-01")
     assert fake_lseg_data.get_history.call_count == 3  # stop_after_attempt(3)
+
+
+# ---------------------------------------------------------------------
+# _is_confirmed_universe_not_found: narrow classification (Module 5B.1)
+# ---------------------------------------------------------------------
+
+def test_is_confirmed_universe_not_found_true_for_exact_match():
+    exc = _make_ld_error(_UNIVERSE_NOT_FOUND_MESSAGE)
+    assert downloader._is_confirmed_universe_not_found(exc) is True
+
+
+def test_is_confirmed_universe_not_found_false_for_generic_no_data_message():
+    # "No data to return" alone, without the specific code+phrase, must
+    # NOT be classified.
+    exc = _make_ld_error("No data to return, please check errors: ERROR: No successful response.")
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+def test_is_confirmed_universe_not_found_false_for_different_error_code():
+    exc = _make_ld_error(
+        "No data to return (TS.Interday.UserRequestError.99999, The universe is not found)"
+    )
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+def test_is_confirmed_universe_not_found_false_for_matching_code_different_phrase():
+    exc = _make_ld_error("(TS.Interday.UserRequestError.70005, Some unrelated reason)")
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+def test_is_confirmed_universe_not_found_false_for_generic_universe_mention():
+    # "universe" alone, without the specific code+phrase, must NOT be
+    # classified.
+    exc = _make_ld_error("Some unrelated universe configuration issue")
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+def test_is_confirmed_universe_not_found_false_for_matching_message_wrong_type():
+    # Even the exact code+phrase must NOT be classified unless the
+    # exception is actually LSEG's LDError type.
+    exc = RuntimeError(_UNIVERSE_NOT_FOUND_MESSAGE)
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+# ---------------------------------------------------------------------
+# download_history: MarketDataUnavailableError translation + retry bypass
+# ---------------------------------------------------------------------
+
+def test_download_history_confirmed_universe_not_found_raises_typed_error_not_retried():
+    fake_lseg_data.get_history.side_effect = _make_ld_error(_UNIVERSE_NOT_FOUND_MESSAGE)
+
+    with pytest.raises(downloader.MarketDataUnavailableError) as exc_info:
+        downloader.download_history("SRAH26", "DAILY", "2026-01-01", "2026-01-05")
+
+    assert exc_info.value.ric == "SRAH26"
+    assert "70005" in exc_info.value.message
+    # Confirmed-permanent condition -- must NOT be retried.
+    assert fake_lseg_data.get_history.call_count == 1
+
+
+def test_download_history_generic_ld_error_is_not_translated_and_still_retries():
+    fake_lseg_data.get_history.side_effect = _make_ld_error(
+        "No data to return, please check errors: ERROR: No successful response."
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        downloader.download_history("SRAH26", "DAILY", "2026-01-01", "2026-01-05")
+
+    assert not isinstance(exc_info.value, downloader.MarketDataUnavailableError)
+    assert fake_lseg_data.get_history.call_count == 3  # ordinary retry behaviour retained
+
+
+def test_download_history_unrelated_ld_error_is_not_translated_and_still_retries():
+    fake_lseg_data.get_history.side_effect = _make_ld_error(
+        "(TS.Interday.SomeOtherError.12345, A completely different problem)"
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        downloader.download_history("SRAH26", "DAILY", "2026-01-01", "2026-01-05")
+
+    assert not isinstance(exc_info.value, downloader.MarketDataUnavailableError)
+    assert fake_lseg_data.get_history.call_count == 3
+
+
+def test_download_history_ordinary_connection_error_retry_behaviour_unaffected():
+    # Regression: the retry-predicate change (excluding only
+    # MarketDataUnavailableError) must not alter behaviour for any other
+    # exception type, including the pre-existing retry-then-succeed and
+    # exhausts-retries cases exercised above.
+    fake_lseg_data.get_history.side_effect = [
+        ConnectionError("transient network blip"),
+        _make_lseg_df(["2026-07-01"]),
+    ]
+    df = downloader.download_history("SRAZ26", "DAILY", "2026-07-01", "2026-07-01")
+    assert len(df) == 1
+    assert fake_lseg_data.get_history.call_count == 2
 
 
 # ---------------------------------------------------------------------

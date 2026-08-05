@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from core.config import BarInterval
+from core.downloader import MarketDataUnavailableError
 from database import cache, service
 from database.connection import get_session as _real_get_session
 
@@ -224,6 +225,23 @@ def test_get_history_downloader_failure_does_not_record_partial_sync_range(mocke
         service.get_history("SRAZ26", "DAILY", "2020-01-01", "2020-01-10")
 
     ranges = cache.get_sync_ranges(db_session, "SRAZ26", "DAILY")
+    assert ranges == []
+
+
+def test_get_history_propagates_market_data_unavailable_error_unchanged(mocker, db_session):
+    # No Module 2 handling for this exception -- it's typed and raised
+    # entirely inside core.downloader (Module 5B.1); get_history must
+    # propagate it exactly like any other download_history exception.
+    mocker.patch(
+        "database.service.download_history",
+        side_effect=MarketDataUnavailableError("SRAH26", "The universe is not found"),
+    )
+
+    with pytest.raises(MarketDataUnavailableError) as exc_info:
+        service.get_history("SRAH26", "DAILY", "2020-01-01", "2020-01-10")
+
+    assert exc_info.value.ric == "SRAH26"
+    ranges = cache.get_sync_ranges(db_session, "SRAH26", "DAILY")
     assert ranges == []
 
 

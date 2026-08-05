@@ -23,6 +23,7 @@ import pandas as pd
 from tenacity import (
     retry,
     retry_if_exception_type,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -32,6 +33,70 @@ from core.config import BarInterval
 from core.utils import get_logger, to_date, DateLike
 
 logger = get_logger(__name__)
+
+
+class MarketDataUnavailableError(Exception):
+    """Raised when LSEG has confirmed a requested RIC has no market data
+    available at all (TS.Interday.UserRequestError.70005, "The universe
+    is not found") -- a permanent, per-RIC condition.
+
+    Distinct from:
+    - a valid RIC with no bars in the requested date range (returns an
+      empty DataFrame from download_history, not an exception -- see
+      _fetch_chunk)
+    - a transient network/session/auth/vendor error (retried and, if it
+      persists, raised as whatever type LSEG's SDK originally raised,
+      unchanged)
+    - a programming/parsing error (e.g. _normalize_columns' ValueError
+      for an unrecognized column shape -- a real bug, not a data-
+      availability condition)
+
+    Callers may treat this as safe to skip and never retry.
+    """
+
+    def __init__(self, ric: str, message: str):
+        super().__init__(f"No market data available for {ric}: {message}")
+        self.ric = ric
+        self.message = message
+
+
+def _is_confirmed_universe_not_found(exc: Exception) -> bool:
+    """True only for the narrow, LSEG-confirmed "universe is not found"
+    condition (TS.Interday.UserRequestError.70005).
+
+    Empirically verified against a live LSEG session before this was
+    written (see the Module 5B.1 design review): the SDK's LDError
+    exposes no structured error code for this -- exc.code is None on
+    real instances, and exc.args is empty -- the only place the
+    identifying detail lives is exc.message. Message-text matching is
+    therefore used deliberately, not as a shortcut, and only inside
+    this one function -- no other module inspects LSEG message text.
+
+    Duck-types the exception's module/class name (rather than
+    `isinstance` against an imported `lseg.data` exception class) so
+    this function needs no import of lseg.data at all, consistent with
+    every other lazy-import in this module.
+
+    Requires ALL of:
+    - the exception is LSEG's LDError type (module "lseg.data._errors",
+      class "LDError")
+    - its message contains the exact error code
+      "TS.Interday.UserRequestError.70005"
+    - its message contains the exact phrase "The universe is not found"
+
+    A generic "No data to return" LDError, or an LDError for a
+    different error code, or a non-LDError exception whose text happens
+    to mention "universe", all return False and are left untranslated.
+    """
+    exc_type = type(exc)
+    if exc_type.__module__ != "lseg.data._errors" or exc_type.__name__ != "LDError":
+        return False
+
+    message = getattr(exc, "message", None) or str(exc)
+    return (
+        "TS.Interday.UserRequestError.70005" in message
+        and "The universe is not found" in message
+    )
 
 # --------------------------------------------------------------------------
 # Session management
@@ -181,10 +246,23 @@ def _chunk_date_range(start: date, end: date, max_days: int) -> list[tuple[date,
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
+    # A confirmed "universe is not found" is a permanent, per-RIC
+    # condition -- retrying it 3x with backoff can never succeed, so it
+    # is excluded here (translated to MarketDataUnavailableError before
+    # this predicate ever sees it, immediately below). Every other
+    # exception keeps its existing retry behaviour unchanged.
+    retry=retry_if_exception_type(Exception) & retry_if_not_exception_type(MarketDataUnavailableError),
 )
 def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.DataFrame:
-    """Fetch a single chunk of history from LSEG, with retry on failure."""
+    """Fetch a single chunk of history from LSEG, with retry on failure.
+
+    A confirmed "universe is not found" LDError (see
+    _is_confirmed_universe_not_found) is translated to
+    MarketDataUnavailableError right here, before the @retry decorator
+    above ever evaluates whether to retry it -- this is what lets the
+    retry predicate exclude it cleanly rather than retrying a condition
+    that can never succeed.
+    """
     import lseg.data as ld
 
     logger.debug("Fetching %s [%s -> %s] interval=%s", ric, start, end, native_interval)
@@ -192,13 +270,19 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
     # CLOSE/VOLUME field names outright. Request LSEG's own default field
     # set per instrument instead (fields=None) and let _normalize_columns'
     # alias table map whatever vendor-specific names come back.
-    df = ld.get_history(
-        universe=ric,
-        interval=native_interval,
-        start=start.isoformat(),
-        end=end.isoformat(),
-        fields=None,
-    )
+    try:
+        df = ld.get_history(
+            universe=ric,
+            interval=native_interval,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            fields=None,
+        )
+    except Exception as exc:
+        if _is_confirmed_universe_not_found(exc):
+            raise MarketDataUnavailableError(ric, getattr(exc, "message", None) or str(exc)) from exc
+        raise
+
     if df is None or df.empty:
         logger.warning("No data returned for %s [%s -> %s]", ric, start, end)
         return pd.DataFrame(columns=_CANONICAL_COLUMNS)

@@ -7,17 +7,24 @@ each candidate via strategy_engine (Module 3, unchanged) sharing one
 leg cache across the whole scan, and measures each resulting history
 via range_analytics (Module 4A/4B, unchanged).
 
-v1 exception policy: build_history() failures are NOT caught here. The
-data layer (core.downloader / database) does not currently expose a
-typed exception distinguishing an "expected market-data retrieval
-failure" from a genuine programming bug -- catching broadly at this
-boundary risked silently converting real bugs into structured-looking
-failure records, which is worse than letting the scan fail loudly. A
-future, separately-scoped improvement can add per-candidate
-infrastructure-failure isolation once the data layer exposes a proper
-typed retrieval exception. No-data and short/partial history are NOT
-exceptions -- they already flow through as empty/NaN-heavy results,
-Modules 1-4's existing, tested behavior.
+Exception policy (Module 5B.1): run_scan() catches exactly ONE typed
+exception around build_history() -- core.downloader.
+MarketDataUnavailableError, LSEG's own confirmation that a RIC has no
+market data at all (never inspected here as message text; only the
+typed exception is caught -- see core/downloader.py for the
+classification). The affected candidate is skipped and recorded on
+ScanReport.skipped; the scan continues. A RIC confirmed unavailable is
+remembered for the rest of the scan (unavailable_rics) so later
+candidates referencing it are skipped without another LSEG/build_
+history attempt.
+
+Every other exception -- network/session/auth/vendor errors, database
+errors, programming bugs (TypeError/KeyError/...), analytics errors --
+is NOT caught and propagates, aborting the scan. This is deliberately
+narrow: it must never grow into a general failure bucket. No-data and
+short/partial history (a valid RIC with nothing in the requested date
+range) are NOT exceptions at all -- they already flow through as
+empty/NaN-heavy results, Modules 1-4's existing, tested behavior.
 """
 
 from __future__ import annotations
@@ -26,10 +33,12 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from core.downloader import MarketDataUnavailableError
 from core.utils import DateLike, get_logger
 
 from range_analytics.multi_lookback import analyze_multi_lookback
 
+from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory, build_history
 
@@ -71,16 +80,32 @@ class ScanRequest:
 
 
 @dataclass(frozen=True)
-class ScanReport:
-    """Result of one scan: every candidate that was successfully priced
-    and analyzed.
+class SkippedCandidate:
+    """One candidate skipped because LSEG confirmed one of its legs has
+    no market data available at all (core.downloader.
+    MarketDataUnavailableError). Deliberately narrow -- this is the only
+    reason a candidate ever ends up here; every other failure mode
+    propagates and aborts the scan instead (see the module docstring).
+    """
 
-    v1 has no separate failure list -- see the module docstring for why
-    a build_history() failure propagates and aborts the scan instead of
-    being recorded here.
+    instance: StrategyInstance
+    unavailable_ric: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ScanReport:
+    """Result of one scan.
+
+    `results` holds every candidate that was successfully priced and
+    analyzed. `skipped` holds every candidate skipped because a leg was
+    confirmed unavailable (see SkippedCandidate) -- never populated for
+    any other reason. A scan where every candidate is affected returns
+    empty `results` and populated `skipped`, not an exception.
     """
 
     results: tuple[ScanCandidateResult, ...]
+    skipped: tuple[SkippedCandidate, ...] = ()
 
 
 def analyze_histories(
@@ -130,8 +155,10 @@ def run_scan(request: ScanRequest) -> ScanReport:
     -> pricing (Module 3, one leg cache shared across the whole
     universe) -> measurement (Module 4A/4B via analyze_histories).
 
-    A build_history() failure propagates and aborts the scan -- see the
-    module docstring's v1 exception policy.
+    A candidate whose leg is confirmed unavailable by LSEG (core.
+    downloader.MarketDataUnavailableError) is skipped and recorded in
+    the returned ScanReport.skipped; every other build_history()
+    failure propagates and aborts the scan -- see the module docstring.
     """
     candidates = generate_candidate_universe(
         list(request.definitions),
@@ -143,19 +170,48 @@ def run_scan(request: ScanRequest) -> ScanReport:
     candidates = dedupe_candidates(candidates)
 
     leg_cache: dict = {}
-    histories = [
-        build_history(instance, request.price_start, request.price_end, leg_cache=leg_cache)
-        for instance in candidates
-    ]
+    unavailable_rics: set[str] = set()
+    histories: list[StrategyHistory] = []
+    skipped: list[SkippedCandidate] = []
+
+    for instance in candidates:
+        already_known = next((r for r in instance.rics if r in unavailable_rics), None)
+        if already_known is not None:
+            skipped.append(
+                SkippedCandidate(
+                    instance=instance,
+                    unavailable_ric=already_known,
+                    message=(
+                        f"{already_known} was already confirmed unavailable "
+                        "earlier in this scan"
+                    ),
+                )
+            )
+            continue
+
+        try:
+            history = build_history(
+                instance, request.price_start, request.price_end, leg_cache=leg_cache
+            )
+        except MarketDataUnavailableError as exc:
+            unavailable_rics.add(exc.ric)
+            skipped.append(
+                SkippedCandidate(instance=instance, unavailable_ric=exc.ric, message=exc.message)
+            )
+            continue
+
+        histories.append(history)
 
     logger.info(
-        "run_scan: %d candidate(s) after dedup -> %d history(ies) priced",
-        len(candidates), len(histories),
+        "run_scan: %d candidate(s) after dedup -> %d history(ies) priced, %d skipped "
+        "(unavailable market data)",
+        len(candidates), len(histories), len(skipped),
     )
 
-    return analyze_histories(
+    report = analyze_histories(
         histories,
         lookbacks=request.lookbacks,
         crossing_equilibrium=request.crossing_equilibrium,
         crossing_threshold=request.crossing_threshold,
     )
+    return ScanReport(results=report.results, skipped=tuple(skipped))

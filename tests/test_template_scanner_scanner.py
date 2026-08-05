@@ -17,12 +17,19 @@ import pandas as pd
 import pytest
 
 from core.config import BarInterval
+from core.downloader import MarketDataUnavailableError
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 from range_analytics import analyze_multi_lookback
 
-from template_scanner.scanner import ScanReport, ScanRequest, analyze_histories, run_scan
+from template_scanner.scanner import (
+    ScanReport,
+    ScanRequest,
+    SkippedCandidate,
+    analyze_histories,
+    run_scan,
+)
 from template_scanner.templates import template_from_dense_weights
 
 _DATES = pd.date_range("2020-01-01", periods=150, freq="D").strftime("%Y-%m-%d").tolist()
@@ -89,10 +96,15 @@ def test_scan_request_rejects_price_start_after_price_end():
         )
 
 
-def test_scan_report_has_no_failures_field_in_v1():
-    # locks in the approved v1 simplification: exceptions propagate
-    # rather than being recorded, so ScanReport carries only results.
-    assert [f.name for f in dataclasses.fields(ScanReport)] == ["results"]
+def test_scan_report_fields_are_results_and_skipped_only():
+    # locks in the narrow contract: ScanReport never grows a general
+    # failure bucket -- only results and skipped (confirmed
+    # MarketDataUnavailableError cases only).
+    assert [f.name for f in dataclasses.fields(ScanReport)] == ["results", "skipped"]
+
+
+def test_scan_report_skipped_defaults_to_empty():
+    assert ScanReport(results=()).skipped == ()
 
 
 # ---------------------------------------------------------------------
@@ -215,6 +227,120 @@ def test_run_scan_no_data_candidate_is_a_result_not_an_exception(mocker):
 
     assert len(report.results) == 3
     assert all(math.isnan(r.multi_lookback.per_lookback[0].current_price) for r in report.results)
+
+
+# ---------------------------------------------------------------------
+# Module 5B.1: MarketDataUnavailableError skip-and-continue behaviour
+# ---------------------------------------------------------------------
+
+def test_run_scan_skips_candidate_with_unavailable_leg_and_continues(mocker):
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            MarketDataUnavailableError("SRAH26", "The universe is not found"),
+            _leg_df(),  # SRAM26
+            _leg_df(),  # SRAU26
+            _leg_df(),  # SRAZ26
+        ],
+    )
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    # candidates: (H26,M26), (M26,U26), (U26,Z26). H26 unavailable ->
+    # only the first (which needs H26) is skipped; the other two price
+    # normally.
+    assert len(report.results) == 2
+    assert {r.rics for r in report.results} == {("SRAM26", "SRAU26"), ("SRAU26", "SRAZ26")}
+
+    assert len(report.skipped) == 1
+    assert report.skipped[0].instance.rics == ("SRAH26", "SRAM26")
+    assert report.skipped[0].unavailable_ric == "SRAH26"
+    assert "universe is not found" in report.skipped[0].message
+
+
+def test_run_scan_shared_unavailable_ric_skips_every_affected_candidate_without_reattempt(mocker):
+    mock_get_history = mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            _leg_df(),  # SRAH26 (candidate 1 leg 1)
+            MarketDataUnavailableError("SRAM26", "The universe is not found"),  # candidate 1 leg 2
+            _leg_df(),  # SRAU26 (candidate 3 leg 1)
+            _leg_df(),  # SRAZ26 (candidate 3 leg 2)
+        ],
+    )
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    # candidates: (H26,M26), (M26,U26), (U26,Z26). M26 unavailable ->
+    # both candidates referencing it are skipped; only (U26,Z26), which
+    # never touches M26, prices successfully.
+    assert len(report.results) == 1
+    assert report.results[0].rics == ("SRAU26", "SRAZ26")
+
+    assert len(report.skipped) == 2
+    assert {s.instance.rics for s in report.skipped} == {("SRAH26", "SRAM26"), ("SRAM26", "SRAU26")}
+    assert all(s.unavailable_ric == "SRAM26" for s in report.skipped)
+
+    # Exactly 4 get_history calls total (H26, M26-fails, U26, Z26): the
+    # second candidate's own attempt to fetch M26 again never happens --
+    # it's pre-emptively skipped via unavailable_rics, proving the
+    # shared unavailable RIC is never re-attempted against LSEG.
+    assert mock_get_history.call_count == 4
+
+
+def test_run_scan_all_unavailable_candidates_returns_empty_results_no_exception(mocker):
+    outright = template_from_dense_weights("SOFR", (1,), BarInterval.DAILY)
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            MarketDataUnavailableError("SRAH26", "The universe is not found"),
+            MarketDataUnavailableError("SRAM26", "The universe is not found"),
+        ],
+    )
+
+    request = ScanRequest(
+        definitions=(outright,),
+        contract_start="2026-01-01", contract_end="2026-06-30",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)  # must not raise
+
+    assert report.results == ()
+    assert len(report.skipped) == 2
+    assert {s.unavailable_ric for s in report.skipped} == {"SRAH26", "SRAM26"}
+
+
+def test_run_scan_unrelated_exception_after_a_skip_still_aborts(mocker):
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            MarketDataUnavailableError("SRAH26", "The universe is not found"),
+            _leg_df(),  # SRAM26 (candidate 2 leg 1)
+            RuntimeError("simulated unrelated failure"),  # SRAU26 (candidate 2 leg 2)
+        ],
+    )
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    with pytest.raises(RuntimeError, match="simulated unrelated failure"):
+        run_scan(request)
 
 
 # ---------------------------------------------------------------------
