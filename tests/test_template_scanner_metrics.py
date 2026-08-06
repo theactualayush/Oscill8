@@ -218,6 +218,29 @@ def test_z_score_and_abs_z_score_computed_independently_per_lookback():
     assert abs_z_score(result.per_lookback[0]) != pytest.approx(abs_z_score(result.per_lookback[1]))
 
 
+# ---------------------------------------------------------------------
+# Tradability Analytics: Oscillation Count / Movement resolve as direct
+# RangeAnalytics fields (no new derived-metric registration needed).
+# ---------------------------------------------------------------------
+
+def test_metric_value_resolves_oscillation_count_as_direct_field():
+    values = [0.0, 5.0, 10.0, 5.0, 0.0, 5.0, 7.0, 5.0, 0.0]
+    history = _history(_dates(9), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(9,)).per_lookback[0]
+
+    assert metric_value(analytics, "oscillation_count") == analytics.oscillation_count
+
+
+def test_metric_value_resolves_mean_abs_change_bp_as_direct_field():
+    values = ([0.98, 1.00, 1.02] * 50)[:150]
+    history = _history(_dates(150), values)
+    analytics = analyze_multi_lookback(history, lookbacks=(20, 40)).per_lookback[0]
+
+    assert metric_value(analytics, "mean_abs_change_bp") == pytest.approx(
+        analytics.mean_abs_change_bp, nan_ok=True
+    )
+
+
 def test_metric_value_unknown_field_raises_attribute_error():
     values = ([0.98, 1.00, 1.02] * 50)[:150]
     history = _history(_dates(150), values)

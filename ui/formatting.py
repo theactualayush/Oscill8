@@ -64,6 +64,19 @@ RANGE_POSITION_HELP = (
     "Values outside this range indicate the strategy is beyond the selected historical band."
 )
 
+MOVEMENT_HELP = (
+    "Mean absolute bar-to-bar change, in bp -- how much the strategy typically moves per bar, "
+    "regardless of direction. Not a textbook OHLC ATR (the synthetic strategy series has no "
+    "economically meaningful intrabar High/Low). Independent of the selected percentile range."
+)
+
+OSCILLATION_COUNT_HELP = (
+    "Number of completed Top<->Bottom traversal-and-return cycles between the selected "
+    "percentile range's Low and High boundaries during the resolved lookback. Depends directly "
+    "on the selected percentile range -- P5/P95 and P25/P75 can produce different counts for "
+    "the same series."
+)
+
 
 def format_percentile(value: float) -> str:
     """Render a percentile as a compact label: whole numbers drop the
@@ -218,9 +231,15 @@ FILTER_SPECS: tuple[FilterSpec, ...] = (
         "ar1_r_squared_min", "AR(1) R² (min)", "ar1_r_squared", "min",
         "How well the simple mean-reversion model explains historical movements.",
     ),
-    FilterSpec("z_score_min", "Z-Score (min)", "z_score", "min", Z_SCORE_HELP),
-    FilterSpec("z_score_max", "Z-Score (max)", "z_score", "max", Z_SCORE_HELP),
     FilterSpec("abs_z_score_min", "Absolute Z-Score (min)", "abs_z_score", "min", ABS_Z_SCORE_HELP),
+    FilterSpec(
+        "oscillation_count_min", "Oscillation Count (min)", "oscillation_count", "min",
+        OSCILLATION_COUNT_HELP,
+    ),
+    FilterSpec(
+        "mean_abs_change_bp_min", "Movement, bp (min)", "mean_abs_change_bp", "min",
+        MOVEMENT_HELP,
+    ),
 )
 
 # One stability filter (Module 4B): bounds how much a candidate's
@@ -285,6 +304,8 @@ RANK_METRIC_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Robust/Full Width Ratio", "robust_to_full_width_ratio"),
     ("Z-Score", "z_score"),
     ("Absolute Z-Score", "abs_z_score"),
+    ("Oscillation Count", "oscillation_count"),
+    ("Movement (bp)", "mean_abs_change_bp"),
 )
 
 NO_SECONDARY_RANK = "(none)"
@@ -360,10 +381,17 @@ DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("Position", "range_position_robust", "percent"),
     ("Z", "z_score", "number"),
     ("|Z|", "abs_z_score", "number"),
+    ("Movement", "mean_abs_change_bp", "number"),
+    ("Osc", "oscillation_count", "number"),
     ("ER", "efficiency_ratio", "number"),
-    ("Cross Freq", "normalized_crossing_frequency", "percent"),
     ("Half-Life", "half_life", "number"),
 )
+
+# Cross Frequency is deliberately NOT in the default DISPLAY_COLUMNS --
+# Movement and Osc took its place to keep the default grid compact (see
+# the Tradability Analytics design review). It remains fully available
+# via FILTER_SPECS/RANK_METRIC_OPTIONS and template_scanner's canonical
+# metric resolution; only the default visible table dropped it.
 
 # Tooltip text for the result-grid column headers with a non-obvious
 # meaning -- shown via st.column_config's `help=`. Same wording as the
@@ -374,8 +402,9 @@ RESULT_COLUMN_HELP: dict[str, str] = {
     "Position": RANGE_POSITION_HELP,
     "Z": Z_SCORE_HELP,
     "|Z|": ABS_Z_SCORE_HELP,
+    "Movement": MOVEMENT_HELP,
+    "Osc": OSCILLATION_COUNT_HELP,
     "ER": "Lower means the strategy moved less directionally and oscillated more.",
-    "Cross Freq": "Higher means the strategy crossed its equilibrium more frequently.",
     "Half-Life": "Estimated time for a deviation from equilibrium to decay by half.",
 }
 
@@ -443,10 +472,12 @@ def add_rank_column(display_df: pd.DataFrame) -> pd.DataFrame:
 def selected_strategy_summary(candidate: ScanCandidateResult, display_lookback: int) -> dict[str, str]:
     """Format the headline stats for the Selected Strategy panel:
     identity, ratio, interval, current level, mean, median, robust low/
-    high, range position, z-score, efficiency ratio, and the active
-    percentile-range label -- all read directly off the candidate's
-    already-computed RangeAnalytics at `display_lookback`, nothing
-    recomputed.
+    high, range position, z-score, efficiency ratio, movement,
+    oscillation count, and the active percentile-range label -- all
+    read directly off the candidate's already-computed RangeAnalytics
+    at `display_lookback`, nothing recomputed. The percentile-range
+    label stays alongside Oscillations since the count is only
+    meaningful together with the boundaries it was computed against.
     """
     analytics = metrics_at_lookback(candidate.multi_lookback, display_lookback)
     return {
@@ -462,6 +493,8 @@ def selected_strategy_summary(candidate: ScanCandidateResult, display_lookback: 
         "position": fmt_percent(analytics.range_position_robust),
         "z_score": fmt_number(analytics.z_score, 2),
         "efficiency_ratio": fmt_number(analytics.efficiency_ratio),
+        "movement": fmt_number(analytics.mean_abs_change_bp, 2),
+        "oscillations": fmt_number(analytics.oscillation_count, 0),
         "percentile_range_label": format_percentile_range(
             analytics.lower_percentile, analytics.upper_percentile
         ),

@@ -167,6 +167,40 @@ def test_rank_results_by_absolute_z_score_surfaces_largest_dislocation_first():
     assert ranked_asc == [mild, severe_negative]
 
 
+# ---------------------------------------------------------------------
+# Tradability Analytics: Oscillation Count / Movement ranking
+# ---------------------------------------------------------------------
+
+def test_rank_results_by_oscillation_count():
+    calm = _candidate([100.0] * 20, ("SRAH28",), lookbacks=(20,))
+    busy = _candidate(
+        ([98.0, 100.0, 102.0] * 20)[:20], ("SRAM28",), lookbacks=(20,),
+    )
+
+    accessor = at_lookback("oscillation_count", 20)
+    assert accessor(calm) < accessor(busy)  # sanity check on the fixtures
+
+    ranked = rank_results([busy, calm], [SortKey(accessor, ascending=True)])
+    assert ranked == [calm, busy]
+
+    ranked_desc = rank_results([calm, busy], [SortKey(accessor, ascending=False)])
+    assert ranked_desc == [busy, calm]
+
+
+def test_rank_results_by_movement():
+    quiet = _candidate([100.0] * 20, ("SRAU28",), lookbacks=(20,))
+    volatile = _candidate(
+        [100.0 + (5.0 if i % 2 == 0 else -5.0) for i in range(20)], ("SRAZ28",), lookbacks=(20,),
+    )
+
+    accessor = at_lookback("mean_abs_change_bp", 20)
+    assert accessor(quiet) < accessor(volatile)  # sanity check on the fixtures
+    assert accessor(quiet) == 0.0
+
+    ranked = rank_results([volatile, quiet], [SortKey(accessor, ascending=True)])
+    assert ranked == [quiet, volatile]
+
+
 def test_rank_results_by_derived_metric_accessor():
     # Regression: ranking by a derived Module 5 metric (not a direct
     # RangeAnalytics field) works end-to-end now that at_lookback()

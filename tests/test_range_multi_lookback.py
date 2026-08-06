@@ -315,6 +315,32 @@ def test_analyze_multi_lookback_matches_direct_analyze_range_per_lookback():
         assert _fields_equal(batched, direct)
 
 
+def test_analyze_multi_lookback_has_no_new_stability_fields_for_oscillation_or_movement():
+    # Tradability Analytics scope: Oscillation Count and Movement are
+    # computed through the normal per-lookback RangeAnalytics pipeline
+    # (see test_analyze_multi_lookback_matches_direct_analyze_range_per_lookback
+    # above, which already covers per_lookback[i].oscillation_count/
+    # mean_abs_change_price/mean_abs_change_bp generically) -- but the
+    # Module 4B cross-lookback stability/composite layer is deliberately
+    # NOT expanded for either metric in this phase.
+    multi_fields = {f.name for f in dataclasses.fields(MultiLookbackAnalytics)}
+    assert "oscillation_count_stability" not in multi_fields
+    assert "mean_abs_change_bp_stability" not in multi_fields
+    assert "mean_abs_change_price_stability" not in multi_fields
+
+
+def test_analyze_multi_lookback_oscillation_count_per_lookback_depends_on_percentiles():
+    values = [0.0, 5.0, 10.0, 5.0, 0.0, 5.0, 7.0, 5.0, 0.0]
+    history = _history(_dates(9), values)
+
+    default = analyze_multi_lookback(history, lookbacks=(9,))  # P5/P95
+    narrow = analyze_multi_lookback(
+        history, lookbacks=(9,), lower_percentile=25.0, upper_percentile=75.0
+    )
+
+    assert default.per_lookback[0].oscillation_count != narrow.per_lookback[0].oscillation_count
+
+
 def test_analyze_multi_lookback_forbidden_classification_fields_are_absent():
     forbidden = {
         "regime_age", "regime_start", "range_break", "is_stable",

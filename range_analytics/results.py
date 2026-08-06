@@ -22,7 +22,7 @@ from core.config import BarInterval
 from core.utils import DateLike, get_logger
 from strategy_engine.pricing import StrategyHistory
 
-from range_analytics import efficiency, location, oscillation, units, volatility
+from range_analytics import efficiency, location, movement, oscillation, units, volatility
 from range_analytics.lookback import resolve_window
 from range_analytics.mean_reversion import fit_ar1
 
@@ -74,6 +74,11 @@ class RangeAnalytics:
     crossing_threshold: float
     raw_crossing_count: int
     hysteresis_crossing_count: int
+
+    oscillation_count: int
+
+    mean_abs_change_price: float
+    mean_abs_change_bp: float
 
     ar1_gamma: float
     ar1_beta: float
@@ -127,6 +132,25 @@ def analyze_range(
     one comparing `current` against the *other* N-1 observations. This
     is the established, tested convention (see
     tests/test_range_analytics.py) and is preserved unchanged here.
+
+    `oscillation_count` (Tradability Analytics): the number of
+    completed Top<->Bottom traversal-and-return cycles between the
+    window's `range_low_robust`/`range_high_robust` boundaries -- see
+    range_analytics.oscillation.count_oscillations. Both boundaries are
+    computed ONCE from this resolved window and held fixed while
+    counting; the count is therefore a direct function of
+    `lower_percentile`/`upper_percentile` (P5/P95 vs P25/P75 can
+    legitimately produce different counts for the same series). This is
+    a materially different metric from `raw_crossing_count`/
+    `hysteresis_crossing_count` (single-equilibrium half-traversals
+    around the median) -- neither replaces the other.
+
+    `mean_abs_change_price`/`mean_abs_change_bp` (Tradability
+    Analytics): mean(abs(S_t - S_(t-1))) over the window -- see
+    range_analytics.movement.mean_absolute_change. Deliberately NOT a
+    percentile-dependent quantity: unlike the robust-range/oscillation
+    fields, changing `lower_percentile`/`upper_percentile` never changes
+    Movement for the same resolved window.
     """
     location.validate_percentiles(lower_percentile, upper_percentile)
 
@@ -168,6 +192,10 @@ def analyze_range(
     hysteresis_count = oscillation.count_crossings(
         series, equilibrium, threshold=crossing_threshold
     )
+    oscillation_count = oscillation.count_oscillations(series, low_robust, high_robust)
+
+    mean_abs_change_price = movement.mean_absolute_change(series)
+    mean_abs_change_bp = units.price_to_bp(mean_abs_change_price, market_key)
 
     ar1 = fit_ar1(series)
 
@@ -204,6 +232,9 @@ def analyze_range(
         crossing_threshold=crossing_threshold,
         raw_crossing_count=raw_count,
         hysteresis_crossing_count=hysteresis_count,
+        oscillation_count=oscillation_count,
+        mean_abs_change_price=mean_abs_change_price,
+        mean_abs_change_bp=mean_abs_change_bp,
         ar1_gamma=ar1.gamma,
         ar1_beta=ar1.beta,
         ar1_std_error=ar1.std_error,

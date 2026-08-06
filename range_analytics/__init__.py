@@ -28,7 +28,8 @@ from range_analytics.multi_lookback import (
     range_to_volatility_ratio,
     robust_to_full_width_ratio,
 )
-from range_analytics.oscillation import count_crossings
+from range_analytics.movement import mean_absolute_change
+from range_analytics.oscillation import count_crossings, count_oscillations
 from range_analytics.results import RangeAnalytics, analyze_range
 from range_analytics.stability import LookbackStability
 from range_analytics.units import price_to_bp
@@ -38,6 +39,8 @@ __all__ = [
     "analyze_range",
     "resolve_window",
     "count_crossings",
+    "count_oscillations",
+    "mean_absolute_change",
     "AR1Fit",
     "fit_ar1",
     "price_to_bp",

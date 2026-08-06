@@ -207,14 +207,26 @@ def test_every_filter_spec_accessor_resolves_against_a_real_candidate(_scan_cand
         criterion.passes(_scan_candidate)
 
 
-def test_filter_specs_include_z_score_min_max_and_abs_z_score_min():
+def test_filter_specs_exclude_signed_z_score_but_keep_abs_z_score_min():
+    # Trader-facing filter cleanup: signed Z-Score min/max controls are
+    # redundant once Absolute Z-Score filtering exists, so they're
+    # removed from FILTER_SPECS -- but signed z_score itself stays fully
+    # available elsewhere (RangeAnalytics, canonical metric resolution,
+    # RANK_METRIC_OPTIONS, results, Selected Strategy); see
+    # test_rank_metric_options_include_z_score_and_absolute_z_score.
     by_key = {spec.key: spec for spec in FILTER_SPECS}
-    assert by_key["z_score_min"].field == "z_score"
-    assert by_key["z_score_min"].bound == "min"
-    assert by_key["z_score_max"].field == "z_score"
-    assert by_key["z_score_max"].bound == "max"
+    assert "z_score_min" not in by_key
+    assert "z_score_max" not in by_key
     assert by_key["abs_z_score_min"].field == "abs_z_score"
     assert by_key["abs_z_score_min"].bound == "min"
+
+
+def test_filter_specs_include_oscillation_count_and_movement_minimums():
+    by_key = {spec.key: spec for spec in FILTER_SPECS}
+    assert by_key["oscillation_count_min"].field == "oscillation_count"
+    assert by_key["oscillation_count_min"].bound == "min"
+    assert by_key["mean_abs_change_bp_min"].field == "mean_abs_change_bp"
+    assert by_key["mean_abs_change_bp_min"].bound == "min"
 
 
 # ---------------------------------------------------------------------
@@ -291,6 +303,12 @@ def test_rank_metric_options_include_z_score_and_absolute_z_score():
     assert "abs_z_score" in fields
 
 
+def test_rank_metric_options_include_oscillation_count_and_movement():
+    fields = {field for _, field in RANK_METRIC_OPTIONS}
+    assert "oscillation_count" in fields
+    assert "mean_abs_change_bp" in fields
+
+
 # ---------------------------------------------------------------------
 # Display formatting
 # ---------------------------------------------------------------------
@@ -348,15 +366,22 @@ def test_display_columns_exclude_ar1_beta_and_width_from_default_table():
 
 
 def test_display_columns_match_approved_column_order():
+    # Tradability Analytics: Movement/Osc took Cross Freq's place in the
+    # default visible table to keep it compact. Cross Frequency stays
+    # fully available in the backend -- FILTER_SPECS still has
+    # "normalized_crossing_frequency_min" and RANK_METRIC_OPTIONS still
+    # has "Normalized Crossing Frequency" -- only the default visible
+    # table dropped it.
     labels = [label for label, _, _ in DISPLAY_COLUMNS]
     assert labels == [
         "Strategy", "Ratio", "Current", "Low", "Median", "High",
-        "Position", "Z", "|Z|", "ER", "Cross Freq", "Half-Life",
+        "Position", "Z", "|Z|", "Movement", "Osc", "ER", "Half-Life",
     ]
+    assert "Cross Freq" not in labels
 
 
 def test_result_column_help_covers_every_new_column():
-    for label in ("Low", "High", "Position", "Z", "|Z|"):
+    for label in ("Low", "High", "Position", "Z", "|Z|", "Movement", "Osc"):
         assert RESULT_COLUMN_HELP[label]
 
 
@@ -369,6 +394,19 @@ def test_to_display_dataframe_shows_low_high_z_for_a_real_candidate(_scan_candid
     assert row["High"] != "—"
     assert row["Z"] != "—"
     assert row["|Z|"] != "—"
+
+
+def test_to_display_dataframe_shows_movement_and_osc_for_a_real_candidate(_scan_candidate):
+    results_df = results_to_dataframe([_scan_candidate], display_lookback=20)
+    display = to_display_dataframe(results_df)
+    row = display.iloc[0]
+
+    analytics = _scan_candidate.multi_lookback.per_lookback[
+        _scan_candidate.multi_lookback.lookbacks_requested.index(20)
+    ]
+    assert row["Movement"] != "—"
+    assert row["Movement"] == fmt_number(analytics.mean_abs_change_bp)
+    assert row["Osc"] == str(analytics.oscillation_count)
 
 
 def test_to_display_dataframe_z_renders_nan_as_dash():
@@ -431,6 +469,20 @@ def test_selected_strategy_summary_includes_mean_robust_bounds_and_z_score(_scan
 
 def test_selected_strategy_summary_includes_percentile_range_label(_scan_candidate):
     summary = selected_strategy_summary(_scan_candidate, display_lookback=20)
+    assert summary["percentile_range_label"] == "P5-P95"
+
+
+def test_selected_strategy_summary_includes_movement_and_oscillations(_scan_candidate):
+    summary = selected_strategy_summary(_scan_candidate, display_lookback=20)
+
+    analytics = _scan_candidate.multi_lookback.per_lookback[
+        _scan_candidate.multi_lookback.lookbacks_requested.index(20)
+    ]
+    assert summary["movement"] == fmt_number(analytics.mean_abs_change_bp, 2)
+    assert summary["oscillations"] == fmt_number(analytics.oscillation_count, 0)
+    assert summary["oscillations"] != "—"
+    # Percentile-range label stays alongside Oscillations -- the count is
+    # only meaningful together with the boundaries it was computed from.
     assert summary["percentile_range_label"] == "P5-P95"
 
 

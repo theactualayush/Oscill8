@@ -228,3 +228,41 @@ def test_filter_criterion_z_score_nan_fails_only_that_filter():
     filtered = apply_filters([_SHORT], [criterion])
     assert filtered == []
     assert apply_filters([_SHORT]) == [_SHORT]
+
+
+# ---------------------------------------------------------------------
+# Tradability Analytics: Oscillation Count / Movement filtering
+# ---------------------------------------------------------------------
+
+def test_filter_using_oscillation_count_minimum():
+    accessor = at_lookback("oscillation_count", 30)
+    osc_oscillating = accessor(_OSCILLATING)
+    osc_trending = accessor(_TRENDING)
+    assert osc_trending < osc_oscillating  # sanity check on the fixtures
+
+    criterion = FilterCriterion("min oscillations", accessor, min_value=osc_oscillating)
+    result = apply_filters([_TRENDING, _OSCILLATING], [criterion])
+    assert _OSCILLATING in result
+    assert _TRENDING not in result
+
+
+def test_filter_using_movement_minimum():
+    accessor = at_lookback("mean_abs_change_bp", 30)
+    movement_oscillating = accessor(_OSCILLATING)
+    assert not math.isnan(movement_oscillating)
+
+    passes = FilterCriterion("movement min", accessor, min_value=movement_oscillating)
+    assert apply_filters([_OSCILLATING], [passes]) == [_OSCILLATING]
+
+    fails = FilterCriterion("movement min too high", accessor, min_value=movement_oscillating + 1000.0)
+    assert apply_filters([_OSCILLATING], [fails]) == []
+
+
+def test_filter_criterion_oscillation_count_short_history_fails_gracefully():
+    # A single-observation candidate has a degenerate (zero-width)
+    # robust range -- oscillation_count is 0 (well-defined, never NaN),
+    # so a min_value > 0 correctly excludes it without raising.
+    accessor = at_lookback("oscillation_count", 30)
+    assert accessor(_SHORT) == 0
+    criterion = FilterCriterion("min oscillations", accessor, min_value=1)
+    assert apply_filters([_SHORT], [criterion]) == []

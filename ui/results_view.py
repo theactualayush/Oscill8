@@ -212,7 +212,10 @@ def render_selection_and_chart(display_lookback: int, scan_request: ScanRequest 
         st.write(f"**{rank_prefix}{summary['rics']}**")
         st.caption(f"{summary['weights']} · {summary['interval']} · Robust Range · {summary['percentile_range_label']}")
 
-        labels = ["Current", "Mean", "Median", "Robust Low", "Robust High", "Position", "Z-Score", "ER"]
+        labels = [
+            "Current", "Mean", "Median", "Robust Low", "Robust High", "Position",
+            "Z-Score", "ER", "Movement (bp)", "Oscillations",
+        ]
         values = [
             summary["current"],
             summary["mean"],
@@ -222,6 +225,8 @@ def render_selection_and_chart(display_lookback: int, scan_request: ScanRequest 
             summary["position"],
             summary["z_score"],
             summary["efficiency_ratio"],
+            summary["movement"],
+            summary["oscillations"],
         ]
         for col, label, value in zip(st.columns(len(labels)), labels, values):
             with col:

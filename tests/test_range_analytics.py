@@ -101,6 +101,9 @@ def test_analyze_range_empty_history_returns_nan_fields():
     assert math.isnan(result.half_life)
     assert result.raw_crossing_count == 0
     assert result.hysteresis_crossing_count == 0
+    assert result.oscillation_count == 0
+    assert math.isnan(result.mean_abs_change_price)
+    assert math.isnan(result.mean_abs_change_bp)
 
 
 def test_analyze_range_single_observation():
@@ -112,6 +115,12 @@ def test_analyze_range_single_observation():
     assert math.isnan(result.range_position_full)
     assert math.isnan(result.realized_vol_price)
     assert math.isnan(result.efficiency_ratio)
+    # A single-observation window has a degenerate (zero-width) robust
+    # range -- oscillation_count is a well-defined 0, never NaN.
+    assert result.oscillation_count == 0
+    # Movement needs at least 2 observations -- NaN, not 0, here.
+    assert math.isnan(result.mean_abs_change_price)
+    assert math.isnan(result.mean_abs_change_bp)
 
 
 def test_analyze_range_no_classification_fields_are_exposed():
@@ -290,3 +299,93 @@ def test_z_score_nan_on_zero_std_constant_series():
     history = _history(dates, values)
     result = analyze_range(history)
     assert math.isnan(result.z_score)
+
+
+# ---------------------------------------------------------------------
+# Tradability Analytics: Oscillation Count and Movement
+# ---------------------------------------------------------------------
+
+def test_analyze_range_oscillation_count_matches_the_underlying_primitive():
+    from range_analytics.oscillation import count_oscillations
+
+    dates = _dates(9)
+    values = [0.0, 5.0, 10.0, 5.0, 0.0, 5.0, 7.0, 5.0, 0.0]
+    history = _history(dates, values)
+
+    result = analyze_range(history)
+    series = pd.Series(values)
+    expected = count_oscillations(series, result.range_low_robust, result.range_high_robust)
+    assert result.oscillation_count == expected
+
+
+def test_analyze_range_oscillation_count_depends_on_selected_percentile_range():
+    dates = _dates(9)
+    values = [0.0, 5.0, 10.0, 5.0, 0.0, 5.0, 7.0, 5.0, 0.0]
+    history = _history(dates, values)
+
+    default = analyze_range(history)  # P5/P95
+    narrow = analyze_range(history, lower_percentile=25.0, upper_percentile=75.0)
+
+    assert default.range_low_robust != narrow.range_low_robust or (
+        default.range_high_robust != narrow.range_high_robust
+    )
+    assert default.oscillation_count == 1
+    assert narrow.oscillation_count == 2
+    assert default.oscillation_count != narrow.oscillation_count
+
+
+def test_analyze_range_oscillation_count_zero_width_range_is_zero_not_nan():
+    # A perfectly flat window: range_low_robust == range_high_robust.
+    dates = _dates(10)
+    values = [3.0] * 10
+    history = _history(dates, values)
+
+    result = analyze_range(history)
+    assert result.range_low_robust == result.range_high_robust
+    assert result.oscillation_count == 0
+
+
+def test_analyze_range_movement_matches_mean_absolute_change():
+    from range_analytics.movement import mean_absolute_change
+
+    dates = _dates(10)
+    values = [1.0, 1.02, 0.98, 1.05, 0.95, 1.03, 0.97, 1.01, 0.99, 1.0]
+    history = _history(dates, values)
+
+    result = analyze_range(history)
+    series = pd.Series(values)
+    assert result.mean_abs_change_price == pytest.approx(mean_absolute_change(series))
+    assert result.mean_abs_change_bp == pytest.approx(result.mean_abs_change_price * 100.0)
+
+
+def test_analyze_range_movement_flat_series_is_zero():
+    dates = _dates(10)
+    values = [2.0] * 10
+    history = _history(dates, values)
+
+    result = analyze_range(history)
+    assert result.mean_abs_change_price == 0.0
+    assert result.mean_abs_change_bp == 0.0
+
+
+def test_analyze_range_movement_nan_with_fewer_than_two_observations():
+    history = _history(["2026-01-01"], [5.0])
+    result = analyze_range(history)
+    assert math.isnan(result.mean_abs_change_price)
+    assert math.isnan(result.mean_abs_change_bp)
+
+
+def test_analyze_range_movement_is_independent_of_percentile_selection():
+    dates = _dates(9)
+    values = [0.0, 5.0, 10.0, 5.0, 0.0, 5.0, 7.0, 5.0, 0.0]
+    history = _history(dates, values)
+
+    default = analyze_range(history)  # P5/P95
+    narrow = analyze_range(history, lower_percentile=25.0, upper_percentile=75.0)
+
+    # Same resolved window/series in both calls -- Movement must be
+    # identical even though Oscillation Count (percentile-dependent)
+    # differs between them.
+    assert default.oscillation_count != narrow.oscillation_count
+    assert default.mean_abs_change_price == pytest.approx(narrow.mean_abs_change_price)
+    assert default.mean_abs_change_bp == pytest.approx(narrow.mean_abs_change_bp)
