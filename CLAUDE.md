@@ -629,11 +629,109 @@ Key design points a future session needs:
   clutter, unified hover. No secondary diagnostic charts (AR(1), crossing
   markers, rolling-stability, z-score) — deferred, see the Development
   Roadmap below.
-- Test suite (current file-level count): `test_ui_chart.py` 5 tests —
+- Test suite (current file-level count): `test_ui_chart.py` 14 tests —
   the pure `build_strategy_chart()` figure builder is unit-tested
   (trace/shape structure, exact lookback-window sizing, empty-window
-  handling); `get_selected_history()`'s I/O and `render_chart()`'s
-  widget rendering are exercised via manual/browser smoke testing.
+  handling, and — added in the trading-day data-integrity pass below —
+  rangebreak/weekend/holiday chart-axis behaviour);
+  `get_selected_history()`'s I/O and `render_chart()`'s widget
+  rendering are exercised via manual/browser smoke testing.
+
+---
+
+## Data-Integrity Pass — Trading-Day / Valid-Observation Handling
+
+COMPLETED AND TESTED. A cross-cutting audit + targeted fix, not a new
+numbered module — it touches Module 3 (`strategy_engine/pricing.py`)
+and Module 6B (`ui/chart_view.py`) only.
+
+**Canonical invariant (applies pipeline-wide, from Module 1 through the
+chart):**
+
+> Oscill8 DAILY analytics operate on valid market observations, not
+> calendar days.
+
+Concretely: a weekend, a holiday, or any other date a market simply has
+no bar for is never a row anywhere in the pipeline — not in LSEG's own
+response, not in the SQLite cache, not in a `StrategyHistory.history`
+frame, not in an analysis window. It is absent, never a zero, never
+forward-filled, never interpolated. `range_analytics.lookback.
+resolve_window`'s `lookback=N` therefore already meant, and continues
+to mean, N *valid* observations — audited and confirmed end-to-end
+before any code changed; no `range_analytics` calculation needed to
+change (see `tests/test_trading_day_regression.py` for the end-to-end
+proof: a mocked history spanning a real weekend, run through
+`strategy_engine.pricing.build_history` -> `range_analytics.results.
+analyze_range`, matches hand-computed values treating Friday->Monday as
+consecutive observations).
+
+**Multi-leg invariant** (`strategy_engine/pricing.py`):
+
+> A synthetic Strategy observation exists only when every required leg
+> has a valid price on that date.
+
+`build_history` already aligned legs with an inner join on `Date` (no
+forward-fill), but the join key itself didn't previously exclude a Date
+where a leg had a row with a NaN `price_field` value (a vendor data-
+quality gap on an otherwise-normal trading date) — that NaN would enter
+the joined frame and only get dropped later, by whichever caller
+happened to run `resolve_window` afterward. Hardened: each leg's
+NaN-`price_field` rows are now dropped immediately after fetch, before
+the join, so `StrategyHistory.history` is NaN-free at its own boundary,
+not by accident of a downstream caller's behaviour. A missing Date and
+a NaN-priced Date are now handled identically at the same point in the
+pipeline. This is deliberately not solved by an explicit per-market
+holiday calendar (CME/ICE/SONIA/CORRA/€STR, etc.) — none was added or
+is needed. Each leg's own valid-observation series (from
+`database.get_history`) is the sole source of truth, which is what lets
+this generalize unchanged to a future intermarket strategy whose legs
+may follow different market holiday calendars: the inner join still
+just takes the intersection of whatever dates each leg actually has.
+
+**Chart axis fix** (`ui/chart_view.py`): the analytical dataframe
+plotted by `build_strategy_chart` was already gap-free (no weekend/
+holiday row), so the line trace itself always connected Friday directly
+to Monday — but Plotly's default continuous date axis still reserved
+real calendar-time width for the non-trading days in between, which
+read visually as a gap/whitespace even though no data was missing. Two
+new pure helpers close that up via Plotly `rangebreaks`, with no static
+holiday calendar:
+  - `_missing_weekdays(dates)`: any Mon-Fri weekday within
+    `[dates.min(), dates.max()]` absent from `dates` — a holiday, or
+    any other date this specific strategy's own valid-observation
+    series happens to lack. Computed dynamically from the actual
+    plotted series every time, never from a maintained list. Dates are
+    `.normalize()`-d before comparison so a DAILY timestamp's
+    time-of-day component can never cause a spurious mismatch.
+  - `_build_rangebreaks(dates)`: `[dict(bounds=["sat", "mon"])]`
+    (always present — the fixed, market-agnostic weekend rule) plus a
+    `dict(values=[...])` entry ONLY when `_missing_weekdays` finds
+    something — a pure weekend-only gap never gets a redundant explicit
+    Saturday/Sunday `values` list.
+  Real chronological date labels are unaffected — rangebreaks only
+  close up unused axis space, never relabel, reorder, or drop a plotted
+  point (verified in `tests/test_ui_chart.py`).
+
+**Deferred, not solved here:**
+- Intraday (HOURLY/4H) non-trading-hour chart gaps — `rangebreaks`
+  would additionally need hour-of-day bounds; out of scope, this pass
+  is DAILY-focused only.
+- Distinguishing a legitimate holiday from an unexpected vendor
+  data-quality gap — both are treated identically today ("no valid
+  price = no observation"); Oscill8 has no independent trading-holiday
+  calendar to cross-check against, and LSEG is the documented sole
+  source of truth. A future sparse-data/vendor-quality diagnostic
+  (surfacing an unusually low hit-rate against business days) is a
+  separate, unapproved idea, not implemented.
+
+Test suite additions: `tests/test_strategy_pricing.py` (+3: NaN-priced
+leg dropped before the join, intersection with a mixed missing-date/
+NaN-price scenario, no forward-fill), `tests/test_ui_chart.py` (+9:
+`_missing_weekdays`/`_build_rangebreaks` unit coverage plus chart-level
+rangebreak/label-preservation checks), and a new
+`tests/test_trading_day_regression.py` (+5: one continuous
+downloader-mock -> `build_history` -> `analyze_range` chain over a real
+weekend-spanning series).
 
 ---
 

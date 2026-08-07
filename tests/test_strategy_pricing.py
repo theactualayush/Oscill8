@@ -130,6 +130,83 @@ def test_build_history_drops_timestamp_missing_from_any_leg(mocker):
     assert result.history["Date"].iloc[0] == pd.Timestamp("2026-01-02")
 
 
+def test_build_history_drops_date_with_nan_price_in_one_leg(mocker):
+    """A Date a leg technically HAS a row for, but with a NaN price (a
+    vendor data-quality gap on an otherwise-normal trading date), must
+    be excluded from the synthetic Strategy series exactly like a Date
+    the leg never had a bar for at all -- see the module docstring's
+    valid-observation invariant.
+    """
+    instance = _fly_instance()
+    dates = ["2026-01-02", "2026-01-05"]
+    leg2 = _leg_df(dates, [96.72, 96.73])
+    leg2.loc[leg2["Date"] == pd.Timestamp("2026-01-05"), "Close"] = float("nan")
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            _leg_df(dates, [96.80, 96.82]),
+            leg2,
+            _leg_df(dates, [96.65, 96.65]),
+        ],
+    )
+
+    result = pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert len(result.history) == 1
+    assert result.history["Date"].iloc[0] == pd.Timestamp("2026-01-02")
+    assert result.history["Strategy"].tolist() == pytest.approx([96.80 - 2 * 96.72 + 96.65])
+
+
+def test_build_history_intersection_combines_missing_date_and_nan_price(mocker):
+    """Three legs, each excluding a DIFFERENT date via a different
+    mechanism (a plain missing row vs. a NaN-priced row) -- only the
+    date every leg agrees on survives, confirming the intersection-of-
+    valid-dates policy holds when both exclusion mechanisms are mixed
+    together, not just individually.
+    """
+    instance = _fly_instance()
+    dates = ["2026-01-02", "2026-01-05", "2026-01-06"]
+    leg1 = _leg_df(dates, [96.80, 96.82, 96.83])  # fully valid
+    leg2 = _leg_df(["2026-01-02", "2026-01-06"], [96.72, 96.74])  # 01-05 missing entirely
+    leg3 = _leg_df(dates, [96.65, 96.66, 96.67])
+    leg3.loc[leg3["Date"] == pd.Timestamp("2026-01-06"), "Close"] = float("nan")  # 01-06 NaN price
+
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[leg1, leg2, leg3],
+    )
+
+    result = pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert len(result.history) == 1
+    assert result.history["Date"].iloc[0] == pd.Timestamp("2026-01-02")
+
+
+def test_build_history_never_forward_fills_a_nan_price(mocker):
+    """The excluded Date's Strategy value must not be resurrected via
+    any prior valid price -- it should simply be absent, not filled
+    with 2026-01-02's price or interpolated between neighbours.
+    """
+    instance = _fly_instance()
+    dates = ["2026-01-02", "2026-01-05", "2026-01-06"]
+    leg2 = _leg_df(dates, [96.72, 96.73, 96.75])
+    leg2.loc[leg2["Date"] == pd.Timestamp("2026-01-05"), "Close"] = float("nan")
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            _leg_df(dates, [96.80, 96.82, 96.84]),
+            leg2,
+            _leg_df(dates, [96.65, 96.66, 96.67]),
+        ],
+    )
+
+    result = pricing.build_history(instance, "2026-01-01", "2026-01-31")
+
+    assert list(result.history["Date"]) == [pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-06")]
+    assert not result.history["Strategy"].isna().any()
+    assert 96.73 not in result.history["Leg_2"].tolist()
+
+
 def test_build_history_empty_leg_produces_empty_result_not_error(mocker):
     instance = _fly_instance()
     mocker.patch(

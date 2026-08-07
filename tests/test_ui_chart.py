@@ -27,12 +27,22 @@ from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.pricing import StrategyHistory
 
-from ui.chart_view import build_strategy_chart
+from ui.chart_view import _build_rangebreaks, _missing_weekdays, build_strategy_chart
 
 
 def _history(n: int) -> StrategyHistory:
     dates = pd.bdate_range("2024-01-01", periods=n)
     values = [100.0 + 0.01 * (i % 7) - 0.005 * (i % 5) for i in range(n)]
+    df = pd.DataFrame({"Date": dates, "Leg_1": values, "Leg_2": values, "Strategy": values})
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0, 1), weights=(1.0, -1.0), interval=BarInterval.DAILY
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAZ25", "SRAH26"))
+    return StrategyHistory(instance=instance, history=df, price_field="Close")
+
+
+def _history_from_dates(dates: pd.DatetimeIndex) -> StrategyHistory:
+    values = [100.0 + 0.01 * (i % 7) - 0.005 * (i % 5) for i in range(len(dates))]
     df = pd.DataFrame({"Date": dates, "Leg_1": values, "Leg_2": values, "Strategy": values})
     definition = StrategyDefinition(
         market_key="SOFR", offsets=(0, 1), weights=(1.0, -1.0), interval=BarInterval.DAILY
@@ -121,3 +131,103 @@ def test_build_strategy_chart_handles_empty_window_gracefully():
     assert len(price_trace.x) == 0
     assert "Current" not in [t.name for t in fig.data]
     assert len(fig.layout.shapes) == 0  # no robust-range band on undefined bounds
+
+
+# --------------------------------------------------------------------------
+# Trading-day rangebreaks (data-integrity phase)
+# --------------------------------------------------------------------------
+
+
+def test_missing_weekdays_empty_for_pure_weekend_gap():
+    # bdate_range never contains a Saturday/Sunday row to begin with --
+    # a plain week-to-week transition has no OTHER missing weekday.
+    dates = pd.bdate_range("2024-01-04", periods=2)  # Thu 01-04, Fri 01-05
+    dates = dates.append(pd.bdate_range("2024-01-08", periods=1))  # Mon 01-08
+    assert _missing_weekdays(pd.Series(dates)) == []
+
+
+def test_missing_weekdays_detects_a_dropped_business_day():
+    bdays = pd.bdate_range("2024-01-01", periods=10)
+    dropped = bdays[5]
+    dates = pd.Series(bdays.delete(5))
+
+    missing = _missing_weekdays(dates)
+
+    assert missing == [pd.Timestamp(dropped).normalize()]
+
+
+def test_missing_weekdays_never_includes_a_saturday_or_sunday():
+    bdays = pd.bdate_range("2024-01-01", periods=10)
+    dates = pd.Series(bdays.delete(5))
+
+    missing = _missing_weekdays(dates)
+
+    assert all(d.weekday() < 5 for d in missing)
+
+
+def test_missing_weekdays_empty_for_empty_input():
+    assert _missing_weekdays(pd.Series([], dtype="datetime64[ns]")) == []
+
+
+def test_missing_weekdays_normalizes_time_of_day():
+    bdays = pd.bdate_range("2024-01-01", periods=5)
+    dropped = bdays[2]
+    remaining = bdays.delete(2)
+    # Give the remaining timestamps a non-midnight, inconsistent
+    # time-of-day component -- normalization must still line them up
+    # against the full calendar range without spuriously flagging any
+    # of them as missing.
+    dates = pd.Series([ts + pd.Timedelta(hours=i) for i, ts in enumerate(remaining)])
+
+    missing = _missing_weekdays(dates)
+
+    assert missing == [pd.Timestamp(dropped).normalize()]
+
+
+def test_build_rangebreaks_weekend_only_gap_has_no_values_entry():
+    dates = pd.Series(pd.bdate_range("2024-01-04", periods=2).append(pd.bdate_range("2024-01-08", periods=1)))
+
+    breaks = _build_rangebreaks(dates)
+
+    assert breaks == [dict(bounds=["sat", "mon"])]
+
+
+def test_build_rangebreaks_includes_values_entry_for_a_holiday_gap():
+    bdays = pd.bdate_range("2024-01-01", periods=10)
+    dropped = bdays[5]
+    dates = pd.Series(bdays.delete(5))
+
+    breaks = _build_rangebreaks(dates)
+
+    assert breaks[0] == dict(bounds=["sat", "mon"])
+    assert len(breaks) == 2
+    assert breaks[1]["values"] == [pd.Timestamp(dropped).normalize()]
+
+
+def test_chart_rangebreaks_excludes_holiday_but_not_weekend_saturday_sunday():
+    bdays = pd.bdate_range("2024-01-01", periods=20)
+    dropped = bdays[10]
+    dates = bdays.delete(10)
+    history = _history_from_dates(dates)
+    analytics = analyze_range(history, lookback=len(dates))
+
+    fig = build_strategy_chart(history.history, lookback=len(dates), analytics=analytics)
+
+    rangebreaks = fig.layout.xaxis.rangebreaks
+    assert rangebreaks[0].bounds == ("sat", "mon")
+    holiday_values = [pd.Timestamp(v) for v in rangebreaks[1].values]
+    assert holiday_values == [pd.Timestamp(dropped).normalize()]
+    # No Saturday/Sunday should ever appear in the explicit values list --
+    # weekends are handled exclusively by the bounds entry above.
+    assert all(v.weekday() < 5 for v in holiday_values)
+
+
+def test_chart_preserves_real_chronological_date_labels_across_a_weekend():
+    dates = pd.bdate_range("2024-01-04", periods=2).append(pd.bdate_range("2024-01-08", periods=1))
+    history = _history_from_dates(dates)
+    analytics = analyze_range(history, lookback=3)
+
+    fig = build_strategy_chart(history.history, lookback=3, analytics=analytics)
+
+    price_trace = next(t for t in fig.data if t.name == "Strategy")
+    assert list(pd.to_datetime(price_trace.x)) == list(dates)

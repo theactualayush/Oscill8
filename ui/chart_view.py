@@ -25,6 +25,26 @@ The plotted window itself is sliced with range_analytics.lookback.
 resolve_window() -- the SAME function Module 4A uses internally to
 resolve a lookback -- so the plotted observations are always exactly
 the ones the displayed overlay levels were computed from.
+
+Trading-day chart axis (data-integrity phase): `window["Date"]` never
+contains a weekend/holiday row to begin with (see the pipeline-wide
+"valid observations, not calendar days" invariant documented in
+strategy_engine.pricing and range_analytics.lookback) -- so the line
+trace itself already connects Friday directly to Monday. What Plotly's
+default continuous date axis gets wrong on its own is spacing: it
+reserves real calendar width for the non-trading days in between,
+which reads visually as a gap even though no data is missing. `_build_
+rangebreaks()` collapses that unused axis space via Plotly
+`rangebreaks` -- weekends via the fixed `bounds=["sat", "mon"]` rule,
+and any OTHER missing weekday (a holiday, or any date this particular
+strategy's own valid-observation series happens to lack) derived
+dynamically from `window["Date"]` itself, never from a maintained
+per-market holiday calendar. This is deliberate: it makes the fix
+automatically correct for every current market and for a future
+intermarket strategy's own combined valid-date set, since it only ever
+reads off the already-correct series, the same source of truth the
+rest of the pipeline uses. DAILY only -- see _build_rangebreaks for why
+HOURLY/4H intraday gaps are explicitly out of scope here.
 """
 
 from __future__ import annotations
@@ -67,6 +87,49 @@ def get_selected_history(candidate: ScanCandidateResult, scan_request: ScanReque
     history = build_history(candidate.instance, scan_request.price_start, scan_request.price_end).history
     state.cache_history(history)
     return history
+
+
+def _missing_weekdays(dates: pd.Series) -> list[pd.Timestamp]:
+    """Weekdays (Mon-Fri) within [dates.min(), dates.max()] that have no
+    observation in `dates` -- i.e. holidays or any other date this
+    strategy's own valid-observation series lacks. Deliberately excludes
+    Saturday/Sunday: weekends are already collapsed by the fixed
+    `bounds=["sat", "mon"]` rangebreak in _build_rangebreaks, and listing
+    them again here would be redundant.
+
+    `dates` is normalized to midnight before comparison (`.normalize()`)
+    so a DAILY timestamp's time-of-day component -- which need not be
+    identical across rows -- can never cause a real trading date to be
+    misclassified as missing.
+
+    Returns [] for an empty input.
+    """
+    if dates.empty:
+        return []
+    normalized = pd.DatetimeIndex(dates).normalize()
+    full_range = pd.date_range(normalized.min(), normalized.max(), freq="D")
+    present = set(normalized)
+    return [d for d in full_range if d.weekday() < 5 and d not in present]
+
+
+def _build_rangebreaks(dates: pd.Series) -> list[dict]:
+    """Plotly xaxis `rangebreaks` that remove non-trading calendar days
+    from the chart's horizontal space without any static holiday
+    calendar: weekends via `bounds=["sat", "mon"]` (always present,
+    covers every market identically), plus a `values` entry for any
+    missing weekday actually found in `dates` (see _missing_weekdays) --
+    omitted entirely when there is none, so a purely weekend-only gap
+    never gets a redundant empty/explicit weekend `values` list.
+
+    Chronological date labels are unaffected -- rangebreaks only close
+    up unused axis space, they never relabel, reorder, or drop a plotted
+    point.
+    """
+    breaks: list[dict] = [dict(bounds=["sat", "mon"])]
+    missing = _missing_weekdays(dates)
+    if missing:
+        breaks.append(dict(values=missing))
+    return breaks
 
 
 def build_strategy_chart(history: pd.DataFrame, lookback: int, analytics: RangeAnalytics) -> go.Figure:
@@ -137,6 +200,7 @@ def build_strategy_chart(history: pd.DataFrame, lookback: int, analytics: RangeA
         yaxis_title="Strategy Value",
         hovermode="x unified",
     )
+    fig.update_xaxes(rangebreaks=_build_rangebreaks(window["Date"]))
     return fig
 
 
