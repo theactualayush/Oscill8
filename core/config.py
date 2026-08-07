@@ -41,6 +41,15 @@ SQLITE_DB_PATH = os.environ.get(
     os.path.join(REPO_ROOT_DIR, "data", "oscill8.db"),
 )
 
+# Directory Module 7A's StrategySetRepository persists one JSON file per
+# saved StrategySet into. Directory creation is that repository's own
+# responsibility at save() time, not a side effect of importing this
+# module -- same convention as SQLITE_DB_PATH above.
+STRATEGY_SETS_DIR = os.environ.get(
+    "RBS_STRATEGY_SETS_DIR",
+    os.path.join(REPO_ROOT_DIR, "data", "strategy_sets"),
+)
+
 
 # --------------------------------------------------------------------------
 # Database settings (PostgreSQL)

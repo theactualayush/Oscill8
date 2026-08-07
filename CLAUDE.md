@@ -735,6 +735,112 @@ weekend-spanning series).
 
 ---
 
+## Module 7A – Strategy Set Engine
+
+COMPLETED AND TESTED. A domain-modelling and backend-architecture
+module, not analytics and not UI — nothing under `range_analytics/`
+was touched, and no Streamlit code was added.
+
+Introduces user-owned, named, serializable collections of strategy
+definitions ("Strategy Sets" — e.g. "Churning", "6M Strategies",
+"Medium Vol") that expand into the existing `strategy_engine.
+StrategyInstance` architecture. The scanner (`template_scanner/`)
+requires zero modifications and never imports this package.
+
+strategy_sets/
+    __init__.py     (public re-exports + design-principle summary)
+    model.py          (StrategySet, StrategySetEntry, ExpansionSettings)
+    serialization.py   (StrategySet <-> dict <-> JSON, no filesystem I/O)
+    repository.py        (StrategySetRepository — save/load/list/
+                        duplicate/rename/delete, one JSON file per set)
+    expansion.py            (expand_strategy_set() -> StrategyInstance[])
+
+tests/
+    test_strategy_sets_model.py, test_strategy_sets_serialization.py,
+    test_strategy_sets_expansion.py, test_strategy_sets_repository.py
+
+Key design points a future session needs:
+
+- **Object model**: a `StrategySet` is a named, validated tuple of
+  `StrategySetEntry`. Each entry composes the existing, unmodified
+  `strategy_engine.StrategyDefinition` (market_key/offsets/weights/
+  interval/price_field) rather than duplicating its shape/validation,
+  plus a human-facing `name`, an `enabled` flag, and `expansion`
+  (`ExpansionSettings` — `max_curve_position`/`eligible_rics` only).
+  Deliberately **not** a second class literally named
+  `StrategyDefinition`: that name is already `strategy_engine.
+  definitions.StrategyDefinition` project-wide, and reusing it for a
+  materially different, richer object would make "StrategyDefinition"
+  ambiguous depending on which module you're reading.
+- **The contract-selection window is NOT part of the saved object**
+  (design correction made during review — the first draft put
+  `contract_start`/`contract_end` on `ExpansionSettings` per-entry;
+  this was reverted). `expand_strategy_set(strategy_set, contract_start,
+  contract_end, only_enabled=True, dedupe=True)` takes the window as a
+  call-time argument, shared across every entry in one call — exactly
+  matching `template_scanner.scanner.ScanRequest`, which already
+  carries one contract window shared across its whole
+  `list[StrategyDefinition]`. Rationale: a Strategy Set describes
+  *what* to scan, not *when* — baking an absolute date range into a
+  *saved, reused* object goes stale the moment "today" moves past it,
+  which would have undermined the module's own reusability goal and
+  diverged from `ScanRequest`'s established shared-window precedent for
+  no compensating benefit. `max_curve_position`/`eligible_rics` stayed
+  per-entry deliberately: those are strategy-shape/liquidity-dependent
+  (a 12-leg curve and a 3-leg fly, or two different markets, can
+  legitimately want different curve-position/eligibility filters even
+  under one shared scan window) — not a calendar concept, so staleness
+  doesn't apply to them.
+- **Expansion reuses `template_scanner.universe` unchanged** —
+  `generate_candidates()` per enabled entry (under the shared window),
+  combined and (by default) `dedupe_candidates()`-ed across the whole
+  set. No new rolling/filtering/dedup logic exists in this package.
+  Audit note: the scanner's actual entry point today
+  (`run_scan(ScanRequest)`) doesn't literally accept
+  `StrategyInstance[]` as an argument — it takes
+  `list[StrategyDefinition]` + one shared window and performs this same
+  `generate_candidates`/`dedupe_candidates` step internally. This
+  module's output is byte-identical in type/shape to what `run_scan()`
+  already builds internally, so it's usable anywhere a manually-built
+  candidate list is today without changing `scanner.py`/`ScanRequest`.
+  Wiring `StrategySet` output *into* a running scan is an explicit
+  non-goal of this phase.
+- **JSON schema** (readable/indented, one file per set, filename =
+  `<name>.json`): top-level `schema_version`/`name`/`description`/
+  `entries`; each entry flattens the `StrategyDefinition`'s four shape
+  fields directly onto itself (not nested under a separate
+  `"definition"` key) for easier hand-editing. No contract window
+  appears anywhere in a saved file.
+- **Validation**: `StrategyDefinition`'s own validation (unknown
+  market, non-increasing offsets, all-zero weights, unsupported
+  interval/price_field) runs unmodified on every entry. `StrategySet`
+  additionally requires ≥1 entry and unique entry `name`s within one
+  set. `StrategySetRepository` filenames rely on `StrategySet.name`'s
+  own validation already being filesystem-safe (letters/digits/
+  spaces/`-`/`_` only) — no separate slugification step exists.
+  Deserialization errors distinguish a genuinely missing JSON key (a
+  distinct `ValueError`) from a downstream domain-validation failure
+  (propagated unmodified, e.g. `StrategyDefinition`'s own `KeyError` for
+  an unknown market) — the dict-lookup guard wraps only the lookup
+  itself, never the object construction that follows it.
+- **Repository**: directory creation deferred to the first `save()`
+  call (matches `database/connection.py`'s convention); `save()` is an
+  upsert (overwrites silently); `duplicate()`/`rename()` both raise
+  `FileExistsError` on a target-name collision rather than silently
+  overwriting, and leave the source untouched on any failure.
+- Test suite (current file-level counts): `test_strategy_sets_model.py`
+  35, `test_strategy_sets_serialization.py` 41,
+  `test_strategy_sets_expansion.py` 17,
+  `test_strategy_sets_repository.py` 21 — 114 tests total for this
+  module.
+
+**Deferred, not solved here** (see the Development Roadmap below):
+Streamlit UI, a strategy editor, wiring `StrategySet`/`expand_strategy_
+set()` output into a running scan, true intermarket (cross-market-leg)
+strategies, watchlists, alerts, deployment.
+
+---
+
 # LSEG
 
 The application currently uses the LSEG Data Library through an
@@ -819,6 +925,9 @@ unavailable-market-data hardening and the canonical metric-resolution
 fix) — STATUS: COMPLETE
 Module 6A — Streamlit range-bound scanner UI — STATUS: COMPLETE
 Module 6B — Selected-strategy history chart — STATUS: COMPLETE
+Module 7A — Strategy Set engine (domain model, JSON persistence,
+expansion to StrategyInstance[]; no scanner/UI integration) —
+STATUS: COMPLETE
 
 Current suite: 399 tests passing (`pytest -q`; re-run for the
 up-to-date count, do not trust this number blindly — see README.md's
@@ -848,7 +957,12 @@ because they're listed here as being considered):
 - Secondary diagnostic charts beyond Module 6B's one primary
   strategy-history chart (AR(1) fit, crossing markers, rolling
   stability, z-score).
-- Saved scans / export workflow.
+- Saved scans / export workflow (distinct from Module 7A's Strategy
+  Sets — a Strategy Set is a named collection of strategy definitions
+  only; it does not capture a price window, lookbacks, or results).
+- Wiring Strategy Set / `expand_strategy_set()` output into a running
+  scan, a Strategy Set editor UI, and any Streamlit surface for Module
+  7A — the scanner remains unaware `strategy_sets` exists.
 - Cloud/server deployment and any non-desktop LSEG authentication.
 - EURIBOR market (`root="FEI"`, `ric_year_digits=1`, QUARTERLY) — RIC
   convention confirmed by the trader, but `MarketDefinition.exchange`
