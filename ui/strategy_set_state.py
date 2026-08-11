@@ -1,95 +1,56 @@
 """
 strategy_set_state.py
 
-Session-state keys and accessor helpers for Module 7B's Strategy Set
-panel: which saved set is currently loaded, the in-progress editor
-draft (entries being added/removed/enabled-toggled before Save
-persists them via strategy_sets.repository), and the panel's own
-status/error banner.
+Session-state keys and accessor helpers for the Strategy Set selector
+integrated into ui.controls' Strategy Templates section: which saved
+set (if any) is currently loaded into the grid, the pending-selection
+indirection the selector's widget-lifecycle fix depends on, and the
+panel's own one-shot status message.
 
-Kept separate from ui.state (Module 6A/6B's scan-result state) -- this
-module is about the Strategy Set *editor*, not the scan report/
-selection/chart-history state ui.state already owns. Running a
-selected set still writes into ui.state's existing SCAN_REQUEST/
-SCAN_REPORT keys unchanged (see ui.strategy_set_view.handle_run_
-strategy_set) -- no new scan-result state is introduced here.
-
-A "draft" is a plain list[StrategySetEntry] (not yet a StrategySet),
-since a StrategySet requires >=1 entry and unique entry names -- an
-in-progress edit (e.g. a brand new set with zero entries so far, or a
-transient duplicate name before the user renames it) must be able to
-violate those invariants without raising. StrategySet's own validation
-only runs at Save time, when the draft is turned into a real
-StrategySet.
+There is no separate "draft" state here (see the Module 7B
+simplification: a Strategy Set is just a saved version of the ONE
+Strategy Templates grid) -- the grid widget itself (owned by
+ui.controls/Streamlit's own data_editor session state) IS the draft.
+This module only tracks which saved name that grid currently reflects,
+not its contents. It also does NOT need to track "did the selection
+just change" anymore: since the grid carries its own per-row Market/
+Interval (see ui.controls/ui.strategy_set_formatting), loading a set
+never needs to override the scan bar's Market/Interval selectors, which
+was the only reason an earlier version of this module tracked that.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
-from strategy_sets.model import StrategySetEntry
-
 SELECTED_NAME = "oscill8_ss_selected_name"  # name of the loaded saved set, or None = new/unsaved
-DRAFT_ENTRIES = "oscill8_ss_draft_entries"  # list[StrategySetEntry] currently being viewed/edited
-DRAFT_DESCRIPTION = "oscill8_ss_draft_description"
 MESSAGE = "oscill8_ss_message"  # (level, text) | None -- "success"/"error"/"info"
 
 # The Strategy Set name (or ui.strategy_set_view's "+ New Strategy Set"
-# sentinel) that a lifecycle action (save/rename/duplicate/delete) wants
-# to become selected. NOT the selector widget's own session-state key --
-# Streamlit forbids writing to a widget's key after that widget has
-# already been instantiated in the current script run, which is exactly
-# what save/rename/duplicate/delete need to do (they run from inside the
-# "Manage Strategy Set" expander, rendered AFTER the selector). This key
+# sentinel) that a lifecycle action (save) wants to become selected.
+# NOT the selector widget's own session-state key -- Streamlit forbids
+# writing to a widget's key after that widget has already been
+# instantiated in the current script run, which is exactly what a Save
+# action needs to do from further down the same script pass. This key
 # is never bound to a widget, so it can be set freely from a callback;
-# ui.strategy_set_view._render_selector applies it to the selector
-# widget's key on the NEXT rerun, before that widget is (re)created --
-# the one point where doing so is legal.
+# ui.strategy_set_view's selector applies it to the widget's key on the
+# NEXT rerun, before that widget is (re)created -- the one point where
+# doing so is legal.
 PENDING_SELECTION = "oscill8_ss_pending_selection"
 
 
 def init_state() -> None:
     st.session_state.setdefault(SELECTED_NAME, None)
-    st.session_state.setdefault(DRAFT_ENTRIES, None)
-    st.session_state.setdefault(DRAFT_DESCRIPTION, "")
     st.session_state.setdefault(MESSAGE, None)
     st.session_state.setdefault(PENDING_SELECTION, None)
-
-
-def load_draft(name: str, entries: list[StrategySetEntry], description: str) -> None:
-    """Load a saved set's entries into the draft for viewing/editing,
-    replacing whatever draft was previously in progress."""
-    st.session_state[SELECTED_NAME] = name
-    st.session_state[DRAFT_ENTRIES] = list(entries)
-    st.session_state[DRAFT_DESCRIPTION] = description
-
-
-def start_new_draft() -> None:
-    """Enter "create a new Strategy Set" mode: an empty, unsaved draft
-    with no loaded name."""
-    st.session_state[SELECTED_NAME] = None
-    st.session_state[DRAFT_ENTRIES] = []
-    st.session_state[DRAFT_DESCRIPTION] = ""
 
 
 def get_selected_name() -> str | None:
     return st.session_state.get(SELECTED_NAME)
 
 
-def get_draft_entries() -> list[StrategySetEntry] | None:
-    return st.session_state.get(DRAFT_ENTRIES)
-
-
-def set_draft_entries(entries: list[StrategySetEntry]) -> None:
-    st.session_state[DRAFT_ENTRIES] = list(entries)
-
-
-def get_draft_description() -> str:
-    return st.session_state.get(DRAFT_DESCRIPTION, "")
-
-
-def set_draft_description(description: str) -> None:
-    st.session_state[DRAFT_DESCRIPTION] = description
+def set_selected_name(name: str | None) -> None:
+    st.session_state[SELECTED_NAME] = name
 
 
 def set_message(level: str, text: str) -> None:

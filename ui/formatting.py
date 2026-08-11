@@ -40,7 +40,16 @@ _NAN = float("nan")
 
 CURVE_POSITION_HELP = (
     "Columns are consecutive curve positions (contract offsets). Templates roll "
-    "across the selected contract universe; blank cells are ignored."
+    "across the active contract universe; blank cells are ignored. Keyboard "
+    "workflow: click a cell once, then type a value and press Tab to commit it "
+    "and move to the next cell -- Label, Market, Interval, and every weight "
+    "column all work this way, so a full row can be entered without touching "
+    "the mouse again. Only press Enter on the last cell of a row, when you "
+    "actually want to commit it and drop down to the next row -- pressing Enter "
+    "mid-row also commits and moves down, which skips the rest of the row. "
+    "Arrow keys move the selection between cells as usual when a cell isn't "
+    "being edited; once you start typing, arrow keys move the text cursor "
+    "inside the cell instead."
 )
 
 PRIMARY_LOOKBACK_HELP = (
@@ -49,17 +58,18 @@ PRIMARY_LOOKBACK_HELP = (
 )
 
 UNIVERSE_HELP = (
-    "Which listed contracts are eligible for strategy expansion -- Contract Start/End bound "
-    "the rolling contract combinations generated for both the manual grid and any Strategy Set "
-    "run here. This does not change how much price history is fetched; see History below."
+    "Which listed contracts are eligible for strategy expansion. Oscill8 scans the currently "
+    "active contract curve -- from today out to a fixed forward horizon -- automatically; there "
+    "is no manual date range to set here. This does not change how much price history is "
+    "fetched; see History below."
 )
 
 HISTORY_HELP = (
     "How far back market price data is retrieved for the expanded strategies -- Price History "
-    "Start/End bound the date range fetched and analyzed. Combined with each strategy's own "
-    "interval (DAILY/HOURLY/4H), the same date range can mean a very different number of bars: "
-    "e.g. three months of DAILY data vs. three months of HOURLY data. This does not change which "
-    "contracts are eligible; see Universe above."
+    "Start/End bound the date range fetched and analyzed, and default to the last six months. "
+    "Combined with each strategy's own interval (DAILY/HOURLY/4H), the same date range can mean "
+    "a very different number of bars: e.g. six months of DAILY data vs. six months of HOURLY "
+    "data. This does not change which contracts are eligible; see Universe above."
 )
 
 PERCENTILE_RANGE_HELP = (
@@ -111,6 +121,11 @@ def format_percentile_range(lower_percentile: float, upper_percentile: float) ->
     recomputed), so it always matches whichever band Low/High/Position
     were actually computed from."""
     return f"P{format_percentile(lower_percentile)}-P{format_percentile(upper_percentile)}"
+
+
+LABEL_COLUMN = "Label"
+MARKET_COLUMN = "Market"
+INTERVAL_COLUMN = "Interval"
 
 
 def position_column(index: int) -> str:
@@ -175,26 +190,41 @@ def build_definitions_from_grid(
     """Translate strategy-grid rows into StrategyDefinitions.
 
     `rows` is one dict per grid row (as returned by
-    `DataFrame.to_dict("records")`), each holding an optional "Label" and
-    a value per entry in `position_columns`. An all-zero/blank row (an
-    empty extra row in a dynamic grid) is silently skipped -- not an
-    error. All strategy-shape validation (offsets/weights, market,
-    interval, price_field) is delegated to template_from_dense_weights()
-    / StrategyDefinition -- never duplicated here. Grid cells are
+    `DataFrame.to_dict("records")`), each holding an optional "Label", an
+    optional per-row "Market"/"Interval" (see below), and a value per
+    entry in `position_columns`. An all-zero/blank row (an empty extra
+    row in a dynamic grid) is silently skipped -- not an error. All
+    strategy-shape validation (offsets/weights, market, interval,
+    price_field) is delegated to template_from_dense_weights() /
+    StrategyDefinition -- never duplicated here. Grid cells are
     constrained client-side to a numeric-looking pattern (see
     ui.controls' TextColumn `validate` regex), and _cell_to_float()
     treats anything that still isn't a clean number as blank/0 rather
     than raising, so the non-numeric-input error case that free-text
     ratio entry required does not apply here either.
+
+    Per-row Market/Interval (Module 7B multi-market fix): the grid's
+    "Market"/"Interval" columns let different rows belong to different
+    markets/intervals in the SAME grid (needed for a Strategy Set like
+    "Intermarket Churning" spanning SOFR/SONIA/CORRA -- a single global
+    market_key/interval could not represent that without silently
+    normalizing every row to one market on save, corrupting the saved
+    set). A row's own "Market"/"Interval" values take priority when
+    present and non-empty; the `market_key`/`interval` parameters are
+    the fallback for rows that don't carry them (e.g. legacy callers/
+    tests that only ever passed one grid-wide market_key/interval,
+    which keeps this function fully backward compatible).
     """
     results: list[TemplateRowResult] = []
     for i, row in enumerate(rows):
-        label = str(row.get("Label") or "").strip() or f"Strategy {i + 1}"
+        label = str(row.get(LABEL_COLUMN) or "").strip() or f"Strategy {i + 1}"
         dense_weights = [_cell_to_float(row.get(col)) for col in position_columns]
         if not any(w != 0 for w in dense_weights):
             continue
+        row_market_key = row.get(MARKET_COLUMN) or market_key
+        row_interval = row.get(INTERVAL_COLUMN) or interval
         try:
-            definition = template_from_dense_weights(market_key, dense_weights, interval, price_field)
+            definition = template_from_dense_weights(row_market_key, dense_weights, row_interval, price_field)
             results.append(TemplateRowResult(i, label, definition, None))
         except ValueError as exc:
             results.append(TemplateRowResult(i, label, None, str(exc)))

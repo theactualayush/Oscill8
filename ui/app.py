@@ -1,14 +1,18 @@
 """
 app.py
 
-Module 6A/6B/7B entry point: compact scan panel + strategy grid -> Run
-Scan, OR the Module 7B Strategy Set panel -> Run Selected Set -- either
-path lands in the same Range-Bound Opportunities (status, ranking/
-filters, ranked result grid, skipped candidates) -> Selected Strategy
-summary -> Selected Strategy history chart. Thin orchestration only --
-every analytics, filtering, ranking, pricing, and Strategy Set
-persistence/expansion computation is delegated to strategy_engine /
-range_analytics / template_scanner / strategy_sets, unmodified.
+Module 6A/6B/7B entry point: scan panel (Market/Data, Universe,
+History, Analytics, Run Scan) + Strategy Templates grid (with its
+integrated Strategy Set selector/Save) -> Run Scan -> Range-Bound
+Opportunities (status, ranking/filters, ranked result grid, skipped
+candidates) -> Selected Strategy summary -> Selected Strategy history
+chart. Thin orchestration only -- every analytics, filtering, ranking,
+pricing, and Strategy Set persistence computation is delegated to
+strategy_engine / range_analytics / template_scanner / strategy_sets,
+unmodified. There is exactly one strategy grid and one Run Scan button
+-- a loaded Strategy Set becomes ordinary grid rows and takes the same
+Run Scan path a manually-typed row does (see ui.controls/ui.
+strategy_set_view).
 
 Run with: streamlit run ui/app.py
 """
@@ -28,20 +32,19 @@ if _REPO_ROOT not in sys.path:
 import streamlit as st
 
 from ui import state
+from ui import strategy_set_state as ss_state
 from ui.controls import render_scan_setup
 from ui.results_view import render_results
 from ui.scan_view import handle_run_scan, render_scan_error
-from ui.strategy_set_view import render_strategy_set_panel
 
 st.set_page_config(page_title="Oscill8 Scanner", layout="wide")
 state.init_state()
+ss_state.init_state()
 
 setup = render_scan_setup()
 
 if setup.run_clicked:
     handle_run_scan(setup)
-
-render_strategy_set_panel(setup)
 
 render_scan_error()
 

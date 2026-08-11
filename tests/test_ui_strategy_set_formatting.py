@@ -1,226 +1,239 @@
 """
 tests/test_ui_strategy_set_formatting.py
 
-Tests for Module 7B's pure UI helper logic (ui/strategy_set_formatting.py):
-the "Strategies in Set" display-row translation (Enabled/Name/Market/
-Interval/Weights -- deliberately no derived Structure/Shape column, see
-the module docstring), applying edited Enabled values back onto a
-draft, and building a new StrategySetEntry from the same curve-position
-grid row shape ui.controls' Strategy Templates grid produces. No
-Streamlit rendering is exercised here -- plain functions over plain
-data and the real, unmodified strategy_engine/strategy_sets objects,
-matching tests/test_ui_formatting.py's own convention for Module 6A.
+Tests for the Module 7B simplification's pure helper logic (ui/
+strategy_set_formatting.py): translating a StrategySet's enabled
+entries into Strategy Templates grid rows (Label + Market + Interval +
+dense weights) and building a brand-new StrategySet directly from the
+grid's current rows. No Streamlit rendering is exercised here -- plain
+functions over plain data and the real, unmodified strategy_engine/
+strategy_sets objects, matching tests/test_ui_formatting.py's own
+convention.
+
+Multi-market fix: every grid row carries its OWN Market/Interval (see
+ui.formatting.MARKET_COLUMN/INTERVAL_COLUMN), so a Strategy Set mixing
+markets (e.g. SOFR + SONIA + CORRA) is representable and round-trips
+losslessly -- there is no more "resolve one market/interval for the
+whole set, warn if they disagree" step; that function was removed.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from core.config import MARKETS, BarInterval
+from core.config import BarInterval
 
 from strategy_engine.definitions import StrategyDefinition
 
-from strategy_sets.model import StrategySetEntry
+from strategy_sets.model import StrategySet, StrategySetEntry
 
-from ui.formatting import position_column
+from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN, position_column
 from ui.strategy_set_formatting import (
-    ENABLED_COLUMN,
-    ENTRY_TABLE_COLUMNS,
-    INTERVAL_COLUMN,
-    MARKET_COLUMN,
-    NAME_COLUMN,
-    WEIGHTS_COLUMN,
-    apply_enabled_edits,
-    build_entry_from_grid_row,
-    entries_to_rows,
-    entry_names,
-    format_weights,
-    remove_entry_by_name,
+    build_strategy_set_from_grid,
+    dense_row_from_definition,
+    format_grid_weight,
+    grid_rows_from_strategy_set,
 )
 
+_POS6 = tuple(position_column(i) for i in range(1, 7))
 
-def _entry(
-    name="SOFR Fly", weights=(1.0, -2.0, 1.0), enabled=True, market_key="SOFR", interval=BarInterval.DAILY
-) -> StrategySetEntry:
+
+def _definition(weights=(1.0, -2.0, 1.0), market_key="SOFR", interval=BarInterval.DAILY) -> StrategyDefinition:
+    return StrategyDefinition(
+        market_key=market_key, offsets=tuple(range(len(weights))), weights=weights, interval=interval,
+    )
+
+
+def _entry(name="SOFR Fly", weights=(1.0, -2.0, 1.0), enabled=True, market_key="SOFR", interval=BarInterval.DAILY) -> StrategySetEntry:
+    return StrategySetEntry(name=name, definition=_definition(weights, market_key, interval), enabled=enabled)
+
+
+# ---------------------------------------------------------------------
+# format_grid_weight
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("value, expected", [(1.0, "1"), (-2.0, "-2"), (0.5, "0.5"), (-1.5, "-1.5")])
+def test_format_grid_weight(value, expected):
+    assert format_grid_weight(value) == expected
+
+
+# ---------------------------------------------------------------------
+# dense_row_from_definition / grid_rows_from_strategy_set
+# ---------------------------------------------------------------------
+
+def test_dense_row_from_definition_places_weights_at_offset_positions():
     definition = StrategyDefinition(
-        market_key=market_key,
-        offsets=tuple(range(len(weights))),
-        weights=weights,
-        interval=interval,
+        market_key="SOFR", offsets=(0, 2, 4), weights=(1.0, -2.0, 1.0), interval=BarInterval.DAILY,
     )
-    return StrategySetEntry(name=name, definition=definition, enabled=enabled)
+    row = dense_row_from_definition("My Fly", definition, _POS6)
+
+    assert row[LABEL_COLUMN] == "My Fly"
+    assert row[_POS6[0]] == "1"
+    assert row[_POS6[1]] == ""
+    assert row[_POS6[2]] == "-2"
+    assert row[_POS6[3]] == ""
+    assert row[_POS6[4]] == "1"
+    assert row[_POS6[5]] == ""
 
 
-# ---------------------------------------------------------------------
-# ENTRY_TABLE_COLUMNS: exact column set, no Structure/Shape classification
-# ---------------------------------------------------------------------
-
-def test_entry_table_columns_are_exactly_enabled_name_market_interval_weights():
-    assert ENTRY_TABLE_COLUMNS == (
-        ENABLED_COLUMN, NAME_COLUMN, MARKET_COLUMN, INTERVAL_COLUMN, WEIGHTS_COLUMN,
+def test_dense_row_from_definition_includes_the_definitions_own_market_and_interval():
+    definition = StrategyDefinition(
+        market_key="SONIA", offsets=(0,), weights=(1.0,), interval=BarInterval.HOURLY,
     )
+    row = dense_row_from_definition("SONIA Outright", definition, _POS6)
+
+    assert row[MARKET_COLUMN] == "SONIA"
+    assert row[INTERVAL_COLUMN] == "HOURLY"
 
 
-def test_entry_table_columns_contain_no_structure_or_shape_label():
-    lowered = [c.lower() for c in ENTRY_TABLE_COLUMNS]
-    for forbidden in ("structure", "shape", "fly", "condor", "butterfly", "curve"):
-        assert forbidden not in lowered
+def test_dense_row_from_definition_drops_offsets_beyond_available_positions():
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0, 1), weights=(1.0, -1.0), interval=BarInterval.DAILY,
+    )
+    narrow_columns = _POS6[:1]  # only 1 position column available
+    row = dense_row_from_definition("Too Wide", definition, narrow_columns)
+    assert row[narrow_columns[0]] == "1"
+    # Label + Market + Interval + the one position column -- the
+    # offset-1 leg is silently dropped, nothing else is.
+    assert len(row) == 4
 
 
-def test_no_structure_classification_function_exists():
-    # Locks in the design brief's core rule: the application must never
-    # infer/assign a generic trading-shape label (Fly/Condor/Butterfly/
-    # Curve) as a separate field -- an earlier version of this module
-    # had exactly that (describe_structure()) and it was removed.
-    import ui.strategy_set_formatting as module
-
-    assert not hasattr(module, "describe_structure")
-
-
-def test_format_weights_matches_ui_formatting_fmt_number_style():
-    assert format_weights((1.0, -2.0, 1.0)) == "1.00 / -2.00 / 1.00"
-
-
-# ---------------------------------------------------------------------
-# entries_to_rows
-# ---------------------------------------------------------------------
-
-def test_entries_to_rows_builds_one_row_per_entry_in_order():
-    entries = [
-        _entry(name="SOFR 6M Fly", weights=(1.0, -2.0, 1.0), interval=BarInterval.DAILY),
-        _entry(
-            name="SOFR Curve", weights=(1.0, -1.0, -1.0, -1.0, 1.0), enabled=False,
-            interval=BarInterval.HOURLY,
+def test_grid_rows_from_strategy_set_includes_only_enabled_entries_in_order():
+    strategy_set = StrategySet(
+        name="Test Set",
+        entries=(
+            _entry(name="A", enabled=True),
+            _entry(name="B", enabled=False),
+            _entry(name="C", enabled=True),
         ),
-    ]
-    rows = entries_to_rows(entries)
-
-    assert len(rows) == 2
-    assert rows[0][NAME_COLUMN] == "SOFR 6M Fly"
-    assert rows[0][MARKET_COLUMN] == MARKETS["SOFR"].name
-    assert rows[0][INTERVAL_COLUMN] == "DAILY"
-    assert rows[0][WEIGHTS_COLUMN] == "1.00 / -2.00 / 1.00"
-    assert rows[0][ENABLED_COLUMN] is True
-
-    assert rows[1][NAME_COLUMN] == "SOFR Curve"
-    assert rows[1][INTERVAL_COLUMN] == "HOURLY"
-    assert rows[1][ENABLED_COLUMN] is False
-
-    for row in rows:
-        assert set(row.keys()) == set(ENTRY_TABLE_COLUMNS)
+    )
+    rows = grid_rows_from_strategy_set(strategy_set, _POS6)
+    assert [row[LABEL_COLUMN] for row in rows] == ["A", "C"]
 
 
-def test_entries_to_rows_empty_list_returns_empty():
-    assert entries_to_rows([]) == []
+def test_grid_rows_from_strategy_set_preserves_custom_names_verbatim():
+    strategy_set = StrategySet(
+        name="Butterflies",
+        entries=(
+            _entry(name="3M Double Butterfly", weights=(1.0, -3.0, 3.0, -1.0)),
+            _entry(name="My SOFR Strategy", weights=(1.0, -1.0)),
+        ),
+    )
+    rows = grid_rows_from_strategy_set(strategy_set, _POS6)
+    assert rows[0][LABEL_COLUMN] == "3M Double Butterfly"
+    assert rows[0][_POS6[0]] == "1"
+    assert rows[0][_POS6[1]] == "-3"
+    assert rows[0][_POS6[2]] == "3"
+    assert rows[0][_POS6[3]] == "-1"
+    assert rows[1][LABEL_COLUMN] == "My SOFR Strategy"
 
 
-def test_entries_to_rows_preserves_user_defined_names_verbatim_regardless_of_weights():
-    # A Strategy Set entry's name is entirely user-defined -- it must be
-    # displayed exactly as saved, never replaced or annotated with a
-    # derived shape label, no matter how many legs/what weights it has.
-    cases = [
-        ("6M Churning", (1.0, -2.0, 1.0)),
-        ("Intermarket Churning", (1.0, -1.0)),
-        ("RBS Intermarket", (1.0,)),
-        ("12M Range Bounds", (1.0, -1.0, -1.0, 1.0)),
-        ("3M Double Butterfly", (1.0, -3.0, 3.0, -1.0)),
-        ("My SOFR Strategy", (1.0, -2.0, 2.0, -1.0, 1.0)),
-    ]
-    entries = [_entry(name=name, weights=weights) for name, weights in cases]
-    rows = entries_to_rows(entries)
+def test_grid_rows_from_strategy_set_preserves_each_entrys_own_market_and_interval():
+    # The multi-market case: "Intermarket Churning"-style set spanning
+    # three markets, each with its own interval too.
+    strategy_set = StrategySet(
+        name="Intermarket Churning",
+        entries=(
+            _entry(name="SOFR Fly", market_key="SOFR", interval=BarInterval.DAILY),
+            _entry(name="SONIA Fly", market_key="SONIA", interval=BarInterval.DAILY),
+            _entry(name="CORRA Fly", market_key="CORRA", interval=BarInterval.HOURLY),
+        ),
+    )
+    rows = grid_rows_from_strategy_set(strategy_set, _POS6)
 
-    assert [row[NAME_COLUMN] for row in rows] == [name for name, _ in cases]
-
-
-def test_entries_to_rows_interval_reflects_the_entrys_own_definition():
-    entries = [
-        _entry(name="Daily One", interval=BarInterval.DAILY),
-        _entry(name="Hourly One", interval=BarInterval.HOURLY),
-        _entry(name="Four Hour One", interval=BarInterval.FOUR_HOUR),
-    ]
-    rows = entries_to_rows(entries)
-    assert [row[INTERVAL_COLUMN] for row in rows] == ["DAILY", "HOURLY", "4H"]
+    by_name = {row[LABEL_COLUMN]: row for row in rows}
+    assert by_name["SOFR Fly"][MARKET_COLUMN] == "SOFR"
+    assert by_name["SOFR Fly"][INTERVAL_COLUMN] == "DAILY"
+    assert by_name["SONIA Fly"][MARKET_COLUMN] == "SONIA"
+    assert by_name["CORRA Fly"][MARKET_COLUMN] == "CORRA"
+    assert by_name["CORRA Fly"][INTERVAL_COLUMN] == "HOURLY"
 
 
 # ---------------------------------------------------------------------
-# apply_enabled_edits
+# build_strategy_set_from_grid
 # ---------------------------------------------------------------------
 
-def test_apply_enabled_edits_toggles_enabled_flags_by_position():
-    entries = [_entry(name="A", enabled=True), _entry(name="B", enabled=False)]
-    edited_rows = [
-        {ENABLED_COLUMN: False, NAME_COLUMN: "A"},
-        {ENABLED_COLUMN: True, NAME_COLUMN: "B"},
-    ]
-
-    updated = apply_enabled_edits(entries, edited_rows)
-
-    assert updated[0].name == "A" and updated[0].enabled is False
-    assert updated[1].name == "B" and updated[1].enabled is True
-    # original untouched (StrategySetEntry is frozen; this also proves
-    # apply_enabled_edits returns a new list rather than mutating).
-    assert entries[0].enabled is True
-    assert entries[1].enabled is False
+def _row(label, *weights, market_key=None, interval=None):
+    row = {LABEL_COLUMN: label}
+    if market_key is not None:
+        row[MARKET_COLUMN] = market_key
+    if interval is not None:
+        row[INTERVAL_COLUMN] = interval.value if isinstance(interval, BarInterval) else interval
+    row.update({col: "" for col in _POS6})
+    for i, w in enumerate(weights):
+        row[_POS6[i]] = str(w)
+    return row
 
 
-def test_apply_enabled_edits_preserves_definition_and_name():
-    entries = [_entry(name="A", weights=(1.0, -1.0))]
-    updated = apply_enabled_edits(entries, [{ENABLED_COLUMN: False}])
-    assert updated[0].definition == entries[0].definition
-    assert updated[0].name == entries[0].name
+def test_build_strategy_set_from_grid_translates_rows_into_entries():
+    rows = [_row("SOFR Fly", 1, -2, 1)]
+    strategy_set = build_strategy_set_from_grid("My New Set", rows, _POS6, "SOFR", BarInterval.DAILY)
 
-
-def test_apply_enabled_edits_returns_unchanged_on_row_count_mismatch():
-    entries = [_entry(name="A"), _entry(name="B")]
-    updated = apply_enabled_edits(entries, [{ENABLED_COLUMN: False}])
-    assert updated == entries
-
-
-# ---------------------------------------------------------------------
-# entry_names / remove_entry_by_name
-# ---------------------------------------------------------------------
-
-def test_entry_names_returns_names_in_order():
-    entries = [_entry(name="A"), _entry(name="B")]
-    assert entry_names(entries) == ["A", "B"]
-
-
-def test_remove_entry_by_name_drops_the_matching_entry_only():
-    entries = [_entry(name="A"), _entry(name="B"), _entry(name="C")]
-    remaining = remove_entry_by_name(entries, "B")
-    assert entry_names(remaining) == ["A", "C"]
-
-
-def test_remove_entry_by_name_is_a_noop_for_unknown_name():
-    entries = [_entry(name="A")]
-    assert remove_entry_by_name(entries, "Does Not Exist") == entries
-
-
-# ---------------------------------------------------------------------
-# build_entry_from_grid_row
-# ---------------------------------------------------------------------
-
-_POS3 = tuple(position_column(i) for i in (1, 2, 3))
-
-
-def test_build_entry_from_grid_row_translates_a_valid_row():
-    row = {"Label": "Fly Row", _POS3[0]: "1", _POS3[1]: "-2", _POS3[2]: "1"}
-    entry = build_entry_from_grid_row(row, _POS3, "SOFR", BarInterval.DAILY, "SOFR 6M Fly")
-
-    assert entry.name == "SOFR 6M Fly"
+    assert strategy_set.name == "My New Set"
+    assert len(strategy_set.entries) == 1
+    entry = strategy_set.entries[0]
+    assert entry.name == "SOFR Fly"
     assert entry.definition.market_key == "SOFR"
     assert entry.definition.offsets == (0, 1, 2)
     assert entry.definition.weights == (1.0, -2.0, 1.0)
+    assert entry.definition.interval == BarInterval.DAILY
     assert entry.enabled is True
 
 
-def test_build_entry_from_grid_row_falls_back_to_grid_label_when_name_blank():
-    row = {"Label": "My Label", _POS3[0]: "1", _POS3[1]: "-1", _POS3[2]: ""}
-    entry = build_entry_from_grid_row(row, _POS3, "SOFR", BarInterval.DAILY, "  ")
-    assert entry.name == "My Label"
+def test_build_strategy_set_from_grid_falls_back_to_passed_market_interval_when_row_lacks_them():
+    # Rows without their own Market/Interval cells (e.g. a hand-built
+    # row dict in a test, or any legacy caller) fall back to the
+    # function's own market_key/interval parameters.
+    rows = [_row("A", 1, -1), _row("B", 1, -2, 1)]
+    strategy_set = build_strategy_set_from_grid("Set", rows, _POS6, "SONIA", BarInterval.HOURLY)
+    for entry in strategy_set.entries:
+        assert entry.definition.market_key == "SONIA"
+        assert entry.definition.interval == BarInterval.HOURLY
 
 
-def test_build_entry_from_grid_row_rejects_all_blank_row():
-    row = {"Label": "Empty", _POS3[0]: "", _POS3[1]: "", _POS3[2]: ""}
+def test_build_strategy_set_from_grid_preserves_each_rows_own_market_and_interval():
+    # The critical multi-market round-trip guarantee: a row's OWN
+    # Market/Interval cell wins over whatever the scan bar's top-level
+    # selectors currently show -- saving never normalizes every row to
+    # one market/interval.
+    rows = [
+        _row("SOFR Fly", 1, -2, 1, market_key="SOFR", interval=BarInterval.DAILY),
+        _row("SONIA Fly", 1, -2, 1, market_key="SONIA", interval=BarInterval.DAILY),
+        _row("CORRA Fly", 1, -2, 1, market_key="CORRA", interval=BarInterval.HOURLY),
+    ]
+    # Deliberately pass a THIRD market/interval as the "current scan
+    # bar selection" -- it must not leak into any row that already had
+    # its own values.
+    strategy_set = build_strategy_set_from_grid("Intermarket Churning", rows, _POS6, "FED_FUNDS", BarInterval.FOUR_HOUR)
+
+    by_name = {e.name: e for e in strategy_set.entries}
+    assert by_name["SOFR Fly"].definition.market_key == "SOFR"
+    assert by_name["SOFR Fly"].definition.interval == BarInterval.DAILY
+    assert by_name["SONIA Fly"].definition.market_key == "SONIA"
+    assert by_name["CORRA Fly"].definition.market_key == "CORRA"
+    assert by_name["CORRA Fly"].definition.interval == BarInterval.HOURLY
+
+
+def test_build_strategy_set_from_grid_skips_all_blank_rows():
+    rows = [_row("Real Row", 1, -1), _row("Blank Row")]
+    strategy_set = build_strategy_set_from_grid("Set", rows, _POS6, "SOFR", BarInterval.DAILY)
+    assert len(strategy_set.entries) == 1
+    assert strategy_set.entries[0].name == "Real Row"
+
+
+def test_build_strategy_set_from_grid_raises_when_no_valid_rows():
+    rows = [_row("Blank Row")]
     with pytest.raises(ValueError):
-        build_entry_from_grid_row(row, _POS3, "SOFR", BarInterval.DAILY, "Whatever")
+        build_strategy_set_from_grid("Empty Set", rows, _POS6, "SOFR", BarInterval.DAILY)
+
+
+def test_build_strategy_set_from_grid_propagates_duplicate_label_error():
+    rows = [_row("Same Name", 1, -1), _row("Same Name", 1, -2, 1)]
+    with pytest.raises(ValueError):
+        build_strategy_set_from_grid("Set", rows, _POS6, "SOFR", BarInterval.DAILY)
+
+
+def test_build_strategy_set_from_grid_propagates_invalid_set_name():
+    rows = [_row("A", 1, -1)]
+    with pytest.raises(ValueError):
+        build_strategy_set_from_grid("bad/name", rows, _POS6, "SOFR", BarInterval.DAILY)

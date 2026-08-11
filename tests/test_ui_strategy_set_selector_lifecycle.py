@@ -1,72 +1,62 @@
 """
 tests/test_ui_strategy_set_selector_lifecycle.py
 
-Regression coverage for a Streamlit widget-lifecycle bug in the
-Strategy Set panel: create/save, rename, duplicate, and delete used to
-write directly to the selector's own widget-owned session-state key
-(ui.strategy_set_view._SELECTOR_KEY) from inside a button callback that
-runs AFTER that widget has already been instantiated earlier in the
-same script pass (the selector renders near the top of
-render_strategy_set_panel(); Save/Rename/Duplicate/Delete live inside
-the "Manage Strategy Set" expander, rendered further down the SAME
-pass). Streamlit forbids that outright:
-
-    StreamlitAPIException: st.session_state.oscill8_ss_selector cannot
-    be modified after the widget with key oscill8_ss_selector is
-    instantiated.
-
-The fix routes every lifecycle action through a separate, non-widget
-key (ui.strategy_set_state.PENDING_SELECTION via set_pending_selection/
-pop_pending_selection) instead of the selector's own key, followed by
-st.rerun(). _render_selector applies the pending value to the selector's
-key on the FRESH rerun that follows, before st.selectbox() (re)creates
-the widget -- the one point in the script where writing to that key is
-legal.
+Regression + integration coverage for the Module 7B simplification:
+Strategy Sets became saved versions of the ONE Strategy Templates grid
+(no separate Strategy Set section/table/Run button/Manage panel), the
+Universe became fully automatic (no manual date inputs), and History
+now defaults to the last six months.
 
 These tests use the REAL Streamlit script via streamlit.testing.v1.
-AppTest rather than a mocked `st` (see tests/test_ui_strategy_set_run.py
-for the mocked-`st` style, which covers the run/propagation logic but
-cannot observe widget-instantiation ordering at all): AppTest enforces
-the actual widget-lifecycle rule, which is exactly why a fully-mocked
-`st` never caught this bug in the first place -- mocking `st` away
-hides the very constraint that broke.
+AppTest rather than a mocked `st`: AppTest enforces the actual widget-
+instantiation rule the selector's pending-selection fix depends on
+(see ui.strategy_set_state.PENDING_SELECTION / ui.strategy_set_view.
+render_selector), which a mocked `st` cannot observe -- this is the
+same rationale the original selector-lifecycle bug-fix tests used, and
+is preserved unchanged by this rewrite.
+
+st.data_editor's canvas grid isn't drivable via AppTest (no
+`data_editor` accessor exists in this Streamlit version's testing
+API), so tests that need REAL grid content either (a) load an existing
+saved Strategy Set (which seeds the grid with real rows without typing
+into it) or (b) call the pure translation functions directly (see
+tests/test_ui_strategy_set_formatting.py for that layer's own direct
+coverage). Only the "no content" paths (blank "+ New Strategy Set")
+are exercised for save-validation here.
 """
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
-
-_APP_PATH = str(Path(__file__).resolve().parent.parent / "ui" / "app.py")
 
 from core import config
 from core.config import BarInterval
 from strategy_engine.definitions import StrategyDefinition
 from strategy_sets.model import StrategySet, StrategySetEntry
 from strategy_sets.repository import StrategySetRepository
+from template_scanner.scanner import ScanReport
+import ui.scan_view as scan_view
+
+_APP_PATH = str(Path(__file__).resolve().parent.parent / "ui" / "app.py")
+_TODAY = date.today()
 
 
-def _definition(weights=(1.0, -2.0, 1.0)) -> StrategyDefinition:
+def _definition(weights=(1.0, -2.0, 1.0), market_key="SOFR", interval=BarInterval.DAILY) -> StrategyDefinition:
     return StrategyDefinition(
-        market_key="SOFR", offsets=tuple(range(len(weights))), weights=weights, interval=BarInterval.DAILY,
+        market_key=market_key, offsets=tuple(range(len(weights))), weights=weights, interval=interval,
     )
 
 
-def _entry(name="SOFR Fly", enabled=True, weights=(1.0, -2.0, 1.0)) -> StrategySetEntry:
-    return StrategySetEntry(name=name, definition=_definition(weights), enabled=enabled)
+def _entry(name="SOFR Fly", weights=(1.0, -2.0, 1.0), market_key="SOFR", interval=BarInterval.DAILY) -> StrategySetEntry:
+    return StrategySetEntry(name=name, definition=_definition(weights, market_key, interval))
 
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch) -> StrategySetRepository:
-    """Redirects the panel's own `StrategySetRepository()` (constructed
-    with no explicit base_dir inside ui.strategy_set_view) to an
-    isolated tmp_path directory -- config.STRATEGY_SETS_DIR is read
-    fresh by StrategySetRepository.__init__ on every call, so patching
-    the already-imported core.config module object here is visible to
-    the AppTest-run script, which imports the SAME cached module.
-    """
     directory = tmp_path / "strategy_sets"
     monkeypatch.setattr(config, "STRATEGY_SETS_DIR", str(directory))
     return StrategySetRepository(base_dir=str(directory))
@@ -94,297 +84,271 @@ def _assert_no_exception(at: AppTest) -> None:
 
 
 # ---------------------------------------------------------------------
-# A. Existing selection -- no regression
+# 1/3/4/5/20: fresh load -- blank grid, no second panel, single Run button
 # ---------------------------------------------------------------------
 
-def test_selecting_an_existing_set_loads_its_entries_and_preserves_enabled_state(repo):
+def test_fresh_load_has_blank_grid_and_no_second_strategy_set_panel(repo):
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+
+    assert _selector(at).value == "+ New Strategy Set"
+
+    # Exactly one Run button, and it's the manual scan's -- no
+    # "Run Strategy Set" of any kind exists anymore.
+    run_labels = [b.label for b in at.button if "Run" in b.label]
+    assert run_labels == ["▶ Run Scan"]
+    assert "Run Strategy Set" not in {b.label for b in at.button}
+
+    expander_titles = [getattr(exp, "label", None) for exp in at.expander]
+    assert "Manage Strategy Set" not in expander_titles
+
+    # Exactly one grid on the page (the Strategy Templates grid) --
+    # no second "Strategies in Set" table.
+    assert len(at.dataframe) <= 1
+
+
+def test_no_manage_strategy_set_panel_or_lifecycle_buttons_exist(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _assert_no_exception(at)
+
+    labels = {b.label for b in at.button}
+    for removed in ("Run Strategy Set", "Rename", "Duplicate", "Delete", "Add to Set", "Remove"):
+        assert removed not in labels
+
+    expander_titles = [getattr(exp, "label", None) for exp in at.expander]
+    assert "Manage Strategy Set" not in expander_titles
+
+
+# ---------------------------------------------------------------------
+# 2/8/9: existing Strategy Set loads into the SAME grid; Run Scan uses it
+# ---------------------------------------------------------------------
+
+def test_selecting_an_existing_set_loads_its_own_market_and_interval_into_the_grid_row(repo):
+    # The grid carries its OWN per-row Market/Interval (the multi-market
+    # fix) -- loading a set never needs to, and no longer does, touch
+    # the scan bar's top-level Market/Interval selectors. What matters
+    # for correctness is the loaded ROW's own cell values.
     repo.save(
         StrategySet(
             name="6M Strategies",
-            entries=(_entry("SOFR 6M Fly", enabled=True), _entry("SONIA Fly", enabled=False)),
+            entries=(_entry(name="SONIA Fly", market_key="SONIA", interval=BarInterval.HOURLY),),
         )
     )
 
     at = _app()
     at.run()
-    _assert_no_exception(at)
-
     _selector(at).select("6M Strategies").run()
     _assert_no_exception(at)
-    assert _selector(at).value == "6M Strategies"
 
-    tables = [df.value for df in at.dataframe if "Enabled" in df.value.columns]
-    assert len(tables) == 1
-    displayed = tables[0]
-
-    # Exactly Enabled/Name/Market/Interval/Weights -- no Structure/Shape
-    # classification column (see the Module 7B date-clarity/no-structure
-    # UX correction; tests/test_ui_strategy_set_formatting.py covers the
-    # underlying column-set contract directly).
-    assert list(displayed.columns) == ["Enabled", "Name", "Market", "Interval", "Weights"]
-
-    table = displayed.set_index("Name")
-    assert bool(table.loc["SOFR 6M Fly", "Enabled"]) is True
-    assert bool(table.loc["SONIA Fly", "Enabled"]) is False
-    # Custom names are shown verbatim, and each entry's own interval
-    # (DAILY here) is visible right next to it.
-    assert table.loc["SOFR 6M Fly", "Interval"] == "DAILY"
-    assert table.loc["SONIA Fly", "Interval"] == "DAILY"
+    grid = [df.value for df in at.dataframe if "Label" in df.value.columns][0]
+    row = grid.set_index("Label").loc["SONIA Fly"]
+    assert row["Market"] == "SONIA"
+    assert row["Interval"] == "HOURLY"
 
 
-# ---------------------------------------------------------------------
-# B. Create + Save -> new set becomes selected
-# ---------------------------------------------------------------------
-
-def test_create_new_set_and_save_selects_it_with_no_exception(repo):
-    at = _app()
-    # Bypass the Add-Strategy grid (a st.data_editor, not drivable via
-    # AppTest -- see tests/test_ui_strategy_set_formatting.py for that
-    # translation logic's own direct unit coverage) by seeding the draft
-    # the same way clicking "Add to Set" would have left it.
-    at.session_state["oscill8_ss_selected_name"] = None
-    at.session_state["oscill8_ss_draft_entries"] = [_entry("SOFR Fly")]
-    at.run()
-    _assert_no_exception(at)
-
-    _text_input(at, "New Strategy Set name").set_value("My New Set").run()
-    _button(at, "Save").click().run()
-
-    _assert_no_exception(at)
-    assert repo.exists("My New Set")
-    assert _selector(at).value == "My New Set"
-    assert "My New Set" in _selector(at).options
-
-
-def test_saving_an_existing_selected_set_keeps_it_selected_with_no_exception(repo):
-    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
-
-    at = _app()
-    at.run()
-    _selector(at).select("6M Strategies").run()
-
-    _button(at, "Save").click().run()
-
-    _assert_no_exception(at)
-    assert _selector(at).value == "6M Strategies"
-
-
-# ---------------------------------------------------------------------
-# D. Rename
-# ---------------------------------------------------------------------
-
-def test_rename_selects_the_renamed_set_and_drops_the_old_name(repo):
-    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
-
-    at = _app()
-    at.run()
-    _selector(at).select("6M Strategies").run()
-
-    _text_input(at, "Rename to").set_value("6M Churning").run()
-    _button(at, "Rename").click().run()
-
-    _assert_no_exception(at)
-    assert _selector(at).value == "6M Churning"
-    assert "6M Strategies" not in _selector(at).options
-    assert not repo.exists("6M Strategies")
-    assert repo.exists("6M Churning")
-
-
-# ---------------------------------------------------------------------
-# E. Duplicate
-# ---------------------------------------------------------------------
-
-def test_duplicate_selects_the_copy_and_leaves_the_original_unchanged(repo):
-    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
-
-    at = _app()
-    at.run()
-    _selector(at).select("6M Strategies").run()
-
-    _text_input(at, "Duplicate as").set_value("6M Strategies Test").run()
-    _button(at, "Duplicate").click().run()
-
-    _assert_no_exception(at)
-    assert _selector(at).value == "6M Strategies Test"
-    assert repo.exists("6M Strategies")
-    assert repo.exists("6M Strategies Test")
-    assert repo.load("6M Strategies").entries == repo.load("6M Strategies Test").entries
-
-
-# ---------------------------------------------------------------------
-# F. Delete
-# ---------------------------------------------------------------------
-
-def test_delete_selected_set_falls_back_to_a_remaining_set(repo):
-    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
-    repo.save(StrategySet(name="Churning", entries=(_entry(),)))
-
-    at = _app()
-    at.run()
-    _selector(at).select("6M Strategies").run()
-
-    [c for c in at.checkbox if c.label == "Confirm delete"][0].set_value(True).run()
-    _button(at, "Delete").click().run()
-
-    _assert_no_exception(at)
-    assert not repo.exists("6M Strategies")
-    assert _selector(at).value == "Churning"
-
-
-def test_delete_the_last_remaining_set_falls_back_to_new_set_option(repo):
-    repo.save(StrategySet(name="Only Set", entries=(_entry(),)))
-
-    at = _app()
-    at.run()
-    _selector(at).select("Only Set").run()
-
-    [c for c in at.checkbox if c.label == "Confirm delete"][0].set_value(True).run()
-    _button(at, "Delete").click().run()
-
-    _assert_no_exception(at)
-    assert not repo.exists("Only Set")
-    assert _selector(at).value == "+ New Strategy Set"
-
-
-# ---------------------------------------------------------------------
-# G. In-memory (unsaved) draft is what Run actually uses
-# ---------------------------------------------------------------------
-
-def test_run_uses_the_unsaved_in_memory_draft_not_the_saved_file(repo, mocker):
-    # On disk, both entries are enabled.
-    saved = StrategySet(
-        name="6M Strategies",
-        entries=(_entry("SOFR Fly", enabled=True), _entry("SONIA Fly", enabled=True)),
+def test_run_scan_uses_the_loaded_sets_exact_weights_via_the_same_run_scan_path(repo, mocker):
+    repo.save(
+        StrategySet(
+            name="6M Strategies",
+            entries=(_entry(name="SOFR Fly", weights=(1.0, -2.0, 1.0)),),
+        )
     )
-    repo.save(saved)
 
     at = _app()
     at.run()
     _selector(at).select("6M Strategies").run()
 
-    # Simulate unticking "SONIA Fly" in the entries table (a data_editor
-    # checkbox edit, not drivable via AppTest) by writing the same
-    # disabled entry directly into the draft, exactly what
-    # apply_enabled_edits() would have produced -- see
-    # tests/test_ui_strategy_set_formatting.py for that function's own
-    # direct unit coverage. "SOFR Fly" stays enabled so the Run button
-    # itself stays enabled (it disables only when NOTHING is enabled).
-    at.session_state["oscill8_ss_draft_entries"] = [
-        _entry("SOFR Fly", enabled=True),
-        _entry("SONIA Fly", enabled=False),
-    ]
-
-    import ui.strategy_set_view as strategy_set_view
-
-    mock_expand = mocker.patch.object(strategy_set_view, "expand_strategy_set", return_value=[])
-    mock_run = mocker.patch.object(strategy_set_view, "run_scan_on_instances")
-
-    _button(at, "▶ Run '6M Strategies'").click().run()
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
 
     _assert_no_exception(at)
-    mock_expand.assert_called_once()
-    (strategy_set_arg, *_rest), _kwargs = mock_expand.call_args
-    entries_by_name = {e.name: e.enabled for e in strategy_set_arg.entries}
-    # The in-memory (unsaved) toggle -- not the saved file's still-fully-
-    # enabled version -- is what reached expand_strategy_set().
-    assert entries_by_name == {"SOFR Fly": True, "SONIA Fly": False}
-
-    # The on-disk file is untouched -- the toggle was never saved.
-    on_disk = {e.name: e.enabled for e in repo.load("6M Strategies").entries}
-    assert on_disk == {"SOFR Fly": True, "SONIA Fly": True}
+    mock_run.assert_called_once()
+    request = mock_run.call_args[0][0]
+    assert len(request.definitions) == 1
+    assert request.definitions[0].weights == (1.0, -2.0, 1.0)
+    assert request.definitions[0].market_key == "SOFR"
 
 
 # ---------------------------------------------------------------------
-# Manual scanner regression -- untouched by any of the above
+# 6: Save an existing (loaded, unmodified) set overwrites it
 # ---------------------------------------------------------------------
 
-def test_manual_scan_bar_is_unaffected_by_strategy_set_lifecycle_actions(repo):
-    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+def test_save_on_an_existing_selected_set_overwrites_it(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(weights=(1.0, -2.0, 1.0)),)))
 
     at = _app()
     at.run()
     _selector(at).select("6M Strategies").run()
-    _text_input(at, "Rename to").set_value("6M Churning").run()
-    _button(at, "Rename").click().run()
+
+    _button(at, "Save Strategy Set").click().run()
 
     _assert_no_exception(at)
-    # The manual scan bar's own controls (market/interval/run scan
-    # button) are still present and unaffected.
-    assert any(s.label == "Market" for s in at.selectbox)
-    assert any(b.label == "▶ Run Scan" for b in at.button)
+    reloaded = repo.load("6M Strategies")
+    assert reloaded.entries[0].definition.weights == (1.0, -2.0, 1.0)
+    assert _selector(at).value == "6M Strategies"
 
 
 # ---------------------------------------------------------------------
-# Universe vs. History label clarity
+# 7: Save on "+ New Strategy Set" prompts for a name (a real Streamlit dialog)
 # ---------------------------------------------------------------------
 
-def test_universe_and_history_date_labels_are_unambiguous(repo):
-    """The two date-range pairs in the scan bar (which contracts get
-    expanded vs. how much price history gets fetched) must be labeled
-    explicitly enough to tell apart without inferring it from layout --
-    plain "Start"/"End" on both was the previous, ambiguous wording."""
+def test_save_on_new_strategy_set_opens_a_name_prompt(repo):
+    at = _app()
+    at.run()
+
+    _button(at, "Save Strategy Set").click().run()
+
+    _assert_no_exception(at)
+    assert any(t.label == "Strategy Set Name" for t in at.text_input)
+    assert any(b.label == "Cancel" for b in at.button)
+    assert any(b.label == "Save" for b in at.button)
+
+
+def test_save_on_new_strategy_set_with_a_blank_grid_errors_without_creating_a_file(repo):
+    at = _app()
+    at.run()
+
+    _button(at, "Save Strategy Set").click().run()
+    _text_input(at, "Strategy Set Name").set_value("My New Set").run()
+    _button(at, "Save").click().run()
+
+    _assert_no_exception(at)
+    assert not repo.exists("My New Set")
+    assert any(e.value for e in at.error)
+
+
+def test_cancel_closes_the_name_prompt_without_creating_a_file(repo):
+    at = _app()
+    at.run()
+
+    _button(at, "Save Strategy Set").click().run()
+    _text_input(at, "Strategy Set Name").set_value("Abandoned Set").run()
+    _button(at, "Cancel").click().run()
+
+    _assert_no_exception(at)
+    assert not repo.exists("Abandoned Set")
+    assert not any(t.label == "Strategy Set Name" for t in at.text_input)
+
+
+# ---------------------------------------------------------------------
+# 14/15/16: Universe is fully automatic -- no manual date inputs
+# ---------------------------------------------------------------------
+
+def test_no_universe_date_input_widgets_exist(repo):
     at = _app()
     at.run()
     _assert_no_exception(at)
 
     labels = {d.label for d in at.date_input}
-    assert labels == {"Contract Start", "Contract End", "Price History Start", "Price History End"}
-    # No bare, unqualified "Start"/"End" left over from before this
-    # clarity pass -- every date label names what it bounds.
-    assert "Start" not in labels
-    assert "End" not in labels
+    assert "Contract Start" not in labels
+    assert "Contract End" not in labels
+    # Only the two History date inputs remain.
+    assert labels == {"Price History Start", "Price History End"}
 
 
-def test_no_strategy_set_specific_date_controls_are_introduced(repo):
-    """A Strategy Set must not grow its own Universe/History dates --
-    the scanner's existing Contract/Price-History controls stay the
-    sole source of truth for both the manual grid and any Strategy Set
-    run (see ui.strategy_set_view.handle_run_strategy_set, which reads
-    setup.contract_start/contract_end/price_start/price_end directly,
-    never a Strategy-Set-owned date)."""
+def test_universe_indicator_is_shown_instead_of_date_inputs(repo):
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+
+    all_text = " ".join(m.value for m in at.markdown) + " ".join(c.value for c in at.caption)
+    infos = " ".join(i.value for i in at.info) if hasattr(at, "info") else ""
+    assert "Automatic" in infos or "Automatic" in all_text
+
+
+def test_active_contract_universe_starts_from_today(repo, mocker):
     repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
-
     at = _app()
     at.run()
     _selector(at).select("6M Strategies").run()
 
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+
+    request = mock_run.call_args[0][0]
+    assert request.contract_start == _TODAY
+
+
+# ---------------------------------------------------------------------
+# 17/18/19: History defaults to six months, still user-editable
+# ---------------------------------------------------------------------
+
+def test_default_history_end_is_today(repo):
+    at = _app()
+    at.run()
+    price_end = [d for d in at.date_input if d.label == "Price History End"][0]
+    assert price_end.value == _TODAY
+
+
+def test_default_history_start_is_about_six_months_before_today(repo):
+    at = _app()
+    at.run()
+    price_start = [d for d in at.date_input if d.label == "Price History Start"][0]
+    delta_days = (_TODAY - price_start.value).days
+    assert 175 <= delta_days <= 190
+
+
+def test_history_dates_remain_user_editable(repo, mocker):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    custom_start = _TODAY - timedelta(days=30)
+    [d for d in at.date_input if d.label == "Price History Start"][0].set_value(custom_start).run()
     _assert_no_exception(at)
-    # Exactly the 4 scanner-level date inputs -- selecting/viewing a
-    # Strategy Set added none of its own.
-    assert len(at.date_input) == 4
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+
+    request = mock_run.call_args[0][0]
+    assert request.price_start == custom_start
 
 
 # ---------------------------------------------------------------------
-# Custom names remain verbatim regardless of mathematical shape
+# 21/22: manual scan workflow (no Strategy Set touched) still works
 # ---------------------------------------------------------------------
 
-def test_custom_names_display_verbatim_alongside_market_interval_weights(repo):
-    double_butterfly = _entry(
-        name="3M Double Butterfly", weights=(1.0, -3.0, 3.0, -1.0), enabled=True,
-    )
-    alternate_difference = StrategySetEntry(
-        name="3M Alternate Difference",
-        definition=StrategyDefinition(
-            market_key="SOFR", offsets=(0, 1, 2, 3), weights=(1.0, -2.0, 2.0, -1.0),
-            interval=BarInterval.DAILY,
-        ),
-    )
-    repo.save(StrategySet(name="Butterflies", entries=(double_butterfly, alternate_difference)))
+def test_manual_scan_workflow_is_unaffected_when_no_strategy_set_is_selected(repo, mocker):
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+    assert _selector(at).value == "+ New Strategy Set"
+
+    # Manual Run Scan with nothing in the grid should error cleanly
+    # (no strategy rows), exactly as before this whole change.
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+    mock_run.assert_not_called()
+    assert any(e.value for e in at.error)
+
+
+def test_switching_strategy_set_selection_does_not_raise(repo):
+    """The original selector-lifecycle bug: writing to the selector's
+    own widget key after it was already instantiated in the same
+    script pass. Save (the only lifecycle action left) still exercises
+    the fix -- see ui.strategy_set_state.set_pending_selection."""
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    repo.save(StrategySet(name="Churning", entries=(_entry(name="Other"),)))
 
     at = _app()
     at.run()
-    _selector(at).select("Butterflies").run()
+    _selector(at).select("6M Strategies").run()
+    _assert_no_exception(at)
+    _selector(at).select("Churning").run()
+    _assert_no_exception(at)
+    _selector(at).select("+ New Strategy Set").run()
     _assert_no_exception(at)
 
-    tables = [df.value for df in at.dataframe if "Enabled" in df.value.columns]
-    table = tables[0].set_index("Name")
-
-    assert "3M Double Butterfly" in table.index
-    assert "3M Alternate Difference" in table.index
-    assert table.loc["3M Double Butterfly", "Weights"] == "1.00 / -3.00 / 3.00 / -1.00"
-    assert table.loc["3M Alternate Difference", "Weights"] == "1.00 / -2.00 / 2.00 / -1.00"
-    assert table.loc["3M Double Butterfly", "Market"] == "SOFR (3M)"
-    assert table.loc["3M Double Butterfly", "Interval"] == "DAILY"
-    # Names are literal, user-chosen text -- never rewritten to reflect
-    # (or replaced by) a generic Fly/Condor/Butterfly/Curve label.
-    assert list(table.columns) == ["Enabled", "Market", "Interval", "Weights"]
+    _button(at, "Save Strategy Set").click().run()
+    _text_input(at, "Strategy Set Name").set_value("Fresh Set").run()
+    _button(at, "Save").click().run()
+    _assert_no_exception(at)
+    # Empty grid -- expected validation error, but critically no
+    # StreamlitAPIException from the selector's widget lifecycle.
+    assert not repo.exists("Fresh Set")

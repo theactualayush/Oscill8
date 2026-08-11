@@ -1,157 +1,146 @@
 """
 strategy_set_formatting.py
 
-Pure helper functions for Module 7B's Strategy Set panel: translating a
-StrategySet's entries into the "Strategies in Set" display table
-(Enabled/Name/Market/Interval/Weights), applying edited Enabled values
-back onto a draft, and building one new StrategySetEntry from the same
-curve-position grid shape ui.controls' Strategy Templates grid already
-uses.
+Pure helper functions bridging the Strategy Templates grid (ui.controls)
+and strategy_sets.StrategySet -- translating a StrategySet's entries
+into grid rows (loading), and building a new StrategySet directly from
+the grid's current rows (saving).
 
-Deliberately does NOT infer or display any generic trading-shape
-classification (Fly/Condor/Butterfly/Curve/...) for an entry -- a
-Strategy Set entry's `name` is entirely user-defined (see strategy_sets/
-model.py), and the actual mathematical strategy is already fully
-represented by market/offsets/weights/interval on the underlying
-StrategyDefinition. Adding a second, derived "what is this shape called"
-label would be a redundant classification layer the design brief
-explicitly rejects -- an earlier version of this module did exactly
-that (a leg-count-only `describe_structure()`/Structure column) and it
-was removed for this reason.
+Design principle (Module 7B simplification): "Strategy Templates is
+the working strategy grid; a Strategy Set is simply a saved named
+version of that grid." There is exactly ONE editable strategy surface
+(the grid) -- a Strategy Set is not a second, richer editing model.
+
+Multi-market/multi-interval fix: a Strategy Set is explicitly allowed
+to mix markets (e.g. "Intermarket Churning": SOFR + SONIA + CORRA
+entries) and each entry keeps its own interval. An earlier version of
+this module bound the WHOLE grid to one scan-bar-selected market_key/
+interval, which meant loading a mixed set and saving it again would
+silently normalize every row to a single market/interval -- corrupting
+the saved file. Fixed by giving the grid its OWN per-row Market/
+Interval columns (see ui.controls' column_config and ui.formatting.
+MARKET_COLUMN/INTERVAL_COLUMN/build_definitions_from_grid, which now
+prefers a row's own Market/Interval over any grid-wide default) --
+every entry's market_key/interval, offsets, weights, and name now
+round-trip losslessly through load -> edit -> save -> reload, whether
+the set is single- or multi-market. There is no more "mixed markets
+can't be represented" case to warn about.
 
 No Streamlit import here -- unit-testable directly against plain data,
 the same convention ui.formatting follows for Module 6A. No shape/
-weight validation is duplicated: entry construction routes through the
-existing, unmodified ui.formatting.build_definitions_from_grid() (which
-itself routes through template_scanner.templates.
-template_from_dense_weights()/StrategyDefinition), and StrategySet/
-StrategySetEntry's own validation (unique names, etc.) is never
-re-implemented -- callers see it surface as a ValueError from
-strategy_sets.model unchanged.
+weight validation is duplicated: row translation routes through the
+existing, unmodified ui.formatting.build_definitions_from_grid()/
+template_from_dense_weights()/StrategyDefinition, and StrategySet's own
+validation (unique entry names, >=1 entry) is never re-implemented --
+callers see it surface as a ValueError from strategy_sets.model
+unchanged.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Sequence
 
-from core.config import MARKETS, BarInterval
+from core.config import BarInterval
 
-from strategy_sets.model import StrategySetEntry
+from strategy_engine.definitions import StrategyDefinition
 
-from ui.formatting import build_definitions_from_grid, fmt_number
+from strategy_sets.model import StrategySet, StrategySetEntry
 
-ENABLED_COLUMN = "Enabled"
-NAME_COLUMN = "Name"
-MARKET_COLUMN = "Market"
-INTERVAL_COLUMN = "Interval"
-WEIGHTS_COLUMN = "Weights"
-
-# Interval is shown here (not just implied) because the shared History
-# window (ScanSetup.price_start/price_end) means something completely
-# different depending on which interval a given entry uses -- three
-# months of DAILY bars vs. three years of HOURLY bars over the same
-# calendar window -- so a trader reading this table needs the entry's
-# own interval right next to its weights, not just inferable from the
-# top-level scan bar's Interval selector (which only drives the manual
-# grid workflow, not Strategy Set entries -- each entry carries its own).
-ENTRY_TABLE_COLUMNS: tuple[str, ...] = (
-    ENABLED_COLUMN,
-    NAME_COLUMN,
-    MARKET_COLUMN,
-    INTERVAL_COLUMN,
-    WEIGHTS_COLUMN,
-)
+from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN, build_definitions_from_grid
 
 
-def format_weights(weights: Sequence[float]) -> str:
-    """"1.00 / -2.00 / 1.00" -- same number formatting ui.formatting
-    already uses for the scanner result grid's Ratio column."""
-    return " / ".join(fmt_number(w, 2) for w in weights)
+def format_grid_weight(value: float) -> str:
+    """Render a weight as the grid's own TextColumn would want it typed
+    -- "1" for a whole number (not "1.0"), "1.5" otherwise."""
+    if float(value).is_integer():
+        return str(int(value))
+    return str(value)
 
 
-def entries_to_rows(entries: Sequence[StrategySetEntry]) -> list[dict]:
-    """One display row per entry, in the SAME order as `entries` --
-    Enabled/Name/Market/Interval/Weights. Row order/position matches
-    `entries` exactly, so a caller pairing an edited row back to
-    `entries[i]` (see apply_enabled_edits below) can rely on positional
-    correspondence without a name-based lookup.
+def dense_row_from_definition(
+    entry_name: str, definition: StrategyDefinition, position_columns: Sequence[str]
+) -> dict:
+    """One grid row (Label + Market + Interval + position columns)
+    reproducing `definition` exactly -- the inverse of ui.formatting.
+    build_definitions_from_grid()'s row-to-StrategyDefinition
+    translation (itself template_scanner.templates.
+    template_from_dense_weights()). market_key/interval are carried on
+    the row itself (not a grid-wide default), which is what lets a
+    multi-market entry round-trip correctly alongside others.
 
-    `Name` is `entry.name` verbatim -- whatever the user typed when
-    adding the strategy -- never reformatted or replaced with a derived
-    label. `Interval` is `definition.interval.value` (e.g. "DAILY"),
-    read directly off the entry's own StrategyDefinition.
+    Offsets beyond what `position_columns` can hold are silently
+    dropped (a StrategySet entry with more legs than the grid's current
+    "Positions" count) -- the caller's grid still loads with whatever
+    fits; growing "Positions" before loading avoids this entirely.
     """
-    rows = []
-    for entry in entries:
-        definition = entry.definition
-        rows.append(
-            {
-                ENABLED_COLUMN: entry.enabled,
-                NAME_COLUMN: entry.name,
-                MARKET_COLUMN: MARKETS[definition.market_key].name,
-                INTERVAL_COLUMN: definition.interval.value,
-                WEIGHTS_COLUMN: format_weights(definition.weights),
-            }
-        )
-    return rows
+    row = {
+        LABEL_COLUMN: entry_name,
+        MARKET_COLUMN: definition.market_key,
+        INTERVAL_COLUMN: definition.interval.value,
+    }
+    row.update({col: "" for col in position_columns})
+    for offset, weight in zip(definition.offsets, definition.weights):
+        if offset < len(position_columns):
+            row[position_columns[offset]] = format_grid_weight(weight)
+    return row
 
 
-def apply_enabled_edits(
-    entries: Sequence[StrategySetEntry], edited_rows: Sequence[dict]
-) -> list[StrategySetEntry]:
-    """Rebuild `entries` with each entry's `enabled` flag taken from the
-    matching (by position) edited row's Enabled cell -- the only field
-    the entries table's data_editor allows editing; Name/Market/
-    Interval/Weights are read-only there and are never written back.
-
-    Returns a NEW list (StrategySetEntry is frozen, via
-    dataclasses.replace); `entries` itself is left untouched. If the
-    row count doesn't match `entries` (e.g. a stale rerun mid-edit),
-    returns `entries` unchanged rather than misaligning positions.
+def grid_rows_from_strategy_set(strategy_set: StrategySet, position_columns: Sequence[str]) -> list[dict]:
+    """Enabled entries of `strategy_set`, translated into grid rows, in
+    entry order -- each row carrying its OWN Market/Interval (see the
+    module docstring), so a set mixing markets loads correctly into the
+    one grid. Disabled entries are omitted -- the unified grid has no
+    enabled/disabled toggle of its own, so "disabled" is preserved by
+    simply not loading that entry into the working grid (it still
+    exists, disabled, in the saved file; a resave from the grid without
+    it will drop it, which is the expected consequence of editing a
+    richer saved set through this simplified surface).
     """
-    if len(entries) != len(edited_rows):
-        return list(entries)
     return [
-        replace(entry, enabled=bool(row.get(ENABLED_COLUMN, entry.enabled)))
-        for entry, row in zip(entries, edited_rows)
+        dense_row_from_definition(entry.name, entry.definition, position_columns)
+        for entry in strategy_set.entries
+        if entry.enabled
     ]
 
 
-def entry_names(entries: Sequence[StrategySetEntry]) -> list[str]:
-    return [e.name for e in entries]
-
-
-def remove_entry_by_name(entries: Sequence[StrategySetEntry], name: str) -> list[StrategySetEntry]:
-    """Drop the entry named `name` (a no-op if no entry has that name)."""
-    return [e for e in entries if e.name != name]
-
-
-def build_entry_from_grid_row(
-    row: dict,
+def build_strategy_set_from_grid(
+    name: str,
+    grid_rows: Sequence[dict],
     position_columns: Sequence[str],
     market_key: str,
     interval: BarInterval,
-    entry_name: str,
-) -> StrategySetEntry:
-    """Translate one curve-position grid row -- the same row shape
-    ui.controls' Strategy Templates grid produces -- into a new
-    StrategySetEntry, via the existing, unmodified
-    ui.formatting.build_definitions_from_grid(). Shape/weight
-    validation is never duplicated here.
+) -> StrategySet:
+    """Snapshot the grid's current rows into a new StrategySet named
+    `name`. Each entry's market_key/interval comes from that ROW's own
+    Market/Interval cell (see ui.formatting.build_definitions_from_grid,
+    which now resolves per-row first) -- `market_key`/`interval` here
+    are only the fallback for a row that somehow lacks its own values
+    (e.g. a hand-built row dict in a test). Row translation/validation
+    is entirely build_definitions_from_grid()'s (offsets/weights,
+    market, interval, price_field) -- never duplicated here.
 
     Raises:
-        ValueError: the row is all-zero/blank (no strategy to add), or
-            the resulting shape is rejected by StrategyDefinition's own
-            validation (non-increasing offsets, all-zero weights, ...).
+        ValueError: a row's shape is rejected by StrategyDefinition's
+            own validation (surfaced with that row's label), no row had
+            a nonzero weight at all, or StrategySet's own validation
+            rejects the result (invalid name, duplicate row labels).
     """
-    results = build_definitions_from_grid([row], position_columns, market_key, interval)
-    if not results:
-        raise ValueError("Enter at least one nonzero curve position before adding.")
+    results = build_definitions_from_grid(grid_rows, position_columns, market_key, interval)
+    errors = [r for r in results if r.error is not None]
+    if errors:
+        raise ValueError("; ".join(f"{r.label}: {r.error}" for r in errors))
 
-    result = results[0]
-    if result.error is not None:
-        raise ValueError(result.error)
+    definitions = [(r.label, r.definition) for r in results if r.definition is not None]
+    if not definitions:
+        raise ValueError("Add at least one strategy row with a nonzero ratio before saving.")
 
-    name = entry_name.strip() or result.label
-    return StrategySetEntry(name=name, definition=result.definition)
+    entries = tuple(StrategySetEntry(name=label, definition=definition) for label, definition in definitions)
+    return StrategySet(name=name, entries=entries)
+
+
+__all__ = [
+    "format_grid_weight",
+    "dense_row_from_definition",
+    "grid_rows_from_strategy_set",
+    "build_strategy_set_from_grid",
+]
