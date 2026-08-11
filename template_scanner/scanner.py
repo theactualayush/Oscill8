@@ -158,6 +158,79 @@ def analyze_histories(
     return ScanReport(results=tuple(results))
 
 
+def run_scan_on_instances(
+    instances: list[StrategyInstance],
+    price_start: DateLike,
+    price_end: DateLike,
+    lookbacks: tuple[int, ...] = (20, 40, 60, 90, 120),
+    crossing_equilibrium: float | None = None,
+    crossing_threshold: float = 0.0,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
+) -> ScanReport:
+    """Price and measure an already-built candidate list -- exactly the
+    build_history()+skip-handling loop run_scan() runs internally (see
+    the module docstring's exception policy), exposed directly for a
+    caller that already has StrategyInstance objects and doesn't need
+    Module 5A's template-rolling/generation step run again.
+
+    This is the "instances-in, ScanReport-out" entry point noted as
+    missing in the project roadmap: it lets any candidate source other
+    than ScanRequest's own definitions+contract-window rolling reuse
+    this exact pricing/skip/analyze pipeline without duplicating it --
+    this module has no knowledge of what that other source is or how
+    it built its candidate list. run_scan() itself is refactored below
+    to call this function too, so there is only one implementation of
+    the loop, not two.
+    """
+    leg_cache: dict = {}
+    unavailable_rics: set[str] = set()
+    histories: list[StrategyHistory] = []
+    skipped: list[SkippedCandidate] = []
+
+    for instance in instances:
+        already_known = next((r for r in instance.rics if r in unavailable_rics), None)
+        if already_known is not None:
+            skipped.append(
+                SkippedCandidate(
+                    instance=instance,
+                    unavailable_ric=already_known,
+                    message=(
+                        f"{already_known} was already confirmed unavailable "
+                        "earlier in this scan"
+                    ),
+                )
+            )
+            continue
+
+        try:
+            history = build_history(instance, price_start, price_end, leg_cache=leg_cache)
+        except MarketDataUnavailableError as exc:
+            unavailable_rics.add(exc.ric)
+            skipped.append(
+                SkippedCandidate(instance=instance, unavailable_ric=exc.ric, message=exc.message)
+            )
+            continue
+
+        histories.append(history)
+
+    logger.info(
+        "run_scan_on_instances: %d candidate(s) -> %d history(ies) priced, %d skipped "
+        "(unavailable market data)",
+        len(instances), len(histories), len(skipped),
+    )
+
+    report = analyze_histories(
+        histories,
+        lookbacks=lookbacks,
+        crossing_equilibrium=crossing_equilibrium,
+        crossing_threshold=crossing_threshold,
+        lower_percentile=lower_percentile,
+        upper_percentile=upper_percentile,
+    )
+    return ScanReport(results=report.results, skipped=tuple(skipped))
+
+
 def run_scan(request: ScanRequest) -> ScanReport:
     """Run a complete REAL-mode scan: candidate generation (Module 5A)
     -> pricing (Module 3, one leg cache shared across the whole
@@ -177,51 +250,13 @@ def run_scan(request: ScanRequest) -> ScanReport:
     )
     candidates = dedupe_candidates(candidates)
 
-    leg_cache: dict = {}
-    unavailable_rics: set[str] = set()
-    histories: list[StrategyHistory] = []
-    skipped: list[SkippedCandidate] = []
-
-    for instance in candidates:
-        already_known = next((r for r in instance.rics if r in unavailable_rics), None)
-        if already_known is not None:
-            skipped.append(
-                SkippedCandidate(
-                    instance=instance,
-                    unavailable_ric=already_known,
-                    message=(
-                        f"{already_known} was already confirmed unavailable "
-                        "earlier in this scan"
-                    ),
-                )
-            )
-            continue
-
-        try:
-            history = build_history(
-                instance, request.price_start, request.price_end, leg_cache=leg_cache
-            )
-        except MarketDataUnavailableError as exc:
-            unavailable_rics.add(exc.ric)
-            skipped.append(
-                SkippedCandidate(instance=instance, unavailable_ric=exc.ric, message=exc.message)
-            )
-            continue
-
-        histories.append(history)
-
-    logger.info(
-        "run_scan: %d candidate(s) after dedup -> %d history(ies) priced, %d skipped "
-        "(unavailable market data)",
-        len(candidates), len(histories), len(skipped),
-    )
-
-    report = analyze_histories(
-        histories,
+    return run_scan_on_instances(
+        candidates,
+        request.price_start,
+        request.price_end,
         lookbacks=request.lookbacks,
         crossing_equilibrium=request.crossing_equilibrium,
         crossing_threshold=request.crossing_threshold,
         lower_percentile=request.lower_percentile,
         upper_percentile=request.upper_percentile,
     )
-    return ScanReport(results=report.results, skipped=tuple(skipped))

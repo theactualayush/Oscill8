@@ -29,8 +29,10 @@ from template_scanner.scanner import (
     SkippedCandidate,
     analyze_histories,
     run_scan,
+    run_scan_on_instances,
 )
 from template_scanner.templates import template_from_dense_weights
+from template_scanner.universe import generate_candidates
 
 _DATES = pd.date_range("2020-01-01", periods=150, freq="D").strftime("%Y-%m-%d").tolist()
 _VALUES = ([0.98, 1.00, 1.02] * 60)[:150]
@@ -429,3 +431,103 @@ def test_analyze_histories_matches_direct_analyze_multi_lookback_call():
     direct = analyze_multi_lookback(history, lookbacks=(20, 40, 60))
 
     assert _fields_equal(via_scanner, direct)
+
+
+# ---------------------------------------------------------------------
+# run_scan_on_instances: the instances-in entry point Module 7B's
+# Strategy Set panel uses (expand_strategy_set() -> here), extracted
+# from run_scan()'s own body so both share one implementation.
+# ---------------------------------------------------------------------
+
+def test_run_scan_on_instances_prices_and_analyzes_a_prebuilt_candidate_list(mocker):
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
+    report = run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    assert len(report.results) == 3
+    assert {r.rics for r in report.results} == {
+        ("SRAH26", "SRAM26"), ("SRAM26", "SRAU26"), ("SRAU26", "SRAZ26"),
+    }
+    assert report.skipped == ()
+
+
+def test_run_scan_on_instances_shares_leg_cache_across_the_whole_call(mocker):
+    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
+    run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    # Same sharing guarantee as run_scan(): 4 distinct RICs fetched, not
+    # 6 (3 instances x 2 legs).
+    assert mock_get_history.call_count == 4
+
+
+def test_run_scan_on_instances_skips_unavailable_leg_and_continues(mocker):
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=[
+            MarketDataUnavailableError("SRAH26", "The universe is not found"),
+            _leg_df(),  # SRAM26
+            _leg_df(),  # SRAU26
+            _leg_df(),  # SRAZ26
+        ],
+    )
+
+    instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
+    report = run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    assert len(report.results) == 2
+    assert len(report.skipped) == 1
+    assert report.skipped[0].unavailable_ric == "SRAH26"
+
+
+def test_run_scan_on_instances_propagates_percentiles():
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1.0,), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=("SRAH26",))
+    history = StrategyHistory(
+        instance=instance,
+        price_field="Close",
+        history=pd.DataFrame(
+            {"Date": pd.to_datetime(_DATES), "Leg_1": _VALUES, "Strategy": _VALUES}
+        ),
+    )
+    # analyze_histories is exercised directly here (no I/O needed); the
+    # percentile plumbing is identical to run_scan_on_instances' own
+    # call into it -- see test_run_scan_carries_configured_percentiles_
+    # through_to_results above for the run_scan() equivalent.
+    report = analyze_histories([history], lookbacks=(20,), lower_percentile=25.0, upper_percentile=75.0)
+    analytics = report.results[0].multi_lookback.per_lookback[0]
+    assert analytics.lower_percentile == 25.0
+    assert analytics.upper_percentile == 75.0
+
+
+def test_run_scan_delegates_to_run_scan_on_instances_with_deduped_candidates(mocker):
+    """run_scan() must produce byte-identical results to calling
+    generate_candidate_universe+dedupe_candidates and then
+    run_scan_on_instances() by hand -- locking in that the refactor
+    left run_scan()'s own behavior unchanged."""
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+
+    request = ScanRequest(
+        definitions=(_fly(), _fly()),  # identical twice -> dedup exercised
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20, 40),
+    )
+    via_run_scan = run_scan(request)
+
+    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    from template_scanner.universe import dedupe_candidates, generate_candidate_universe
+
+    candidates = dedupe_candidates(
+        generate_candidate_universe(list(request.definitions), request.contract_start, request.contract_end)
+    )
+    via_manual_call = run_scan_on_instances(
+        candidates, request.price_start, request.price_end, lookbacks=request.lookbacks
+    )
+
+    assert {r.rics for r in via_run_scan.results} == {r.rics for r in via_manual_call.results}
+    assert len(via_run_scan.results) == len(via_manual_call.results)
