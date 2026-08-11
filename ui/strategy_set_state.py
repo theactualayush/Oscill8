@@ -34,12 +34,26 @@ DRAFT_ENTRIES = "oscill8_ss_draft_entries"  # list[StrategySetEntry] currently b
 DRAFT_DESCRIPTION = "oscill8_ss_draft_description"
 MESSAGE = "oscill8_ss_message"  # (level, text) | None -- "success"/"error"/"info"
 
+# The Strategy Set name (or ui.strategy_set_view's "+ New Strategy Set"
+# sentinel) that a lifecycle action (save/rename/duplicate/delete) wants
+# to become selected. NOT the selector widget's own session-state key --
+# Streamlit forbids writing to a widget's key after that widget has
+# already been instantiated in the current script run, which is exactly
+# what save/rename/duplicate/delete need to do (they run from inside the
+# "Manage Strategy Set" expander, rendered AFTER the selector). This key
+# is never bound to a widget, so it can be set freely from a callback;
+# ui.strategy_set_view._render_selector applies it to the selector
+# widget's key on the NEXT rerun, before that widget is (re)created --
+# the one point where doing so is legal.
+PENDING_SELECTION = "oscill8_ss_pending_selection"
+
 
 def init_state() -> None:
     st.session_state.setdefault(SELECTED_NAME, None)
     st.session_state.setdefault(DRAFT_ENTRIES, None)
     st.session_state.setdefault(DRAFT_DESCRIPTION, "")
     st.session_state.setdefault(MESSAGE, None)
+    st.session_state.setdefault(PENDING_SELECTION, None)
 
 
 def load_draft(name: str, entries: list[StrategySetEntry], description: str) -> None:
@@ -88,3 +102,18 @@ def pop_message() -> tuple[str, str] | None:
     message = st.session_state.get(MESSAGE)
     st.session_state[MESSAGE] = None
     return message
+
+
+def set_pending_selection(value: str) -> None:
+    """Record the name (or the "+ New Strategy Set" sentinel) that
+    should become the selector's value on the next rerun -- see
+    PENDING_SELECTION above for why this indirection exists."""
+    st.session_state[PENDING_SELECTION] = value
+
+
+def pop_pending_selection() -> str | None:
+    """Read and clear the pending selection -- applied at most once, by
+    the very next render of the selector."""
+    value = st.session_state.get(PENDING_SELECTION)
+    st.session_state[PENDING_SELECTION] = None
+    return value

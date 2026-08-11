@@ -120,15 +120,27 @@ def render_strategy_set_panel(setup: ScanSetup) -> None:
 
 # ---------------------------------------------------------------------
 # Selector
+#
+# Streamlit forbids writing to a widget's own session-state key once
+# that widget has been instantiated in the current script run -- and
+# save/rename/duplicate/delete run from the "Manage Strategy Set"
+# expander, AFTER the selector below has already rendered in the same
+# pass. So a lifecycle action never touches `_SELECTOR_KEY` directly;
+# it calls ss_state.set_pending_selection(name) and st.rerun(). On the
+# FRESH rerun that follows, _render_selector applies that pending value
+# to `_SELECTOR_KEY` here, before st.selectbox() (re)creates the widget
+# -- the one point in the script where writing to it is legal -- so the
+# desired selection takes effect on the next render, never the current
+# one.
 # ---------------------------------------------------------------------
-
-def _set_selector(value: str) -> None:
-    st.session_state[_SELECTOR_KEY] = value
-
 
 def _render_selector(repo: StrategySetRepository, names: list[str]) -> None:
     options = [_NEW_SET_OPTION] + names
-    if st.session_state.get(_SELECTOR_KEY) not in options:
+
+    pending = ss_state.pop_pending_selection()
+    if pending is not None:
+        st.session_state[_SELECTOR_KEY] = pending if pending in options else _NEW_SET_OPTION
+    elif st.session_state.get(_SELECTOR_KEY) not in options:
         selected = ss_state.get_selected_name()
         st.session_state[_SELECTOR_KEY] = selected if selected in options else options[0]
 
@@ -391,7 +403,7 @@ def _handle_save(
     repo.save(strategy_set)
     ss_state.load_draft(name, list(strategy_set.entries), strategy_set.description)
     ss_state.set_message("success", f"Saved '{name}'.")
-    _set_selector(name)
+    ss_state.set_pending_selection(name)
     st.rerun()
 
 
@@ -403,7 +415,7 @@ def _handle_rename(repo: StrategySetRepository, selected_name: str, rename_to: s
         return
     ss_state.load_draft(renamed.name, list(renamed.entries), renamed.description)
     ss_state.set_message("success", f"Renamed to '{renamed.name}'.")
-    _set_selector(renamed.name)
+    ss_state.set_pending_selection(renamed.name)
     st.rerun()
 
 
@@ -415,13 +427,20 @@ def _handle_duplicate(repo: StrategySetRepository, selected_name: str, duplicate
         return
     ss_state.load_draft(copy.name, list(copy.entries), copy.description)
     ss_state.set_message("success", f"Duplicated as '{copy.name}'.")
-    _set_selector(copy.name)
+    ss_state.set_pending_selection(copy.name)
     st.rerun()
 
 
 def _handle_delete(repo: StrategySetRepository, selected_name: str) -> None:
     repo.delete(selected_name)
     ss_state.start_new_draft()
+
+    # Select a sensible remaining set (first remaining name, alphabetically
+    # -- StrategySetRepository.list_names() is already sorted) rather than
+    # always dropping back to "+ New Strategy Set" when other sets exist.
+    remaining = repo.list_names()
+    next_selection = remaining[0] if remaining else _NEW_SET_OPTION
+
     ss_state.set_message("info", f"Deleted '{selected_name}'.")
-    _set_selector(_NEW_SET_OPTION)
+    ss_state.set_pending_selection(next_selection)
     st.rerun()
