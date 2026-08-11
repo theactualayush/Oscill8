@@ -29,8 +29,10 @@ formatting.py     Pure helpers: grid-row translation, filter/sort-key
 strategy_set_state.py       Module 7B: session-state for the Strategy
                              Set panel's selected set + editor draft.
 strategy_set_formatting.py   Module 7B: pure helpers -- entries -> display
-                             rows, structure labels, grid-row -> new
-                             StrategySetEntry (reuses ui.formatting).
+                             rows (Enabled/Name/Market/Interval/Weights,
+                             never a derived shape/structure label),
+                             grid-row -> new StrategySetEntry (reuses
+                             ui.formatting).
 strategy_set_view.py         Module 7B: the Strategy Set panel -- select/
                              view/run a saved set, and its add/remove/
                              enable-disable/rename/duplicate/delete/save/

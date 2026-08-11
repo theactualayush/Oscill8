@@ -115,9 +115,21 @@ def test_selecting_an_existing_set_loads_its_entries_and_preserves_enabled_state
 
     tables = [df.value for df in at.dataframe if "Enabled" in df.value.columns]
     assert len(tables) == 1
-    table = tables[0].set_index("Name")
+    displayed = tables[0]
+
+    # Exactly Enabled/Name/Market/Interval/Weights -- no Structure/Shape
+    # classification column (see the Module 7B date-clarity/no-structure
+    # UX correction; tests/test_ui_strategy_set_formatting.py covers the
+    # underlying column-set contract directly).
+    assert list(displayed.columns) == ["Enabled", "Name", "Market", "Interval", "Weights"]
+
+    table = displayed.set_index("Name")
     assert bool(table.loc["SOFR 6M Fly", "Enabled"]) is True
     assert bool(table.loc["SONIA Fly", "Enabled"]) is False
+    # Custom names are shown verbatim, and each entry's own interval
+    # (DAILY here) is visible right next to it.
+    assert table.loc["SOFR 6M Fly", "Interval"] == "DAILY"
+    assert table.loc["SONIA Fly", "Interval"] == "DAILY"
 
 
 # ---------------------------------------------------------------------
@@ -300,3 +312,79 @@ def test_manual_scan_bar_is_unaffected_by_strategy_set_lifecycle_actions(repo):
     # button) are still present and unaffected.
     assert any(s.label == "Market" for s in at.selectbox)
     assert any(b.label == "▶ Run Scan" for b in at.button)
+
+
+# ---------------------------------------------------------------------
+# Universe vs. History label clarity
+# ---------------------------------------------------------------------
+
+def test_universe_and_history_date_labels_are_unambiguous(repo):
+    """The two date-range pairs in the scan bar (which contracts get
+    expanded vs. how much price history gets fetched) must be labeled
+    explicitly enough to tell apart without inferring it from layout --
+    plain "Start"/"End" on both was the previous, ambiguous wording."""
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+
+    labels = {d.label for d in at.date_input}
+    assert labels == {"Contract Start", "Contract End", "Price History Start", "Price History End"}
+    # No bare, unqualified "Start"/"End" left over from before this
+    # clarity pass -- every date label names what it bounds.
+    assert "Start" not in labels
+    assert "End" not in labels
+
+
+def test_no_strategy_set_specific_date_controls_are_introduced(repo):
+    """A Strategy Set must not grow its own Universe/History dates --
+    the scanner's existing Contract/Price-History controls stay the
+    sole source of truth for both the manual grid and any Strategy Set
+    run (see ui.strategy_set_view.handle_run_strategy_set, which reads
+    setup.contract_start/contract_end/price_start/price_end directly,
+    never a Strategy-Set-owned date)."""
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    _assert_no_exception(at)
+    # Exactly the 4 scanner-level date inputs -- selecting/viewing a
+    # Strategy Set added none of its own.
+    assert len(at.date_input) == 4
+
+
+# ---------------------------------------------------------------------
+# Custom names remain verbatim regardless of mathematical shape
+# ---------------------------------------------------------------------
+
+def test_custom_names_display_verbatim_alongside_market_interval_weights(repo):
+    double_butterfly = _entry(
+        name="3M Double Butterfly", weights=(1.0, -3.0, 3.0, -1.0), enabled=True,
+    )
+    alternate_difference = StrategySetEntry(
+        name="3M Alternate Difference",
+        definition=StrategyDefinition(
+            market_key="SOFR", offsets=(0, 1, 2, 3), weights=(1.0, -2.0, 2.0, -1.0),
+            interval=BarInterval.DAILY,
+        ),
+    )
+    repo.save(StrategySet(name="Butterflies", entries=(double_butterfly, alternate_difference)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("Butterflies").run()
+    _assert_no_exception(at)
+
+    tables = [df.value for df in at.dataframe if "Enabled" in df.value.columns]
+    table = tables[0].set_index("Name")
+
+    assert "3M Double Butterfly" in table.index
+    assert "3M Alternate Difference" in table.index
+    assert table.loc["3M Double Butterfly", "Weights"] == "1.00 / -3.00 / 3.00 / -1.00"
+    assert table.loc["3M Alternate Difference", "Weights"] == "1.00 / -2.00 / 2.00 / -1.00"
+    assert table.loc["3M Double Butterfly", "Market"] == "SOFR (3M)"
+    assert table.loc["3M Double Butterfly", "Interval"] == "DAILY"
+    # Names are literal, user-chosen text -- never rewritten to reflect
+    # (or replaced by) a generic Fly/Condor/Butterfly/Curve label.
+    assert list(table.columns) == ["Enabled", "Market", "Interval", "Weights"]

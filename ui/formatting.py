@@ -48,6 +48,20 @@ PRIMARY_LOOKBACK_HELP = (
     "to measure stability."
 )
 
+UNIVERSE_HELP = (
+    "Which listed contracts are eligible for strategy expansion -- Contract Start/End bound "
+    "the rolling contract combinations generated for both the manual grid and any Strategy Set "
+    "run here. This does not change how much price history is fetched; see History below."
+)
+
+HISTORY_HELP = (
+    "How far back market price data is retrieved for the expanded strategies -- Price History "
+    "Start/End bound the date range fetched and analyzed. Combined with each strategy's own "
+    "interval (DAILY/HOURLY/4H), the same date range can mean a very different number of bars: "
+    "e.g. three months of DAILY data vs. three months of HOURLY data. This does not change which "
+    "contracts are eligible; see Universe above."
+)
+
 PERCENTILE_RANGE_HELP = (
     "Defines the historical range used for Low, High and Position. Example: "
     "25 / 75 uses the middle 50% of observations."

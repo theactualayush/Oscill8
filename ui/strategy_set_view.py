@@ -60,9 +60,9 @@ from ui.formatting import position_column
 from ui.strategy_set_formatting import (
     ENABLED_COLUMN,
     ENTRY_TABLE_COLUMNS,
+    INTERVAL_COLUMN,
     MARKET_COLUMN,
     NAME_COLUMN,
-    STRUCTURE_COLUMN,
     WEIGHTS_COLUMN,
     apply_enabled_edits,
     build_entry_from_grid_row,
@@ -165,7 +165,7 @@ def _render_entries_table(entries: list[StrategySetEntry]) -> list[StrategySetEn
         ENABLED_COLUMN: st.column_config.CheckboxColumn(ENABLED_COLUMN, width="small"),
         NAME_COLUMN: st.column_config.TextColumn(NAME_COLUMN, disabled=True),
         MARKET_COLUMN: st.column_config.TextColumn(MARKET_COLUMN, disabled=True, width="small"),
-        STRUCTURE_COLUMN: st.column_config.TextColumn(STRUCTURE_COLUMN, disabled=True, width="small"),
+        INTERVAL_COLUMN: st.column_config.TextColumn(INTERVAL_COLUMN, disabled=True, width="small"),
         WEIGHTS_COLUMN: st.column_config.TextColumn(WEIGHTS_COLUMN, disabled=True),
     }
     # Keyed by selection + entry count so the widget's own cached edit

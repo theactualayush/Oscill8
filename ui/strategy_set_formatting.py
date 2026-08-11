@@ -3,13 +3,21 @@ strategy_set_formatting.py
 
 Pure helper functions for Module 7B's Strategy Set panel: translating a
 StrategySet's entries into the "Strategies in Set" display table
-(Enabled/Name/Market/Structure/Weights), a leg-count-only structure
-label (Outright/Spread/Fly/Condor/Curve -- purely informational, never
-a shape-classification system: Strategy Set/entry names stay entirely
-user-defined per the design brief), applying edited Enabled values back
-onto a draft, and building one new StrategySetEntry from the same
+(Enabled/Name/Market/Interval/Weights), applying edited Enabled values
+back onto a draft, and building one new StrategySetEntry from the same
 curve-position grid shape ui.controls' Strategy Templates grid already
 uses.
+
+Deliberately does NOT infer or display any generic trading-shape
+classification (Fly/Condor/Butterfly/Curve/...) for an entry -- a
+Strategy Set entry's `name` is entirely user-defined (see strategy_sets/
+model.py), and the actual mathematical strategy is already fully
+represented by market/offsets/weights/interval on the underlying
+StrategyDefinition. Adding a second, derived "what is this shape called"
+label would be a redundant classification layer the design brief
+explicitly rejects -- an earlier version of this module did exactly
+that (a leg-count-only `describe_structure()`/Structure column) and it
+was removed for this reason.
 
 No Streamlit import here -- unit-testable directly against plain data,
 the same convention ui.formatting follows for Module 6A. No shape/
@@ -33,32 +41,27 @@ from strategy_sets.model import StrategySetEntry
 
 from ui.formatting import build_definitions_from_grid, fmt_number
 
-_STRUCTURE_BY_LEG_COUNT = {1: "Outright", 2: "Spread", 3: "Fly", 4: "Condor"}
-
 ENABLED_COLUMN = "Enabled"
 NAME_COLUMN = "Name"
 MARKET_COLUMN = "Market"
-STRUCTURE_COLUMN = "Structure"
+INTERVAL_COLUMN = "Interval"
 WEIGHTS_COLUMN = "Weights"
 
+# Interval is shown here (not just implied) because the shared History
+# window (ScanSetup.price_start/price_end) means something completely
+# different depending on which interval a given entry uses -- three
+# months of DAILY bars vs. three years of HOURLY bars over the same
+# calendar window -- so a trader reading this table needs the entry's
+# own interval right next to its weights, not just inferable from the
+# top-level scan bar's Interval selector (which only drives the manual
+# grid workflow, not Strategy Set entries -- each entry carries its own).
 ENTRY_TABLE_COLUMNS: tuple[str, ...] = (
     ENABLED_COLUMN,
     NAME_COLUMN,
     MARKET_COLUMN,
-    STRUCTURE_COLUMN,
+    INTERVAL_COLUMN,
     WEIGHTS_COLUMN,
 )
-
-
-def describe_structure(weights: Sequence[float]) -> str:
-    """Trader-familiar structure label from leg count alone -- 1 leg =
-    Outright, 2 = Spread, 3 = Fly, 4 = Condor, 5+ = Curve. Never
-    inspects the actual weight values (e.g. does not try to detect
-    whether a 3-legger is a "genuine" fly vs. some other custom
-    weighting) -- this is purely an informational label for the entries
-    table, not a shape-classification system.
-    """
-    return _STRUCTURE_BY_LEG_COUNT.get(len(weights), "Curve")
 
 
 def format_weights(weights: Sequence[float]) -> str:
@@ -69,10 +72,15 @@ def format_weights(weights: Sequence[float]) -> str:
 
 def entries_to_rows(entries: Sequence[StrategySetEntry]) -> list[dict]:
     """One display row per entry, in the SAME order as `entries` --
-    Enabled/Name/Market/Structure/Weights. Row order/position matches
+    Enabled/Name/Market/Interval/Weights. Row order/position matches
     `entries` exactly, so a caller pairing an edited row back to
     `entries[i]` (see apply_enabled_edits below) can rely on positional
     correspondence without a name-based lookup.
+
+    `Name` is `entry.name` verbatim -- whatever the user typed when
+    adding the strategy -- never reformatted or replaced with a derived
+    label. `Interval` is `definition.interval.value` (e.g. "DAILY"),
+    read directly off the entry's own StrategyDefinition.
     """
     rows = []
     for entry in entries:
@@ -82,7 +90,7 @@ def entries_to_rows(entries: Sequence[StrategySetEntry]) -> list[dict]:
                 ENABLED_COLUMN: entry.enabled,
                 NAME_COLUMN: entry.name,
                 MARKET_COLUMN: MARKETS[definition.market_key].name,
-                STRUCTURE_COLUMN: describe_structure(definition.weights),
+                INTERVAL_COLUMN: definition.interval.value,
                 WEIGHTS_COLUMN: format_weights(definition.weights),
             }
         )
@@ -95,7 +103,7 @@ def apply_enabled_edits(
     """Rebuild `entries` with each entry's `enabled` flag taken from the
     matching (by position) edited row's Enabled cell -- the only field
     the entries table's data_editor allows editing; Name/Market/
-    Structure/Weights are read-only there and are never written back.
+    Interval/Weights are read-only there and are never written back.
 
     Returns a NEW list (StrategySetEntry is frozen, via
     dataclasses.replace); `entries` itself is left untouched. If the

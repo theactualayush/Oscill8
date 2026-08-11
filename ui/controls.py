@@ -29,8 +29,10 @@ from core.config import MARKETS, BarInterval
 
 from ui.formatting import (
     CURVE_POSITION_HELP,
+    HISTORY_HELP,
     PERCENTILE_RANGE_HELP,
     PRIMARY_LOOKBACK_HELP,
+    UNIVERSE_HELP,
     position_column,
 )
 
@@ -120,29 +122,29 @@ def _render_scan_bar() -> dict:
             "Interval", _INTERVALS, format_func=lambda i: i.value, key="oscill8_interval"
         )
     with row1[2]:
-        st.caption("Universe")
+        st.caption("Universe", help=UNIVERSE_HELP)
         u1, u2 = st.columns(2)
         with u1:
             contract_start = st.date_input(
-                "Start", value=today - timedelta(days=730), key="oscill8_contract_start",
-                label_visibility="collapsed",
+                "Contract Start", value=today - timedelta(days=730), key="oscill8_contract_start",
+                help=UNIVERSE_HELP,
             )
         with u2:
             contract_end = st.date_input(
-                "End", value=today + timedelta(days=730), key="oscill8_contract_end",
-                label_visibility="collapsed",
+                "Contract End", value=today + timedelta(days=730), key="oscill8_contract_end",
+                help=UNIVERSE_HELP,
             )
     with row1[3]:
-        st.caption("History")
+        st.caption("History", help=HISTORY_HELP)
         h1, h2 = st.columns(2)
         with h1:
             price_start = st.date_input(
-                "Start", value=today - timedelta(days=1095), key="oscill8_price_start",
-                label_visibility="collapsed",
+                "Price History Start", value=today - timedelta(days=1095), key="oscill8_price_start",
+                help=HISTORY_HELP,
             )
         with h2:
             price_end = st.date_input(
-                "End", value=today, key="oscill8_price_end", label_visibility="collapsed",
+                "Price History End", value=today, key="oscill8_price_end", help=HISTORY_HELP,
             )
     with row1[4]:
         st.caption("Percentile Range", help=PERCENTILE_RANGE_HELP)
