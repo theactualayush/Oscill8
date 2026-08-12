@@ -32,6 +32,48 @@ to scanner.py/ScanRequest -- consistent with "the scanner remains
 completely unaware this module exists" and "do not duplicate existing
 scanner logic". Wiring StrategySet output INTO a scan is an explicit
 non-goal of this phase (see the package docstring's out-of-scope list).
+
+Two separate entry points into the scanner (multi-market audit note):
+Oscill8 currently has two independent paths that end up building the
+StrategyInstance/StrategyDefinition objects the scanner/pricing layer
+actually consumes:
+
+  MANUAL GRID:  ui grid rows -> ui.formatting.build_definitions_from_
+                grid() -> list[StrategyDefinition] -> ScanRequest ->
+                template_scanner.scanner.run_scan()
+  STRATEGY SET: StrategySet -> expand_strategy_set() (this module) ->
+                list[StrategyInstance] -> template_scanner.scanner.
+                run_scan_on_instances()
+
+Both are real, currently-tested paths, not a WIP/replaced-by
+relationship -- the UI's "Run Scan" button drives the manual grid path
+only; expand_strategy_set() is not wired into it (see the audit note
+above). Whichever path a caller uses, market and interval always come
+from each StrategyDefinition/StrategyInstance individually -- never
+from a global scanner-level market/interval, because none exists:
+template_scanner.scanner.ScanRequest has no market/interval field at
+all. Concretely, this means the manual grid's top-level ScanSetup
+market/interval controls are never an override of anything -- for the
+manual path they are only fallback/default values `build_definitions_
+from_grid()` applies to a genuinely blank grid row (see that function's
+own docstring); for the Strategy Set path they are not consulted at
+all, since expand_strategy_set() doesn't take a market/interval
+argument in the first place. See tests/test_strategy_sets_multimarket_
+pipeline.py and tests/test_multimarket_cache_key_independence.py for
+the regression coverage proving both paths keep every entry's market,
+interval, RICs, and cached history fully independent of one another.
+
+A future intermarket "Set A" (one combined strategy whose own legs
+belong to different markets, e.g. SOFR +1 / CORRA -1 priced and
+analyzed as a SINGLE series) is not part of either path today, and
+won't be a variation of either one when it arrives: today's
+StrategyDefinition is deliberately single-market_key (see strategy_
+engine/definitions.py and template_scanner/templates.py's own scope
+notes), and build_history()'s leg alignment assumes every leg shares
+one instance's interval/calendar. "Set A" is expected to need an
+additive sibling concept alongside today's StrategyDefinition/
+StrategyInstance, not a change to either of the two entry points
+described above -- not started, not designed yet.
 """
 
 from __future__ import annotations
