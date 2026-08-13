@@ -38,6 +38,23 @@ from ui.results_view import render_results
 from ui.scan_view import handle_run_scan, render_scan_error
 
 st.set_page_config(page_title="Oscill8 Scanner", layout="wide")
+
+# Trading-terminal density pass: tighten default Streamlit spacing and
+# restrain decoration (section 16/17 of the UI/UX spec). Presentation
+# only -- no selector targets st.data_editor/st.dataframe internals, so
+# the grid's rendered column geometry (and the keyboard-workflow
+# Playwright test that measures it in pixels) is unaffected.
+st.markdown(
+    """
+    <style>
+    div.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+    div[data-testid="stVerticalBlockBorderWrapper"] {gap: 0.4rem;}
+    hr {margin: 0.6rem 0;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 state.init_state()
 ss_state.init_state()
 

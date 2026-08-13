@@ -1,0 +1,9 @@
+# Oscill8 trading-terminal theme: dark, high-contrast, minimal decoration.
+# Presentation only -- does not affect widget behavior, data_editor column
+# widths/geometry, or any backend/scanner logic.
+[theme]
+base = "dark"
+primaryColor = "#3fa9f5"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e6edf3"

@@ -1,8 +1,9 @@
 """
 strategy_set_view.py
 
-Module 7B (simplified): the Strategy Set selector and Save control that
-live at the top of ui.controls' Strategy Templates section -- NOT a
+Module 7B (simplified): the Strategy Set selector and Save/"+ New"/
+Delete controls that live at the top of ui.controls' Strategy Templates
+section -- NOT a
 separate application section, NOT a second grid, NOT a second Run
 button. "Strategy Templates is the working strategy grid; a Strategy
 Set is simply a saved named version of that grid" (see the design
@@ -46,6 +47,36 @@ selector's key before st.selectbox() (re)creates the widget -- the one
 point in the script where writing to it is legal. This is the same fix
 verified in the Strategy Set selector lifecycle bug fix; preserved
 unchanged here.
+
+Lifecycle controls row (UI/UX redesign pass): render_controls_row()
+renders the selector alongside three buttons -- Save, "+ New", Delete
+-- as one row (ui.controls places this in the Strategy Workspace
+header, ABOVE the grid). "+ New" and Delete act immediately, since
+neither needs the just-edited grid's content: "+ New" reuses the exact
+same pending-selection indirection Save already uses to switch the
+selector to NEW_SET_OPTION (no second "new set" implementation), and
+Delete only ever removes an already-SAVED file via the existing,
+unmodified StrategySetRepository.delete() -- it never touches the
+in-progress grid. Save is different: overwriting an existing set (or
+creating a new one) needs that rerun's just-edited grid_rows, which
+ui.controls only has AFTER the grid itself renders further down the
+same script pass. So render_controls_row() only captures whether the
+Save button was clicked (a plain bool, returned to the caller) --
+process_save() performs the actual save once grid_rows is available,
+exactly mirroring the split ui.controls' render order already needs
+for _peek_current_market_and_interval().
+
+Delete confirmation: clicking Delete never deletes immediately -- it
+only sets a session-state flag that opens an `@st.dialog` confirmation
+naming the exact set to be removed, with Cancel/Delete actions (same
+open/close pattern as the existing "+ New Strategy Set" name-prompt
+dialog below). Only the dialog's own Delete button calls repo.delete().
+After a confirmed delete, a "sensible remaining Strategy Set" is
+selected automatically: the alphabetically-first name still on disk
+(repo.list_names() is already sorted), or NEW_SET_OPTION (a blank
+Strategy Workspace) if none remain -- applied via the same pending-
+selection indirection, so the grid resets to whatever that selection's
+own resolve_grid_seed() produces. No scan is ever triggered by delete.
 """
 
 from __future__ import annotations
@@ -128,30 +159,92 @@ def resolve_grid_seed(
 
 
 _SHOW_DIALOG_KEY = "oscill8_ss_show_save_dialog"
+_SHOW_DELETE_DIALOG_KEY = "oscill8_ss_show_delete_dialog"
 
 
-def render_save_controls(
+def render_controls_row(repo: StrategySetRepository) -> tuple[str | None, bool]:
+    """The Strategy Set selector plus its Save / "+ New" / Delete
+    buttons, rendered as one row (see the module docstring's "Lifecycle
+    controls row" note for why Save is only captured, not processed,
+    here). "+ New" and Delete both act immediately -- neither needs the
+    grid's current content. Returns (selected_name, save_clicked); the
+    caller (ui.controls) must still call process_save() with that
+    selected_name/save_clicked plus the just-rendered grid_rows.
+    """
+    sel_col, save_col, new_col, delete_col = st.columns([3, 1, 1, 1])
+
+    with sel_col:
+        selected_name = render_selector(repo)
+
+    with save_col:
+        save_clicked = st.button("Save Strategy Set", key="oscill8_ss_save_button", width="stretch")
+
+    with new_col:
+        if st.button("+ New", key="oscill8_ss_new_button", width="stretch"):
+            # Reuses the exact "+ New Strategy Set" sentinel/pending-
+            # selection path Save already uses to switch the selector --
+            # no second "start a new set" implementation.
+            ss_state.set_pending_selection(NEW_SET_OPTION)
+            st.rerun()
+
+    with delete_col:
+        if st.button(
+            "Delete", key="oscill8_ss_delete_button", width="stretch", disabled=selected_name is None,
+        ):
+            st.session_state[_SHOW_DELETE_DIALOG_KEY] = True
+
+    if selected_name is not None and st.session_state.get(_SHOW_DELETE_DIALOG_KEY):
+        _delete_confirm_dialog(repo, selected_name)
+
+    return selected_name, save_clicked
+
+
+@st.dialog("Delete Strategy Set")
+def _delete_confirm_dialog(repo: StrategySetRepository, name: str) -> None:
+    """Explicit, two-step delete: this dialog only ever opens from a
+    Delete button click and never removes anything by itself -- only
+    its own "Delete" button (below) actually calls repo.delete()."""
+    st.warning(f"Delete Strategy Set **'{name}'**? This cannot be undone.")
+    col_cancel, col_delete = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", key="oscill8_ss_delete_cancel", width="stretch"):
+            st.session_state[_SHOW_DELETE_DIALOG_KEY] = False
+            st.rerun()
+    with col_delete:
+        if st.button("Delete", key="oscill8_ss_delete_confirm", type="primary", width="stretch"):
+            repo.delete(name)
+            st.session_state[_SHOW_DELETE_DIALOG_KEY] = False
+            # A sensible remaining set (alphabetically first, matching
+            # repo.list_names()'s own sort) if any is left, else a
+            # blank/new Strategy Workspace -- never a scan, never a
+            # second deletion mechanism.
+            remaining = repo.list_names()
+            next_selection = remaining[0] if remaining else NEW_SET_OPTION
+            ss_state.set_message("success", f"Deleted '{name}'.")
+            ss_state.set_pending_selection(next_selection)
+            st.rerun()
+
+
+def process_save(
     repo: StrategySetRepository,
     selected_name: str | None,
+    save_clicked: bool,
     grid_rows: list[dict],
     position_columns: tuple[str, ...],
     market_key: str,
     interval: BarInterval,
 ) -> None:
-    """The single "Save Strategy Set" control. Overwrites in place when
-    a saved set is loaded; opens a small name prompt when "+ New
-    Strategy Set" is active. No Rename/Duplicate/Delete here -- dropped
-    in this simplification pass (see the design review); Save/create
-    is enough to keep the grid <-> Strategy Set workflow usable, and a
-    cleaner management UI can be layered on later without changing this
-    save path.
-    """
+    """Acts on the Save click captured by render_controls_row(), now
+    that the grid's current rows are known. Overwrites in place when a
+    saved set is loaded; opens a small name prompt when "+ New Strategy
+    Set" is active -- identical behavior to the original single-button
+    Save control, just split across the grid's render point."""
     if selected_name is not None:
-        if st.button("Save Strategy Set", key="oscill8_ss_save_button"):
+        if save_clicked:
             _save(repo, selected_name, grid_rows, position_columns, market_key, interval, new_name=None)
         return
 
-    if st.button("Save Strategy Set", key="oscill8_ss_save_button"):
+    if save_clicked:
         st.session_state[_SHOW_DIALOG_KEY] = True
 
     if st.session_state.get(_SHOW_DIALOG_KEY):

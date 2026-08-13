@@ -40,6 +40,7 @@ from strategy_sets.model import StrategySet, StrategySetEntry
 from strategy_sets.repository import StrategySetRepository
 from template_scanner.scanner import ScanReport
 import ui.scan_view as scan_view
+from ui.formatting import LABEL_COLUMN
 
 _APP_PATH = str(Path(__file__).resolve().parent.parent / "ui" / "app.py")
 _TODAY = date.today()
@@ -72,6 +73,13 @@ def _selector(at: AppTest):
 
 def _button(at: AppTest, label: str):
     return [b for b in at.button if b.label == label][0]
+
+
+def _button_by_key(at: AppTest, key: str):
+    """Disambiguates buttons that share a label -- e.g. the toolbar's
+    "Delete" button and the delete-confirmation dialog's own "Delete"
+    button both render at once while the dialog is open."""
+    return [b for b in at.button if b.key == key][0]
 
 
 def _text_input(at: AppTest, label: str):
@@ -108,7 +116,10 @@ def test_fresh_load_has_blank_grid_and_no_second_strategy_set_panel(repo):
     assert len(at.dataframe) <= 1
 
 
-def test_no_manage_strategy_set_panel_or_lifecycle_buttons_exist(repo):
+def test_no_manage_strategy_set_panel_or_removed_lifecycle_buttons_exist(repo):
+    # Delete is INTENTIONALLY present (see the Delete confirmation-flow
+    # tests below) -- only the never-implemented Rename/Duplicate/
+    # Add-to-Set/Remove/"Run Strategy Set" surface stays absent.
     repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
     at = _app()
     at.run()
@@ -116,8 +127,9 @@ def test_no_manage_strategy_set_panel_or_lifecycle_buttons_exist(repo):
     _assert_no_exception(at)
 
     labels = {b.label for b in at.button}
-    for removed in ("Run Strategy Set", "Rename", "Duplicate", "Delete", "Add to Set", "Remove"):
+    for removed in ("Run Strategy Set", "Rename", "Duplicate", "Add to Set", "Remove"):
         assert removed not in labels
+    assert "Delete" in labels
 
     expander_titles = [getattr(exp, "label", None) for exp in at.expander]
     assert "Manage Strategy Set" not in expander_titles
@@ -382,4 +394,145 @@ def test_switching_strategy_set_selection_does_not_raise(repo):
     _assert_no_exception(at)
     # Empty grid -- expected validation error, but critically no
     # StreamlitAPIException from the selector's widget lifecycle.
+    assert not repo.exists("Fresh Set")
+
+
+# ---------------------------------------------------------------------
+# "+ New" button -- reuses the "+ New Strategy Set" selection path
+# ---------------------------------------------------------------------
+
+def test_new_button_switches_selector_to_new_strategy_set(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _assert_no_exception(at)
+
+    _button(at, "+ New").click().run()
+    _assert_no_exception(at)
+    assert _selector(at).value == "+ New Strategy Set"
+
+
+def test_new_button_does_not_delete_the_previously_loaded_set(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _button(at, "+ New").click().run()
+    _assert_no_exception(at)
+
+    assert repo.exists("6M Strategies")
+
+
+# ---------------------------------------------------------------------
+# Delete -- explicit confirm dialog, never an immediate delete
+# ---------------------------------------------------------------------
+
+def test_delete_button_disabled_when_no_strategy_set_is_selected(repo):
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+
+    assert _button(at, "Delete").disabled is True
+
+
+def test_delete_button_opens_confirmation_and_does_not_delete_yet(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    _button(at, "Delete").click().run()
+    _assert_no_exception(at)
+
+    # Still on disk -- clicking Delete only opened the confirmation.
+    assert repo.exists("6M Strategies")
+    # The dialog names the exact set being deleted.
+    assert any("6M Strategies" in w.value for w in at.warning)
+    assert any(b.label == "Cancel" for b in at.button)
+    assert any(b.label == "Delete" for b in at.button)
+
+
+def test_cancel_in_delete_dialog_leaves_the_set_untouched(repo):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _button(at, "Delete").click().run()
+
+    _button(at, "Cancel").click().run()
+    _assert_no_exception(at)
+
+    assert repo.exists("6M Strategies")
+    assert st_session_state_flag_cleared(at)
+    assert _selector(at).value == "6M Strategies"
+
+
+def st_session_state_flag_cleared(at: AppTest) -> bool:
+    """The delete dialog's own open/close flag, read directly from
+    session_state -- the same authoritative-signal pattern the existing
+    Save-dialog Cancel regression test above already uses (AppTest's
+    stale-widget-metadata caveat documented there applies here too)."""
+    return at.session_state["oscill8_ss_show_delete_dialog"] is False
+
+
+def test_confirming_delete_removes_the_set_and_selects_a_remaining_one(repo):
+    repo.save(StrategySet(name="Alpha Set", entries=(_entry(),)))
+    repo.save(StrategySet(name="Zebra Set", entries=(_entry(name="Other"),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("Zebra Set").run()
+    _button(at, "Delete").click().run()
+
+    _button_by_key(at, "oscill8_ss_delete_confirm").click().run()
+    _assert_no_exception(at)
+
+    assert not repo.exists("Zebra Set")
+    assert repo.exists("Alpha Set")
+    # A sensible remaining set (alphabetically first, per
+    # StrategySetRepository.list_names()'s own sort) is auto-selected --
+    # never left pointing at the just-deleted name.
+    assert _selector(at).value == "Alpha Set"
+    assert any(m.value == "Deleted 'Zebra Set'." for m in at.success)
+
+
+def test_confirming_delete_of_the_last_remaining_set_resets_to_a_blank_workspace(repo):
+    repo.save(StrategySet(name="Only Set", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("Only Set").run()
+    _button(at, "Delete").click().run()
+
+    _button_by_key(at, "oscill8_ss_delete_confirm").click().run()
+    _assert_no_exception(at)
+
+    assert not repo.exists("Only Set")
+    assert _selector(at).value == "+ New Strategy Set"
+
+    # Grid reset to blank -- no leftover row from the deleted set.
+    grid = [df.value for df in at.dataframe if "Label" in df.value.columns][0]
+    assert len(grid) == 1
+    assert grid.iloc[0][LABEL_COLUMN] == ""
+
+
+def test_delete_never_triggers_a_scan(repo, mocker):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _button(at, "Delete").click().run()
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button_by_key(at, "oscill8_ss_delete_confirm").click().run()
+    _assert_no_exception(at)
+
+    mock_run.assert_not_called()
+
     assert not repo.exists("Fresh Set")

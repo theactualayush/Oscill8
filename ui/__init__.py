@@ -46,8 +46,11 @@ strategy_set_formatting.py   Pure helpers -- StrategySet entries <-> grid
                              loaded set's market/interval, and building
                              a new StrategySet directly from the grid's
                              current rows (reuses ui.formatting).
-strategy_set_view.py         The Strategy Set selector + Save control
-                             rendered inside ui.controls' Strategy
-                             Templates section -- no separate section,
-                             no second table, no second Run button.
+strategy_set_view.py         The Strategy Set selector + Save/"+ New"/
+                             Delete controls rendered inside ui.controls'
+                             Strategy Templates section -- no separate
+                             section, no second table, no second Run
+                             button. Delete requires an explicit confirm
+                             dialog naming the set before it removes
+                             anything.
 """

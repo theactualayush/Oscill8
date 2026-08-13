@@ -35,6 +35,23 @@ own ScanRequest metadata quotes; ui.formatting.build_definitions_from_
 grid() resolves each row's OWN Market/Interval first, falling back to
 those scan-bar selectors only for a row that somehow lacks them.
 
+Render order (UI/UX redesign pass): the Strategy Workspace (this
+section) now renders ABOVE Scan Configuration (_render_scan_bar()) in
+render_scan_setup(), matching the spec's "what am I scanning, then how
+should it be measured" hierarchy -- reversed from the original Module
+6A order, where the scan bar rendered first specifically to hand this
+section its Market/Interval defaults. Since the grid's own per-row
+Market/Interval is what actually matters for correctness (see above),
+_peek_current_market_and_interval() reads the scan bar's widget keys
+as they stood after the PREVIOUS rerun (Streamlit session_state
+persists a widget's key across reruns) purely to seed a brand-new
+blank row's default cells -- a cosmetic seed value only, never
+authoritative. The Strategy Set selector's Save/+New/Delete controls
+(ui.strategy_set_view.render_controls_row()/process_save()) are split
+the same way: the buttons render in this section's header (next to the
+selector), but Save's actual persistence logic runs after the grid
+below it, since it needs that rerun's just-edited grid_rows.
+
 Universe (Module 7B UX correction): no longer a user-entered date
 range. Oscill8 scans the CURRENTLY active contract curve, not an
 arbitrary historical contract universe -- contract_start is always
@@ -70,10 +87,12 @@ from core.config import MARKETS, BarInterval
 
 from strategy_sets.repository import StrategySetRepository
 
+from ui import state
 from ui import strategy_set_state as ss_state
 from ui import strategy_set_view
 from ui.formatting import (
     CURVE_POSITION_HELP,
+    CURVE_POSITION_HELP_COMPACT,
     HISTORY_HELP,
     INTERVAL_COLUMN,
     LABEL_COLUMN,
@@ -167,14 +186,27 @@ def _default_history_window(today: date) -> tuple[date, date]:
 
 
 def render_scan_setup() -> ScanSetup:
+    """Renders the Strategy Workspace (Strategy Set controls + grid)
+    ABOVE Scan Configuration (Data/Contracts/History/Analytics/Run
+    Scan), per the UI/UX spec's workflow hierarchy ("what am I
+    scanning?" before "how should it be measured?"). The Strategy
+    Workspace no longer needs a completed scan-bar Market/Interval
+    selection to render first -- _render_strategy_templates() peeks the
+    scan bar's own widget keys from the PREVIOUS rerun (see
+    _peek_current_market_and_interval()) purely to seed a brand-new
+    blank row's default Market/Interval cells; every already-populated
+    grid row keeps carrying its own Market/Interval regardless of
+    render order.
+    """
     main, _ = st.columns([5, 1])
     with main:
-        with st.container(border=True):
-            st.subheader("Oscill8 — Range-Bound Scanner")
-            setup_values = _render_scan_bar()
+        st.subheader("Oscill8 — Range-Bound Scanner")
 
         with st.container(border=True):
-            grid_rows, position_columns = _render_strategy_templates(setup_values)
+            grid_rows, position_columns = _render_strategy_templates()
+
+        with st.container(border=True):
+            setup_values = _render_scan_bar()
 
     return ScanSetup(
         grid_rows=grid_rows,
@@ -183,7 +215,25 @@ def render_scan_setup() -> ScanSetup:
     )
 
 
+def _peek_current_market_and_interval() -> tuple[str, BarInterval]:
+    """Best-effort read of the scan bar's Market/Interval widget values
+    as they stood after the PREVIOUS rerun (st.session_state persists a
+    widget's key across reruns even before that widget is re-instantiated
+    later in the current one) -- used only to seed a brand-new "+ New
+    Strategy Set" blank row's default Market/Interval cells. Falls back
+    to the first configured market / DAILY on the very first render,
+    before those widget keys exist at all."""
+    market_key = st.session_state.get("oscill8_market")
+    if market_key not in MARKETS:
+        market_key = next(iter(MARKETS))
+    interval = st.session_state.get("oscill8_interval")
+    if not isinstance(interval, BarInterval):
+        interval = BarInterval.DAILY
+    return market_key, interval
+
+
 def _render_scan_bar() -> dict:
+    st.caption("SCAN CONFIGURATION")
     today = date.today()
     universe_start, universe_end = _default_universe_window(today)
     history_start, history_end = _default_history_window(today)
@@ -191,7 +241,7 @@ def _render_scan_bar() -> dict:
     col_market, col_universe, col_history, col_analytics = st.columns([1.1, 1.4, 1.8, 2.6])
 
     with col_market:
-        st.caption("MARKET / DATA")
+        st.caption("DATA")
         market_key = st.selectbox(
             "Market", list(MARKETS.keys()), format_func=lambda k: MARKETS[k].name, key="oscill8_market"
         )
@@ -200,7 +250,7 @@ def _render_scan_bar() -> dict:
         )
 
     with col_universe:
-        st.caption("UNIVERSE", help=UNIVERSE_HELP)
+        st.caption("CONTRACTS", help=UNIVERSE_HELP)
         st.info("Active contracts — Automatic", icon="📈")
         st.caption(f"{universe_start:%Y/%m/%d} → {universe_end:%Y/%m/%d}", help=UNIVERSE_HELP)
         first_active = _first_active_contract(market_key, today)
@@ -248,9 +298,16 @@ def _render_scan_bar() -> dict:
             )
 
     st.divider()
-    button_col, _ = st.columns([1, 3])
+    status_col, button_col = st.columns([3, 1])
     with button_col:
         run_clicked = st.button("▶ Run Scan", type="primary", width="stretch")
+    with status_col:
+        # Do not invent progress percentages (spec section 12) -- the
+        # spinner in ui.scan_view.handle_run_scan() already covers the
+        # "⟳ SCANNING..." state during execution; this only reflects
+        # that a completed scan result is currently on display.
+        if not run_clicked and state.get_scan_report() is not None:
+            st.caption("✓ Scan complete")
 
     return {
         "market_key": market_key,
@@ -267,13 +324,16 @@ def _render_scan_bar() -> dict:
     }
 
 
-def _render_strategy_templates(setup_values: dict) -> tuple[list[dict], tuple[str, ...]]:
+def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     repo = StrategySetRepository()
+    default_market_key, default_interval = _peek_current_market_and_interval()
+
+    st.subheader("Strategy Workspace")
 
     header_col, positions_col = st.columns([4, 1])
     with header_col:
-        st.subheader("Strategy Templates")
-        selected_name = strategy_set_view.render_selector(repo)
+        st.caption("STRATEGY SET")
+        selected_name, save_clicked = strategy_set_view.render_controls_row(repo)
     with positions_col:
         n_positions = st.number_input(
             "Positions",
@@ -292,13 +352,14 @@ def _render_strategy_templates(setup_values: dict) -> tuple[list[dict], tuple[st
 
     position_columns = tuple(position_column(i) for i in range(1, n_positions + 1))
     seed_df = strategy_set_view.resolve_grid_seed(
-        selected_name, repo, position_columns, setup_values["market_key"], setup_values["interval"]
+        selected_name, repo, position_columns, default_market_key, default_interval
     )
 
+    st.caption("STRATEGY")
     grid_rows = _render_strategy_grid(seed_df, position_columns, selected_name, n_positions)
-    strategy_set_view.render_save_controls(
-        repo, selected_name, grid_rows, position_columns,
-        setup_values["market_key"], setup_values["interval"],
+    strategy_set_view.process_save(
+        repo, selected_name, save_clicked, grid_rows, position_columns,
+        default_market_key, default_interval,
     )
 
     return grid_rows, position_columns
@@ -307,7 +368,7 @@ def _render_strategy_templates(setup_values: dict) -> tuple[list[dict], tuple[st
 def _render_strategy_grid(
     seed_df: pd.DataFrame, position_columns: tuple[str, ...], selected_name: str | None, n_positions: int
 ) -> list[dict]:
-    st.caption(CURVE_POSITION_HELP)
+    st.caption(CURVE_POSITION_HELP_COMPACT, help=CURVE_POSITION_HELP)
 
     column_config = {
         LABEL_COLUMN: st.column_config.TextColumn("Label", width="small"),
@@ -344,4 +405,5 @@ def _render_strategy_grid(
         column_config=column_config,
         column_order=column_order,
     )
+    st.caption("+ Add Strategy — use the **+** row at the bottom of the grid.")
     return edited.to_dict("records")

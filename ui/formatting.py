@@ -38,6 +38,13 @@ from template_scanner.templates import template_from_dense_weights
 
 _NAN = float("nan")
 
+# Compact, always-visible caption (spec: no large instructional
+# paragraph should dominate the screen) -- the full explanation moves
+# into CURVE_POSITION_HELP below, shown only as a hover tooltip.
+CURVE_POSITION_HELP_COMPACT = (
+    "Positions are consecutive curve offsets · Tab moves across cells · Enter moves to next row"
+)
+
 CURVE_POSITION_HELP = (
     "Columns are consecutive curve positions (contract offsets). Templates roll "
     "across the active contract universe; blank cells are ignored. Keyboard "
@@ -49,7 +56,8 @@ CURVE_POSITION_HELP = (
     "mid-row also commits and moves down, which skips the rest of the row. "
     "Arrow keys move the selection between cells as usual when a cell isn't "
     "being edited; once you start typing, arrow keys move the text cursor "
-    "inside the cell instead."
+    "inside the cell instead. Example: 1 -2 1 = first contract minus 2x second "
+    "contract plus third contract."
 )
 
 PRIMARY_LOOKBACK_HELP = (
