@@ -298,9 +298,14 @@ def test_universe_indicator_is_shown_instead_of_date_inputs(repo):
     at.run()
     _assert_no_exception(at)
 
+    # Rendered as a disabled text_input (not st.info) so its label-row +
+    # control-row height matches Market/Price History Start/Lookbacks in
+    # the other three Scan Configuration columns (alignment pass) --
+    # "Automatic" still appears somewhere in that indicator either way.
     all_text = " ".join(m.value for m in at.markdown) + " ".join(c.value for c in at.caption)
     infos = " ".join(i.value for i in at.info) if hasattr(at, "info") else ""
-    assert "Automatic" in infos or "Automatic" in all_text
+    text_inputs = " ".join(t.value or "" for t in at.text_input)
+    assert "Automatic" in infos or "Automatic" in all_text or "Automatic" in text_inputs
 
 
 def test_active_contract_universe_starts_from_today(repo, mocker):

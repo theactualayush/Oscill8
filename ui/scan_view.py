@@ -14,7 +14,12 @@ catches core.downloader.MarketDataUnavailableError internally and
 reports it via ScanReport.skipped, so it never reaches this module.
 Anything that does reach here (session/auth/network failures, a
 programming bug) is shown to the user, not silently retried or
-reclassified.
+reclassified -- what changes is only how it's PRESENTED: the raw
+exception is still caught, still fully preserved as technical detail,
+and still shown, but ui.error_formatting.classify_scan_error() derives
+a short trader-facing headline from it first (see render_scan_error()
+below) rather than putting the exception type/message in front of the
+user directly.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from template_scanner.scanner import ScanRequest, run_scan
 
 from ui import state
 from ui.controls import ScanSetup
+from ui.error_formatting import classify_scan_error
 from ui.formatting import build_definitions_from_grid
 
 
@@ -74,16 +80,24 @@ def handle_run_scan(setup: ScanSetup) -> None:
         with st.spinner("Scanning market data..."):
             report = run_scan(request)
     except Exception as exc:  # noqa: BLE001 -- UI boundary: surface, don't classify
-        state.store_scan_error(f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}")
+        presentation = classify_scan_error(type(exc).__name__, str(exc))
+        technical = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+        state.store_scan_error((presentation, technical))
         return
 
     state.store_scan_result(request, report, setup.display_lookback)
 
 
 def render_scan_error() -> None:
-    message = st.session_state.get(state.SCAN_ERROR)
-    if not message:
+    """Shows the classified, trader-facing headline/message as the
+    PRIMARY error -- never a Python traceback, LSEG error code, file
+    path, or exception type/message. The full technical detail (what
+    used to be the entire visible error) is still shown, unmodified,
+    but only inside the collapsed "Technical details" expander."""
+    error = state.get_scan_error()
+    if error is None:
         return
-    st.error("The scan failed to complete. See technical details below.")
+    presentation, technical = error
+    st.error(f"**{presentation.title}**\n\n{presentation.message}")
     with st.expander("Technical details"):
-        st.code(message)
+        st.code(technical)

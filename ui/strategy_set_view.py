@@ -48,10 +48,14 @@ point in the script where writing to it is legal. This is the same fix
 verified in the Strategy Set selector lifecycle bug fix; preserved
 unchanged here.
 
-Lifecycle controls row (UI/UX redesign pass): render_controls_row()
-renders the selector alongside three buttons -- Save, "+ New", Delete
--- as one row (ui.controls places this in the Strategy Workspace
-header, ABOVE the grid). "+ New" and Delete act immediately, since
+Lifecycle controls row (UI/UX redesign pass): render_selector(),
+render_save_button(), render_new_button(), and render_delete_control()
+are each a single column's worth of widgets -- ui.controls renders all
+five columns (selector, Save, "+ New", Delete, Positions) from ONE flat
+st.columns() call so every control shares the same label-row/control-
+row baseline (see ui.controls._render_strategy_templates()'s own
+comment on why columns-inside-a-column previously left the buttons
+floating above the dropdown). "+ New" and Delete act immediately, since
 neither needs the just-edited grid's content: "+ New" reuses the exact
 same pending-selection indirection Save already uses to switch the
 selector to NEW_SET_OPTION (no second "new set" implementation), and
@@ -60,7 +64,7 @@ unmodified StrategySetRepository.delete() -- it never touches the
 in-progress grid. Save is different: overwriting an existing set (or
 creating a new one) needs that rerun's just-edited grid_rows, which
 ui.controls only has AFTER the grid itself renders further down the
-same script pass. So render_controls_row() only captures whether the
+same script pass. So render_save_button() only captures whether the
 Save button was clicked (a plain bool, returned to the caller) --
 process_save() performs the actual save once grid_rows is available,
 exactly mirroring the split ui.controls' render order already needs
@@ -162,41 +166,39 @@ _SHOW_DIALOG_KEY = "oscill8_ss_show_save_dialog"
 _SHOW_DELETE_DIALOG_KEY = "oscill8_ss_show_delete_dialog"
 
 
-def render_controls_row(repo: StrategySetRepository) -> tuple[str | None, bool]:
-    """The Strategy Set selector plus its Save / "+ New" / Delete
-    buttons, rendered as one row (see the module docstring's "Lifecycle
-    controls row" note for why Save is only captured, not processed,
-    here). "+ New" and Delete both act immediately -- neither needs the
-    grid's current content. Returns (selected_name, save_clicked); the
-    caller (ui.controls) must still call process_save() with that
-    selected_name/save_clicked plus the just-rendered grid_rows.
-    """
-    sel_col, save_col, new_col, delete_col = st.columns([3, 1, 1, 1])
+def render_save_button() -> bool:
+    """The Save button only -- caller (ui.controls) places this in its
+    own column of the Strategy Set control row (see the module
+    docstring's "Lifecycle controls row" note for why Save is only
+    captured here, not processed: it needs that rerun's just-edited
+    grid_rows, which only exist after the grid itself renders further
+    down the same script pass). Returns whether it was clicked this
+    rerun; the caller must still call process_save()."""
+    return st.button("Save Strategy Set", key="oscill8_ss_save_button", width="stretch")
 
-    with sel_col:
-        selected_name = render_selector(repo)
 
-    with save_col:
-        save_clicked = st.button("Save Strategy Set", key="oscill8_ss_save_button", width="stretch")
+def render_new_button() -> None:
+    """The "+ New" button -- acts immediately, since starting a new
+    (blank) Strategy Workspace needs no grid content. Reuses the exact
+    "+ New Strategy Set" sentinel/pending-selection path Save already
+    uses to switch the selector -- no second "start a new set"
+    implementation."""
+    if st.button("+ New", key="oscill8_ss_new_button", width="stretch"):
+        ss_state.set_pending_selection(NEW_SET_OPTION)
+        st.rerun()
 
-    with new_col:
-        if st.button("+ New", key="oscill8_ss_new_button", width="stretch"):
-            # Reuses the exact "+ New Strategy Set" sentinel/pending-
-            # selection path Save already uses to switch the selector --
-            # no second "start a new set" implementation.
-            ss_state.set_pending_selection(NEW_SET_OPTION)
-            st.rerun()
 
-    with delete_col:
-        if st.button(
-            "Delete", key="oscill8_ss_delete_button", width="stretch", disabled=selected_name is None,
-        ):
-            st.session_state[_SHOW_DELETE_DIALOG_KEY] = True
+def render_delete_control(repo: StrategySetRepository, selected_name: str | None) -> None:
+    """The Delete button (disabled with nothing saved-and-selected) plus
+    its confirmation dialog trigger -- also acts immediately, since
+    deleting an already-SAVED file needs no grid content either."""
+    if st.button(
+        "Delete", key="oscill8_ss_delete_button", width="stretch", disabled=selected_name is None,
+    ):
+        st.session_state[_SHOW_DELETE_DIALOG_KEY] = True
 
     if selected_name is not None and st.session_state.get(_SHOW_DELETE_DIALOG_KEY):
         _delete_confirm_dialog(repo, selected_name)
-
-    return selected_name, save_clicked
 
 
 @st.dialog("Delete Strategy Set")

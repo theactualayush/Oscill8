@@ -47,10 +47,11 @@ as they stood after the PREVIOUS rerun (Streamlit session_state
 persists a widget's key across reruns) purely to seed a brand-new
 blank row's default cells -- a cosmetic seed value only, never
 authoritative. The Strategy Set selector's Save/+New/Delete controls
-(ui.strategy_set_view.render_controls_row()/process_save()) are split
-the same way: the buttons render in this section's header (next to the
-selector), but Save's actual persistence logic runs after the grid
-below it, since it needs that rerun's just-edited grid_rows.
+(ui.strategy_set_view.render_save_button()/render_new_button()/
+render_delete_control()/process_save()) are split the same way: the
+buttons render in this section's header (next to the selector), but
+Save's actual persistence logic runs after the grid below it, since it
+needs that rerun's just-edited grid_rows.
 
 Universe (Module 7B UX correction): no longer a user-entered date
 range. Oscill8 scans the CURRENTLY active contract curve, not an
@@ -251,7 +252,14 @@ def _render_scan_bar() -> dict:
 
     with col_universe:
         st.caption("CONTRACTS", help=UNIVERSE_HELP)
-        st.info("Active contracts — Automatic", icon="📈")
+        # A disabled text_input, not st.info: it renders with the exact
+        # same label-row + control-row height as Market/Price History
+        # Start/Lookbacks (bars) in the other three columns, so this
+        # row's boxes line up with theirs instead of an st.info banner's
+        # own (taller, label-less) height sitting a row higher.
+        st.text_input(
+            "Active Contracts", value="📈 Automatic", disabled=True, key="oscill8_universe_display",
+        )
         st.caption(f"{universe_start:%Y/%m/%d} → {universe_end:%Y/%m/%d}", help=UNIVERSE_HELP)
         first_active = _first_active_contract(market_key, today)
         if first_active:
@@ -329,11 +337,31 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     default_market_key, default_interval = _peek_current_market_and_interval()
 
     st.subheader("Strategy Workspace")
+    st.caption("STRATEGY SET")
 
-    header_col, positions_col = st.columns([4, 1])
-    with header_col:
-        st.caption("STRATEGY SET")
-        selected_name, save_clicked = strategy_set_view.render_controls_row(repo)
+    # ONE flat row (not columns-inside-a-column, which left the button
+    # trio floating a half-row above the dropdown/Positions boxes) so
+    # every control shares the same label-row + control-row baseline --
+    # the selector's "Strategy Set" label, Positions' own "Positions"
+    # label, and the small captions above Save/+ New/Delete all render
+    # at the same height, and their boxes below therefore line up too.
+    sel_col, save_col, new_col, delete_col, positions_col = st.columns(
+        [3.4, 1, 1, 1, 1.2], vertical_alignment="bottom"
+    )
+    with sel_col:
+        selected_name = strategy_set_view.render_selector(repo)
+    with save_col:
+        st.caption("Save")
+        save_clicked = strategy_set_view.render_save_button()
+    with new_col:
+        # Escaped leading "+": Streamlit captions render as Markdown,
+        # where a bare "+ " at the start of a line is a bullet-list
+        # marker -- without the escape this rendered as "• New".
+        st.caption("\\+ New")
+        strategy_set_view.render_new_button()
+    with delete_col:
+        st.caption("Delete")
+        strategy_set_view.render_delete_control(repo, selected_name)
     with positions_col:
         n_positions = st.number_input(
             "Positions",
@@ -405,5 +433,6 @@ def _render_strategy_grid(
         column_config=column_config,
         column_order=column_order,
     )
-    st.caption("+ Add Strategy — use the **+** row at the bottom of the grid.")
+    # Escaped leading "+" -- see the "+ New" caption above for why.
+    st.caption("\\+ Add strategy", help="Use the + row at the bottom of the grid to add a new strategy.")
     return edited.to_dict("records")
