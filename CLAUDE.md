@@ -32,7 +32,11 @@ Local Market Data Cache
       ↓
 Strategy Engine
       ↓
-Analytics Engine
+Analytics Engine (Range-Bound + Multi-Lookback)
+      ↓
+Template / Scanner Engine (candidate generation, filtering, ranking)
+      ↓
+Strategy Sets (saved named collections, feeding the same grid/scanner)
       ↓
 Streamlit UI
 
@@ -283,18 +287,23 @@ range_analytics/
                         OR calendar start/end, never both; drops NaN
                         Strategy rows before applying N)
     location.py         (mean/median, full & robust range bounds/width/
-                        position, distance-from-mean, z-score)
+                        position, distance-from-mean, z-score;
+                        validate_percentiles() -- see the configurable-
+                        percentile update below)
     volatility.py        (realized_volatility -- sample stdev, ddof=1, of
                         level changes; not annualized, not % returns)
     efficiency.py         (Kaufman-style efficiency_ratio)
-    oscillation.py         (count_crossings -- hysteresis-band crossing count)
-    mean_reversion.py       (AR1Fit, fit_ar1 -- differenced-OLS AR(1), half-life)
-    units.py                 (price_to_bp -- per-market bp_per_point conversion)
-    results.py                (RangeAnalytics dataclass, analyze_range() entry point)
+    movement.py            (mean_absolute_change -- Tradability Analytics,
+                        see the update below)
+    oscillation.py           (count_crossings -- hysteresis-band crossing
+                        count; count_oscillations -- zone-based, see below)
+    mean_reversion.py          (AR1Fit, fit_ar1 -- differenced-OLS AR(1), half-life)
+    units.py                     (price_to_bp -- per-market bp_per_point conversion)
+    results.py                     (RangeAnalytics dataclass, analyze_range() entry point)
 
 tests/
     test_range_lookback.py, test_range_location.py, test_range_volatility.py,
-    test_range_efficiency.py, test_range_oscillation.py,
+    test_range_efficiency.py, test_range_oscillation.py, test_range_movement.py,
     test_range_mean_reversion.py, test_range_units.py, test_range_analytics.py
 
 Key design points a future session needs:
@@ -325,16 +334,56 @@ Key design points a future session needs:
 - `half_life = ln(2) / (-ln(|beta|))` for `0 < |beta| < 1`; `0.0` at
   `beta == 0` (computed directly, no `log(0)` singularity); `NaN` for
   `|beta| >= 1`.
-- The only "dislocation from equilibrium" field that exists is
-  `z_score` (`(current - mean) / std`, same window). A separate,
-  **unapproved** future "robust Z-score to distinguish range-boundedness
-  quality from current dislocation" is **not implemented** and is not
-  the same thing as this field — see the Development Roadmap below.
+- `z_score` (`(current - mean) / std`, same window) is the
+  "dislocation from equilibrium" field.
+
+**UPDATE — configurable percentiles, movement, and oscillation
+tradability are now IMPLEMENTED** (post-4A follow-up pass; the two
+bullets above describing the P5/P95 bounds as hard-coded and Z-score as
+the *only* dislocation field predate this pass and are kept for
+history, not as current fact):
+
+- **Configurable robust-range percentile bounds.** `location.
+  range_low_robust()`/`range_high_robust()`/`range_width_robust()` now
+  take `lower_percentile`/`upper_percentile` parameters (defaulting to
+  `5.0`/`95.0`, preserving all prior behaviour when unspecified).
+  `location.validate_percentiles(lower_percentile, upper_percentile)`
+  enforces `0 <= lower_percentile < upper_percentile <= 100` at every
+  entry point that accepts the pair (`analyze_range()`,
+  `template_scanner.scanner.ScanRequest`) — not re-validated
+  separately at each call site. `RangeAnalytics` carries the resolved
+  `lower_percentile`/`upper_percentile` alongside the bounds they
+  produced, so a result is always self-describing. The UI exposes this
+  as the Scan Configuration panel's "Lower %ile" / "Upper %ile" inputs
+  (see [Module 6A](#module-6a--streamlit-range-bound-scanner-ui) below).
+- **Movement (Tradability Analytics)** — `range_analytics/movement.py`:
+  `mean_absolute_change(series)` = `mean(abs(ΔS_t))`, the close-to-close
+  analogue of Average True Range for a synthetic strategy level series
+  (deliberately NOT a classical OHLC True Range — the combined multi-leg
+  series has only one price field per leg, so a true intrabar range
+  would be fabricated, not economically real). Surfaced on
+  `RangeAnalytics.mean_abs_change_price` (and its bp conversion).
+- **Oscillation tradability** — `range_analytics/oscillation.py`:
+  `count_oscillations(series, lower, upper)` (zone-based, distinct from
+  the existing equilibrium-crossing `count_crossings()`), surfaced as
+  `RangeAnalytics.oscillation_count`, computed against the window's own
+  robust bounds.
+- All of the above are read directly from `RangeAnalytics`/
+  `MultiLookbackAnalytics` by the UI's "Selected Strategy" summary panel
+  (`ui/results_view.py`) as "Z-Score", "Movement (bp)", and
+  "Oscillations" — no recomputation in `ui/`.
+- A separate, still-**unapproved** future "robust Z-score to distinguish
+  range-boundedness quality from current dislocation" (a materially
+  different statistic from the existing `z_score` field) remains **not
+  implemented** — see the Development Roadmap below.
 - Test suite (current file-level counts): `test_range_lookback.py` 10,
-  `test_range_location.py` 12, `test_range_volatility.py` 5,
-  `test_range_efficiency.py` 6, `test_range_oscillation.py` 14,
-  `test_range_mean_reversion.py` 10, `test_range_units.py` 7,
-  `test_range_analytics.py` 10 — 74 tests total for this module.
+  `test_range_location.py` 18, `test_range_volatility.py` 5,
+  `test_range_efficiency.py` 6, `test_range_oscillation.py` 31,
+  `test_range_mean_reversion.py` 10, `test_range_units.py` 3,
+  `test_range_analytics.py` 25, `test_range_movement.py` 6 — see
+  [Testing](#testing-current-state) below for the full-suite total
+  (per-file counts here are a snapshot; re-run `pytest -q` for
+  up-to-date numbers rather than trusting any count in this file).
 
 ## Module 4B – Multi-Lookback / Stability Analytics
 
@@ -835,9 +884,213 @@ Key design points a future session needs:
   module.
 
 **Deferred, not solved here** (see the Development Roadmap below):
-Streamlit UI, a strategy editor, wiring `StrategySet`/`expand_strategy_
-set()` output into a running scan, true intermarket (cross-market-leg)
-strategies, watchlists, alerts, deployment.
+true intermarket (cross-market-leg, i.e. one *strategy's* legs spanning
+more than one market) strategies, watchlists, alerts, deployment. A
+Streamlit UI and a strategy editor were built (Module 7B, below), but
+**not** the way this paragraph originally anticipated — see Module 7B's
+own notes on why `expand_strategy_set()` ended up unused by the UI.
+
+---
+
+## Module 7B – Strategy Set UI Integration (+ Multi-Market Grid Fix)
+
+COMPLETED AND TESTED. Wires Strategy Sets into the existing Module 6A
+Strategy Templates grid — deliberately NOT a second grid, NOT a
+separate application section, and NOT a second Run Scan path. Design
+principle: "Strategy Templates is the working strategy grid; a Strategy
+Set is simply a saved named version of that grid."
+
+**Important correction vs. Module 7A's own "deferred" note above**:
+Module 7A anticipated wiring `StrategySet` output into a scan via
+`expand_strategy_set()` → `template_scanner.scanner.
+run_scan_on_instances()`. That is **not** the path the UI actually
+takes. Instead, a loaded Strategy Set is translated into ordinary
+Strategy Templates grid rows (`ui.strategy_set_formatting.
+grid_rows_from_strategy_set()`), and `ui.scan_view.handle_run_scan()`
+builds `StrategyDefinition[]` from those grid rows via `ui.formatting.
+build_definitions_from_grid()` and calls `run_scan()` — exactly the
+same path a manually-typed row takes. `expand_strategy_set()` and
+`run_scan_on_instances()` still exist, are still tested (Module 7A's
+own suite), and remain valid public API, but **the UI does not call
+either of them**. There is exactly one execution path from the grid to
+a `ScanReport`, whether a row was typed by hand or loaded from a saved
+set.
+
+ui/
+    strategy_set_view.py       (selector, Save/+New/Delete controls,
+                                delete-confirmation dialog, save dialog,
+                                selector widget-lifecycle handling)
+    strategy_set_state.py       (session-state keys: selected saved
+                                name, pending-selection indirection,
+                                one-shot status message)
+    strategy_set_formatting.py   (StrategySet <-> grid row translation,
+                                no Streamlit import, unit-testable)
+
+tests/
+    test_ui_strategy_set_formatting.py,
+    test_ui_strategy_set_state.py,
+    test_ui_strategy_set_selector_lifecycle.py,
+    test_ui_strategy_set_multimarket_roundtrip.py,
+    test_strategy_sets_multimarket_pipeline.py
+
+Key design points a future session needs:
+
+- **One grid, not two.** See the correction above — this is the whole
+  point of the module.
+- **Per-row Market/Interval (multi-market fix).** The grid gained its
+  own `Market`/`Interval` `SelectboxColumn`s per row
+  (`ui.formatting.MARKET_COLUMN`/`INTERVAL_COLUMN`, wired in
+  `ui.controls`'s `column_config`), defaulting a brand-new row to
+  whatever the scan bar's own Market/Interval selectors currently show,
+  but otherwise fully independent per row. This is what lets a
+  Strategy Set mix markets (e.g. "Intermarket Churning": SOFR + SONIA +
+  CORRA entries) round-trip losslessly through load → edit → save →
+  reload. An earlier version bound the whole grid to one scan-bar-
+  selected market/interval, which silently normalized every row to a
+  single market/interval on resave — corrupting a mixed-market saved
+  file. `ui.formatting.build_definitions_from_grid()` now resolves each
+  row's OWN Market/Interval first, falling back to the scan bar's
+  selectors only for a row that somehow lacks them (e.g. a hand-built
+  row dict in a test). Do not describe this as "true intermarket
+  strategies" — a Strategy *Set* mixing markets across its entries is
+  not the same thing as one *strategy*'s legs spanning multiple markets
+  (still deferred, see the roadmap).
+- **Automatic Universe.** The contract-selection window
+  (`contract_start`/`contract_end`) is no longer user-entered. Oscill8
+  scans the CURRENTLY active contract curve: `contract_start` is always
+  today, `contract_end` is today plus a fixed forward horizon
+  (`ui.controls._UNIVERSE_FORWARD_DAYS = 730`) — shown as a compact
+  "Active Contracts — Automatic" indicator plus the resolved first
+  active contract (`ui.controls._first_active_contract()`, via
+  `core.futures_calendar.generate_contracts()`, the SAME function every
+  rolling scan already calls — no separate expiry calendar is
+  maintained). Price History (what date range gets priced) remains a
+  completely separate, user-editable concept, defaulting to the last
+  ~6 months (`ui.controls._HISTORY_LOOKBACK_DAYS = 182`, down from an
+  earlier 3-year default).
+- **Keyboard workflow.** Grid position columns are `TextColumn`s (see
+  Module 6A's notes on why) with native `st.data_editor` Tab-to-commit-
+  and-move-right and Enter-to-commit-and-drop-to-next-row semantics — no
+  custom keyboard handling was written. A full row (Label, Market,
+  Interval, every weight column) can be entered without touching the
+  mouse again after the first click; pressing Enter mid-row also
+  commits and moves down, so it should only be used on a row's last
+  cell. Documented in `ui.formatting.CURVE_POSITION_HELP`.
+  `tests/test_ui_keyboard_browser.py` is a real-browser Playwright test
+  against a live `streamlit run` process — the only test layer that can
+  actually drive `st.data_editor`'s canvas-rendered cells
+  (`streamlit.testing.v1.AppTest` cannot). It is SKIPPED, not failed,
+  when Playwright/Chromium isn't available in the current environment
+  (same convention `test_live_connection.py` uses for a missing live
+  LSEG session) — it is the only authority for any claim about grid
+  keyboard behavior; do not report Tab/Enter behavior as verified
+  without actually running it where Chromium is available.
+- **Save / + New / Delete**, all rendered from one flat `st.columns()`
+  row (selector, Save, "+ New", Delete, Positions) so every control
+  shares one label-row/control-row baseline:
+  - **Save** only captures the button click during `ui.controls`'s
+    render pass (`ui.strategy_set_view.render_save_button()`);
+    `process_save()` performs the actual save AFTER the grid itself
+    renders further down the same script pass, since it needs that
+    rerun's just-edited `grid_rows`. Overwrites an existing set in
+    place; opens a small name-prompt `@st.dialog` for "+ New Strategy
+    Set".
+  - **+ New** acts immediately (needs no grid content) — switches the
+    selector to the `NEW_SET_OPTION` sentinel via the same
+    pending-selection indirection Save uses.
+  - **Delete** never deletes immediately: clicking it only opens an
+    `@st.dialog` confirmation (`_delete_confirm_dialog`) naming the
+    exact set to be removed, with Cancel/Delete actions — only the
+    dialog's own Delete button calls `repo.delete()`. After a confirmed
+    delete, a sensible remaining set is auto-selected (the
+    alphabetically-first name still on disk, or a blank "+ New Strategy
+    Set" if none remain) — no scan is ever triggered by delete.
+- **Selector widget-lifecycle handling.** Streamlit forbids writing to
+  a widget's own session-state key once that widget has been
+  instantiated in the current script run. Save/+New/Delete all run
+  later in the same script pass than the selector, so none of them
+  write the selector's key directly — they call
+  `ui.strategy_set_state.set_pending_selection(name)` + `st.rerun()`;
+  on the fresh rerun, `render_selector()` applies the pending value to
+  the widget's key BEFORE `st.selectbox()` (re)creates it — the one
+  point where writing to it is legal. `tests/
+  test_ui_strategy_set_selector_lifecycle.py` covers this end to end
+  (a previously flaky Cancel-dialog assertion in this file was fixed
+  without changing the behavior it tests).
+- **Render order**: the Strategy Workspace (Strategy Set controls +
+  grid) renders ABOVE Scan Configuration in `ui.controls.
+  render_scan_setup()` — reversed from the original Module 6A order,
+  matching "what am I scanning?" before "how should it be measured?".
+  `_peek_current_market_and_interval()` reads the scan bar's widget
+  keys as they stood after the PREVIOUS rerun purely to seed a
+  brand-new blank row's default cells — a cosmetic seed only, never
+  authoritative, since every already-populated row carries its own
+  Market/Interval regardless of render order.
+- Test suite additions for this module: `test_ui_strategy_set_
+  formatting.py`, `test_ui_strategy_set_state.py`, `test_ui_
+  strategy_set_selector_lifecycle.py`, `test_ui_strategy_set_
+  multimarket_roundtrip.py`, `test_strategy_sets_multimarket_
+  pipeline.py` — see [Testing](#testing-current-state) below for the
+  full-suite total and per-file counts (re-run `pytest -q` rather than
+  trusting any number in this file).
+
+---
+
+## UI/UX Redesign — Dark Trading-Terminal Theme, Friendly Scan Errors
+
+COMPLETED AND TESTED. A presentation/UX pass across `ui/`, not a new
+numbered module — no new backend capability, no analytics/filtering/
+ranking change. Ships in the same working area as Module 7B above (some
+commits touch both).
+
+ui/
+    app.py               (dark trading-terminal spacing/density CSS,
+                           page config)
+    error_formatting.py    (classify_scan_error() -- exception ->
+                           trader-facing headline, NEW in this pass)
+    scan_view.py             (render_scan_error() -- classified headline
+                           as the primary error, technical details
+                           behind a collapsed expander)
+
+tests/
+    test_ui_error_formatting.py, test_ui_scan_error_view.py
+
+Key design points a future session needs:
+
+- **Dark, compact trading-terminal theme.** `ui/app.py` applies
+  presentation-only CSS via `st.markdown(..., unsafe_allow_html=True)`:
+  tightened `block-container` padding, reduced vertical-block gap,
+  thinner `<hr>` margins. Deliberately no selector targets
+  `st.data_editor`/`st.dataframe` internals, so the grid's rendered
+  column geometry — and the pixel-measuring keyboard-workflow
+  Playwright test — is unaffected by this pass.
+- **Friendly scan-error UX** (`ui/error_formatting.py`,
+  `ui/scan_view.py::render_scan_error()`): a failed scan's raw exception
+  is still fully caught and preserved unmodified, but the trader sees a
+  short, trader-facing headline/message FIRST
+  (`classify_scan_error(exc_type_name, exc_message)`, a case-insensitive
+  keyword match checked in order: permission/entitlement → no-data/
+  no-response → connection/session/proxy/timeout/network → a generic
+  fallback). Classification is deliberately market-agnostic — no
+  hard-coded reference to CORRA's current LSEG entitlement gap or any
+  other specific market/error string. The full technical detail
+  (exception type, message, traceback) is preserved unmodified and
+  shown only inside a collapsed "Technical details" `st.expander` —
+  never the primary, always-visible error.
+- **Strategy Workspace / Scan Configuration alignment.** Both the
+  Strategy Set control row (selector, Save, "+ New", Delete, Positions)
+  and the Scan Configuration row (Data, Contracts, History, Analytics)
+  each render all of their controls from ONE flat `st.columns()` call
+  (not columns-inside-a-column), so every control within a row shares
+  one consistent label-row/control-row baseline — the earlier
+  columns-inside-a-column layout left button rows floating a half-row
+  above their neighboring dropdowns.
+- Test suite additions: `test_ui_error_formatting.py` (keyword
+  classification/precedence; asserts NO traceback, exception type name,
+  or file path ever leaks into the presented headline/message),
+  `test_ui_scan_error_view.py` (end-to-end: a failed `run_scan()` call
+  surfaces the classified headline as the primary error and the raw
+  exception only inside the expander).
 
 ---
 
@@ -854,6 +1107,101 @@ Cloud/server deployment will be considered later and may require
 different LSEG authentication.
 
 Do not solve cloud deployment yet.
+
+---
+
+# Planned: Quanthub Secondary Market-Data Provider
+
+**STATUS: NOT IMPLEMENTED. Investigation stage only.** No Quanthub
+(QH) client code, configuration, or dependency exists anywhere in this
+repository today. Nothing in `core/`, `database/`, `strategy_engine/`,
+`template_scanner/`, or `ui/` references QH. Do not write code against
+this section without a separate, explicit implementation task — it
+documents intent and known constraints, not a build-ready spec.
+
+Below, **ESTABLISHED** means confirmed from QH's own documentation or
+from this repository's actual code. **PLANNED** means an intended
+design decision for a future implementation, not yet built.
+**NOT YET VERIFIED** means the detail is required to implement QH but
+is currently unknown and must be confirmed against the live QH API
+before implementation begins.
+
+**ESTABLISHED (from QH's own documentation):**
+
+- QH is being investigated as a **secondary** historical-data provider,
+  to cover markets/intervals LSEG cannot currently serve (the CORRA/
+  SONIA entitlement and verification gaps documented under
+  [Module 1](#module-1--lseg-data-layer) above).
+- Authentication is a two-step flow: Microsoft-credential login at
+  `/api/auth/` (issues a username/password shown only once), then
+  `POST /api/token/` with `{"username": ..., "password": ...}`
+  returning an `access_token` + `refresh_token`; subsequent requests
+  carry `Authorization: Bearer <access_token>`.
+- Known endpoints: v1 — `/api/tas/`, `/api/ohlc/`, `/api/fairvalue/`,
+  `/api/gtc/`, `/api/economies/premiums/`, rate-limited at
+  **400 requests/hour**. v2 — `/api/v2/ohlc/`, rate-limited at
+  **50 requests/minute**. `/api/v2/ohlc/` is the endpoint of interest
+  for this integration.
+
+**PLANNED (design intent, not yet built):**
+
+- **LSEG remains the PRIMARY provider, unconditionally.** QH is
+  consulted only as a fallback when LSEG cannot serve a specific
+  request — never a global provider switch, and never preferred over
+  LSEG when LSEG succeeds.
+- **Fallback happens at the individual data-request level** (per RIC +
+  interval + date-sub-range), not per market, per scan, or
+  application-wide. Two different RICs — even two legs of the same
+  strategy — should be able to resolve through different providers
+  within the same scan without either the scanner or the trader needing
+  to know.
+- QH must ultimately return the **same canonical OHLCV DataFrame**
+  (`Date`, `Open`, `High`, `Low`, `Close`, `Volume` — see
+  [Current data architecture](#lseg-data-flow--canonical-format)
+  below) already consumed by `database/service.py` and everything above
+  it. Normalization from QH's native response shape into that schema
+  happens entirely inside a QH-specific module, mirroring how
+  `core.downloader._normalize_columns()` does this for LSEG today.
+  `strategy_engine/`, `template_scanner/`, and `range_analytics/` must
+  never be made aware that QH exists (see
+  [Architectural constraints](#important-architectural-constraints)
+  below).
+- **CORRA and SONIA are the initial intended QH markets** — specifically
+  because these are the markets with a currently-known LSEG gap
+  (CORRA's entitlement error, SONIA's unverified RIC root).
+- Provider provenance (which provider actually supplied a given cached
+  bar) is intended to be retained internally for diagnostics/auditing,
+  without changing the canonical DataFrame contract the rest of the
+  application consumes.
+
+**NOT YET VERIFIED (must be confirmed against the live QH API before
+implementation):**
+
+- The exact `/api/v2/ohlc/` request contract: HTTP method, required/
+  optional parameters, and whether it takes RICs, exchange symbols, or
+  QH-specific instrument identifiers for CORRA and SONIA specifically.
+- The exact response schema: timestamp field/timezone, field names for
+  O/H/L/C/volume, and how missing data or an empty result are
+  represented.
+- Whether `/api/v2/ohlc/` supports `DAILY`/`4H`/`1H` natively, or only
+  some subset — and if `4H` isn't native, whether it can be synthesized
+  from QH `1H` data the same way `core.downloader._resample_to_4h()`
+  synthesizes it from LSEG hourly data today (see
+  [Current data architecture](#lseg-data-flow--canonical-format)
+  below).
+- Maximum bars/date-range per request, and whether pagination exists —
+  this determines whether a large historical backfill (e.g. a multi-
+  year, multi-contract 1H series) is feasible within the documented
+  50 requests/minute limit, or requires a materially different
+  chunking/throttling strategy than LSEG's current per-interval
+  `MAX_LOOKBACK_DAYS` chunking (`core/config.py`).
+- Access-token/refresh-token lifetimes and the refresh mechanism.
+- Exact error signaling for an invalid instrument, no data, an expired
+  token, and a rate-limit response (status codes, headers, body shape).
+
+Do not implement any QH client, symbol-mapping layer, or fallback
+routing based on assumptions filling these gaps. Confirm against the
+live API first.
 
 ---
 
@@ -892,6 +1240,127 @@ or SQLite.
 
 ---
 
+# LSEG Data Flow & Canonical Format
+
+Recap of the current, actual data-access path (verified against source
+— see Modules 1–3 above for full detail):
+
+- **LSEG is the only market-data provider implemented today.** Quanthub
+  is investigation-stage only — see
+  [Planned: Quanthub Secondary Market-Data Provider](#planned-quanthub-secondary-market-data-provider)
+  above.
+- `database.get_history(ric, interval, start, end)` (`database/
+  service.py`) is the single, central historical-data access path.
+  Every consumer above the data layer — `strategy_engine.pricing`,
+  `template_scanner`, and (indirectly, through those) `ui/` — calls
+  this function and only this function. Nothing above `database/`
+  calls `core.downloader` or `lseg.data` directly, enforced by a
+  structural module-identity test in `tests/test_strategy_pricing.py`,
+  not just convention.
+- The cache is logically keyed by **RIC + interval + datetime**:
+  `database/models.py`'s `PriceBar` has a database-level
+  `UniqueConstraint(ric, interval, datetime)`, and `SyncRange` (which
+  tracks confirmed-downloaded coverage windows) is indexed on
+  `(ric, interval)`. Two different RICs, or the same RIC at two
+  different intervals, are fully independent cache entries — verified
+  end-to-end in `tests/test_multimarket_cache_key_independence.py`.
+- **`4H` is not a native LSEG interval — it is synthesized from `HOURLY`
+  bars.** `core.config.LSEG_NATIVE_INTERVAL[BarInterval.FOUR_HOUR] =
+  "hourly"`; `core.downloader.download_history()` fetches hourly bars
+  and resamples them via `_resample_to_4h()` (Open=first, High=max,
+  Low=min, Close=last, Volume=sum). Every module above the downloader
+  treats `4H` as an ordinary first-class interval; the synthesis detail
+  is contained entirely inside `core/downloader.py`.
+- The **canonical OHLCV DataFrame format**, returned by both
+  `core.downloader.download_history()` and `database.get_history()`:
+  columns exactly `[Date, Open, High, Low, Close, Volume]`, `Date` as
+  `datetime64[ns]`, OHLCV as plain `float64` (never a pandas nullable
+  extension dtype — missing values are always `np.nan`), sorted
+  ascending by `Date`. An empty result is an empty DataFrame with the
+  correct columns, never an exception; a confirmed "no market data for
+  this RIC at all" condition is the one typed exception,
+  `core.downloader.MarketDataUnavailableError`.
+
+---
+
+# Important Architectural Constraints
+
+Load-bearing rules, not preferences — several are enforced by tests,
+not just convention. See [Important Development Rules](#important-development-rules)
+below for the general project-wide rules; the ones here are specific to
+the provider/data-layer boundary and matter most for any future
+Quanthub work.
+
+- **`strategy_engine/`, `template_scanner/`, and `range_analytics/`
+  must remain provider-agnostic and UI-agnostic.** None of them may
+  import `core.downloader`, `lseg.data`, or (in the future) any
+  Quanthub module, and none of them may import `streamlit` or anything
+  under `ui/`. `strategy_engine.pricing` retrieves market data
+  exclusively through `database.get_history`; `range_analytics` never
+  retrieves market data at all — it operates purely on an
+  already-built `StrategyHistory`. This boundary is enforced
+  structurally in `tests/test_strategy_pricing.py` (a module-namespace
+  identity check, not a brittle string match), not merely documented.
+- **Do not duplicate cache-writing logic.** `database/cache.py` is the
+  only module that writes `PriceBar`/`SyncRange` rows
+  (`insert_bars()`/`record_sync_range()`), both going through the
+  single dialect-aware upsert helper `cache._upsert_statement()`. Any
+  future provider (Quanthub included) must produce the same canonical
+  DataFrame and flow through the existing `database/service.py` write
+  path — never a second, provider-specific write path into
+  `price_bars`/`sync_ranges`.
+- **Preserve existing data-integrity behaviour.** The pipeline-wide
+  invariant documented under
+  [Data-Integrity Pass](#data-integrity-pass--trading-day--valid-observation-handling)
+  above — a missing or NaN-priced observation is always *absent*, never
+  a zero, never forward-filled or interpolated — applies to any future
+  data source exactly as it applies to LSEG today. A future provider
+  must not weaken this by returning a filled/interpolated bar for a
+  non-trading day.
+- **Keep secrets and machine-specific configuration out of Git.**
+  `core.config` reads all environment-specific settings (LSEG session
+  type/app key, SQLite path, Strategy Set storage path) from
+  environment variables with safe defaults, never hard-coded — see
+  rules 6/7 under [Important Development Rules](#important-development-rules).
+  Any future Quanthub credentials (username/password, tokens) must
+  follow the same pattern and must never be committed, hard-coded, or
+  placed in a test fixture that could reach a real endpoint.
+
+---
+
+# Testing (Current State)
+
+```
+pytest -q
+```
+
+Current suite, actually run against this repository (not a figure
+carried forward from an earlier pass — see rule 11 under
+[Important Development Rules](#important-development-rules); re-run the
+command above for the up-to-date count rather than trusting this one):
+**745 passed, 1 skipped**. One pre-existing `DeprecationWarning`
+(`database/service.py`'s module docstring has an unescaped `\-`) —
+unrelated to any change documented here.
+
+- **`tests/test_ui_keyboard_browser.py`** is the real-browser Playwright
+  test verifying the Strategy Templates grid's Tab/Enter keyboard
+  workflow against a live `streamlit run` process — the only test layer
+  that can drive `st.data_editor`'s canvas-rendered cells at all (see
+  [Module 7B](#module-7b--strategy-set-ui-integration--multi-market-grid-fix)
+  above). This is the one skipped test in the count above — skipped,
+  not failed, because Playwright/Chromium isn't installed in every
+  environment.
+- **`tests/test_live_connection.py`** is a manual smoke test, not part
+  of the automated pytest run — it requires a real, authenticated LSEG
+  Workspace desktop session; run it directly on a machine with
+  Workspace open.
+- Every other test in the suite runs fully mocked — LSEG mocked at the
+  `core.downloader.download_history` boundary or below, no live session
+  or network access required — including every `ui/`, `strategy_sets/`,
+  and `template_scanner/` test.
+
+---
+
 # Important Development Rules
 
 1. Do not unnecessarily rewrite working Module 1 code.
@@ -925,23 +1394,40 @@ unavailable-market-data hardening and the canonical metric-resolution
 fix) — STATUS: COMPLETE
 Module 6A — Streamlit range-bound scanner UI — STATUS: COMPLETE
 Module 6B — Selected-strategy history chart — STATUS: COMPLETE
+Module 4A Addendum — Configurable robust-range percentiles, Movement
+(Tradability Analytics), oscillation tradability — STATUS: COMPLETE
 Module 7A — Strategy Set engine (domain model, JSON persistence,
-expansion to StrategyInstance[]; no scanner/UI integration) —
+expansion to StrategyInstance[]) — STATUS: COMPLETE
+Module 7B — Strategy Set UI integration into the Strategy Templates
+grid (per-row market/interval, Automatic Universe, Save/+New/Delete,
+Tab/Enter keyboard workflow) — STATUS: COMPLETE
+UI/UX Redesign — Dark trading-terminal theme, friendly scan-error
+presentation, Strategy Workspace/Scan Configuration alignment —
 STATUS: COMPLETE
+Quanthub (QH) secondary market-data provider — STATUS: NOT STARTED,
+investigation stage only — see "Planned: Quanthub Secondary
+Market-Data Provider" above.
 
-Current suite: 399 tests passing (`pytest -q`; re-run for the
-up-to-date count, do not trust this number blindly — see README.md's
-Testing section).
+Current suite: 745 passed, 1 skipped (`pytest -q`, actually run against
+this repository — see [Testing](#testing-current-state) above; re-run
+the command yourself for the up-to-date count, do not trust this number
+blindly).
 
 Deferred / not yet implemented (do not assume any of these exist merely
 because they're listed here as being considered):
 
-- Configurable robust-range percentile bounds (today's 5th/95th
-  percentile bounds in `range_analytics/location.py` are hard-coded).
-- Z-score / current-dislocation analytics distinct from the existing
-  `RangeAnalytics.z_score` field — exact statistical definition not
-  approved.
-- Intermarket strategies (legs spanning more than one market).
+- Quanthub (QH) as a secondary/fallback market-data provider — see
+  "Planned: Quanthub Secondary Market-Data Provider" above. Investigation
+  stage only; no code exists.
+- A separate, still-unapproved future "robust Z-score to distinguish
+  range-boundedness quality from current dislocation" — a materially
+  different statistic from the existing `RangeAnalytics.z_score` field,
+  which IS implemented (see the Module 4A Addendum above). Do not
+  confuse the two.
+- True intermarket strategies — one *strategy's* legs spanning more
+  than one market (`StrategyDefinition.market_key` remains singular by
+  design). Not the same thing as a Strategy *Set* mixing markets across
+  its separate entries, which Module 7B already supports.
 - An explicit "Real Contract" scanning mode (pick one specific set of
   dated contracts rather than a rolled template) — the backend
   primitives it would need already exist (`StrategyInstance`,
@@ -960,9 +1446,14 @@ because they're listed here as being considered):
 - Saved scans / export workflow (distinct from Module 7A's Strategy
   Sets — a Strategy Set is a named collection of strategy definitions
   only; it does not capture a price window, lookbacks, or results).
-- Wiring Strategy Set / `expand_strategy_set()` output into a running
-  scan, a Strategy Set editor UI, and any Streamlit surface for Module
-  7A — the scanner remains unaware `strategy_sets` exists.
+- Wiring `StrategySet`/`expand_strategy_set()` output directly into
+  `run_scan_on_instances()` — Module 7B shipped a Strategy Set editor
+  UI and a working scanner path, but via a different, simpler route
+  (grid rows → `run_scan()`, see [Module 7B](#module-7b--strategy-set-ui-integration--multi-market-grid-fix)
+  above), not by wiring `expand_strategy_set()`'s output into
+  `run_scan_on_instances()`. Both functions still exist and are still
+  tested, but the UI never calls either of them — `template_scanner/`
+  remains unaware `strategy_sets` exists.
 - Cloud/server deployment and any non-desktop LSEG authentication.
 - EURIBOR market (`root="FEI"`, `ric_year_digits=1`, QUARTERLY) — RIC
   convention confirmed by the trader, but `MarketDefinition.exchange`
