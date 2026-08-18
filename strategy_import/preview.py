@@ -21,15 +21,33 @@ from any individual row:
       decision, this is NEVER auto-sanitized; the sheet is reported as
       an error telling the user to rename the worksheet, exactly as
       given
-    - two ready rows in the same sheet share a Label -- StrategySet
-      itself requires unique entry names (strategy_sets/model.py); like
-      the sheet-name case, this is reported for the user to fix in the
-      source file rather than silently renamed
 A sheet_error means that sheet cannot be imported at all this round,
 even if some of its rows individually validated -- but its ready/
 unavailable/invalid rows are still fully populated and shown, so
 nothing about it looks silently dropped; only the ACT of importing it
 is blocked until the user fixes the workbook and re-uploads.
+
+Strategy identity is the StrategyDefinition, never the Label (real-
+workbook finding): a trader's Label is a human-facing description, not
+an identifier -- the same Label ("1Yr Fly") legitimately recurs across
+different markets, and even within one market across genuinely
+different position structures. Two ready rows are the SAME strategy
+iff their resulting StrategyDefinitions are equal (market_key, offsets,
+weights -- StrategyDefinition's own dataclass equality, reused
+directly rather than re-derived; offsets/weights are already the
+dense-weights-normalized form from template_from_dense_weights(), so a
+blank position cell and an explicit 0 already produce identical
+StrategyDefinitions before this comparison ever runs). _dedupe_ready()
+below collapses true duplicates to one entry, silently -- exactly
+template_scanner.universe.dedupe_candidates()'s own "same shape, no
+error" precedent, not a validation failure. Rows that survive dedup but
+still share a Label (different structures, same human-facing name) are
+disambiguated with the same "Name", "Name 2", ... suffixing
+strategy_import.naming.unique_strategy_set_name() already uses for
+Strategy Set names -- StrategySetEntry.name uniqueness within a
+StrategySet is an existing, unmodified strategy_sets/model.py
+invariant this module must still satisfy, it just no longer conflates
+"same Label" with "same strategy" while doing so.
 
 Duplicate Strategy Set names: `name_exists` is called once per sheet
 with at least one ready row (read-only -- see
@@ -44,7 +62,7 @@ after.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
 from core.config import BarInterval
@@ -140,6 +158,45 @@ def _classify_rows(
     return ready, unavailable, invalid
 
 
+def _dedupe_ready(ready: list[ReadyRow]) -> list[ReadyRow]:
+    """Collapse rows whose StrategyDefinition is equal (same market,
+    same offsets/weights -- see the module docstring) to a single
+    ReadyRow, keeping the first occurrence's row number/label. Label is
+    never part of the comparison. Silent, not an error -- matching
+    template_scanner.universe.dedupe_candidates()'s own precedent for a
+    genuine duplicate shape.
+    """
+    seen: dict = {}
+    deduped: list[ReadyRow] = []
+    for row in ready:
+        definition = row.entry.definition
+        if definition in seen:
+            continue
+        seen[definition] = row
+        deduped.append(row)
+    return deduped
+
+
+def _disambiguate_labels(ready: list[ReadyRow]) -> list[ReadyRow]:
+    """After dedup, two SURVIVING rows can still share a Label (the same
+    human-facing name legitimately describing two different structures,
+    e.g. the same Label in two markets). StrategySetEntry.name must
+    still be unique within a StrategySet (strategy_sets/model.py,
+    unmodified) -- reuses the exact "Name", "Name 2", ... suffixing
+    strategy_import.naming.unique_strategy_set_name() already applies
+    to Strategy Set names, applied here per-entry-name instead.
+    """
+    used: set[str] = set()
+    disambiguated: list[ReadyRow] = []
+    for row in ready:
+        name = unique_strategy_set_name(row.entry.name, used.__contains__)
+        used.add(name)
+        if name != row.entry.name:
+            row = ReadyRow(row_number=row.row_number, entry=replace(row.entry, name=name))
+        disambiguated.append(row)
+    return disambiguated
+
+
 def build_preview(
     sheets: Sequence[SheetFrame],
     name_exists: Callable[[str], bool],
@@ -165,6 +222,7 @@ def build_preview(
             continue
 
         ready, unavailable, invalid = _classify_rows(sheet, interval)
+        ready = _disambiguate_labels(_dedupe_ready(ready))
 
         import_name: str | None = None
         sheet_error: str | None = None
@@ -174,13 +232,12 @@ def build_preview(
                 StrategySet(name=candidate_name, entries=tuple(r.entry for r in ready))
                 import_name = candidate_name
             except ValueError as exc:
-                # Either the sheet/file name itself fails StrategySet's
-                # name pattern, or two ready rows share a Label --
-                # StrategySet's own validation is the single source of
-                # truth for both; never duplicated or re-derived here.
-                # Per product decision: never auto-sanitized/auto-
-                # renamed, always surfaced for the user to fix at the
-                # source.
+                # The sheet/file name itself fails StrategySet's own
+                # name pattern -- the only remaining way this can raise,
+                # now that _dedupe_ready()/_disambiguate_labels() above
+                # already guarantee unique entry names. Per product
+                # decision: never auto-sanitized, always surfaced for
+                # the user to fix at the source.
                 sheet_error = str(exc)
 
         candidates.append(

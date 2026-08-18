@@ -4,9 +4,10 @@ tests/test_strategy_import_preview.py
 strategy_import.preview.build_preview(): grouping validated rows into
 per-sheet ImportCandidates and a whole-upload ImportPreview -- totals,
 the ER-style unavailable-by-market breakdown, de-duplicated import
-names, and sheet-level blocking errors (bad header, invalid sheet
-name, duplicate labels) that never silently swallow a sheet's
-individually-classified rows.
+names, strategy-identity deduplication (StrategyDefinition, never the
+Label), and sheet-level blocking errors (bad header, invalid sheet
+name) that never silently swallow a sheet's individually-classified
+rows.
 """
 
 from __future__ import annotations
@@ -126,16 +127,72 @@ def test_invalid_sheet_name_is_a_sheet_error_not_auto_sanitized():
     assert candidate.sheet_name == "EZ8 & Friends"  # original name preserved verbatim
 
 
-def test_duplicate_labels_within_a_sheet_are_a_sheet_error():
+def test_same_label_different_markets_are_both_accepted_and_disambiguated():
+    # Real-workbook finding: a Label is not an identifier -- "1Yr Fly"
+    # legitimately recurs across markets. Both must import; since the
+    # Label collides, the surviving entries get disambiguated names.
     sheet = _sheet(
         "Set", [_row("SRA", "Same Name", 1, -1, 0), _row("SON", "Same Name", 1, -2, 1)]
     )
     preview = build_preview([sheet], _never_exists)
     candidate = preview.candidates[0]
-    assert candidate.importable is False
-    assert candidate.sheet_error is not None
-    # The rows are still individually classified and visible, even
-    # though the sheet as a whole can't be imported this round.
+
+    assert candidate.importable is True
+    assert candidate.sheet_error is None
+    assert len(candidate.ready) == 2
+    names = [row.entry.name for row in candidate.ready]
+    assert names == ["Same Name", "Same Name 2"]
+    assert candidate.ready[0].entry.definition.market_key == "SOFR"
+    assert candidate.ready[1].entry.definition.market_key == "SONIA"
+
+
+def test_same_label_same_market_different_structure_are_both_accepted():
+    sheet = _sheet(
+        "Set", [_row("SRA", "Same Name", 1, -1, 0), _row("SRA", "Same Name", 1, -2, 1)]
+    )
+    preview = build_preview([sheet], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert candidate.importable is True
+    assert len(candidate.ready) == 2
+    assert [row.entry.name for row in candidate.ready] == ["Same Name", "Same Name 2"]
+
+
+def test_same_label_same_market_identical_structure_deduplicates_to_one():
+    sheet = _sheet(
+        "Set", [_row("SRA", "Same Name", 1, -1, 0), _row("SRA", "Same Name", 1, -1, 0)]
+    )
+    preview = build_preview([sheet], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert len(candidate.ready) == 1
+    assert candidate.ready[0].entry.name == "Same Name"
+
+
+def test_blank_and_zero_position_cells_deduplicate_as_the_same_strategy():
+    # SRA | 1Yr Fly | 1 | -2 | blank | 1  ==  SRA | 1Yr Fly | 1 | -2 | 0 | 1
+    blank_row = {"Market": "SRA", "Label": "1Yr Fly", "1": 1, "2": -2, "3": None, "4": 1}
+    zero_row = {"Market": "SRA", "Label": "1Yr Fly", "1": 1, "2": -2, "3": 0, "4": 1}
+    sheet = _sheet("Set", [blank_row, zero_row], position_columns=("1", "2", "3", "4"))
+
+    preview = build_preview([sheet], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert len(candidate.ready) == 1
+    assert candidate.ready[0].entry.definition.offsets == (0, 1, 3)
+    assert candidate.ready[0].entry.definition.weights == (1.0, -2.0, 1.0)
+
+
+def test_different_weight_at_same_offset_is_not_deduplicated():
+    sheet = _sheet(
+        "Set", [_row("SRA", "Fly", 1, -2, 1), _row("SRA", "Fly", 2, -4, 2)]
+    )
+    preview = build_preview([sheet], _never_exists)
+    candidate = preview.candidates[0]
+
+    # (1, -2, 1) and (2, -4, 2) are the same shape but different
+    # economic exposure -- NOT duplicates, matching StrategyDefinition/
+    # dedupe_candidates()'s own project-wide convention.
     assert len(candidate.ready) == 2
 
 
