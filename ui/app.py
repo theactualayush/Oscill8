@@ -32,10 +32,12 @@ if _REPO_ROOT not in sys.path:
 import streamlit as st
 
 from ui import state
+from ui import strategy_import_state as import_state
 from ui import strategy_set_state as ss_state
 from ui.controls import render_scan_setup
 from ui.results_view import render_results
 from ui.scan_view import handle_run_scan, render_scan_error
+from ui.strategy_set_scan_view import handle_run_strategy_set_scan
 
 st.set_page_config(page_title="Oscill8 Scanner", layout="wide")
 
@@ -57,11 +59,15 @@ st.markdown(
 
 state.init_state()
 ss_state.init_state()
+import_state.init_state()
 
 setup = render_scan_setup()
 
 if setup.run_clicked:
     handle_run_scan(setup)
+
+if setup.strategy_set_scan_requested:
+    handle_run_strategy_set_scan(setup)
 
 render_scan_error()
 

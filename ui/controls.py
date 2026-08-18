@@ -89,6 +89,8 @@ from core.config import MARKETS, BarInterval
 from strategy_sets.repository import StrategySetRepository
 
 from ui import state
+from ui import strategy_import_view
+from ui import strategy_set_scan_view
 from ui import strategy_set_state as ss_state
 from ui import strategy_set_view
 from ui.formatting import (
@@ -144,6 +146,12 @@ class ScanSetup:
     grid_rows: list[dict]
     position_columns: tuple[str, ...]
     run_clicked: bool
+    # Strategy Set Scan (additive, separate from the grid's own Run
+    # Scan above): captured in _render_strategy_templates(), acted on
+    # by ui.strategy_set_scan_view.handle_run_strategy_set_scan() once
+    # this ScanSetup is fully built -- see that module's docstring.
+    strategy_set_scan_requested: bool
+    strategy_set_scan_interval: BarInterval | None
 
 
 def _clamp_session_value(key: str, valid_options: tuple, fallback) -> None:
@@ -204,7 +212,9 @@ def render_scan_setup() -> ScanSetup:
         st.subheader("Oscill8 — Range-Bound Scanner")
 
         with st.container(border=True):
-            grid_rows, position_columns = _render_strategy_templates()
+            grid_rows, position_columns, ss_scan_requested, ss_scan_interval = (
+                _render_strategy_templates()
+            )
 
         with st.container(border=True):
             setup_values = _render_scan_bar()
@@ -212,6 +222,8 @@ def render_scan_setup() -> ScanSetup:
     return ScanSetup(
         grid_rows=grid_rows,
         position_columns=position_columns,
+        strategy_set_scan_requested=ss_scan_requested,
+        strategy_set_scan_interval=ss_scan_interval,
         **setup_values,
     )
 
@@ -332,7 +344,7 @@ def _render_scan_bar() -> dict:
     }
 
 
-def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
+def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...], bool, BarInterval | None]:
     repo = StrategySetRepository()
     default_market_key, default_interval = _peek_current_market_and_interval()
 
@@ -345,8 +357,8 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     # the selector's "Strategy Set" label, Positions' own "Positions"
     # label, and the small captions above Save/+ New/Delete all render
     # at the same height, and their boxes below therefore line up too.
-    sel_col, save_col, new_col, delete_col, positions_col = st.columns(
-        [3.4, 1, 1, 1, 1.2], vertical_alignment="bottom"
+    sel_col, save_col, new_col, delete_col, import_col, positions_col = st.columns(
+        [2.6, 0.9, 0.9, 0.9, 1.0, 1.1], vertical_alignment="bottom"
     )
     with sel_col:
         selected_name = strategy_set_view.render_selector(repo)
@@ -362,6 +374,9 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     with delete_col:
         st.caption("Delete")
         strategy_set_view.render_delete_control(repo, selected_name)
+    with import_col:
+        st.caption("Import")
+        strategy_import_view.render_import_button()
     with positions_col:
         n_positions = st.number_input(
             "Positions",
@@ -372,6 +387,21 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
             key="oscill8_positions",
             help="How many curve positions to show. Changing this resets the grid below.",
         )
+
+    # Import Strategies (additive, separate from every other control in
+    # this row): renders its own panel (upload/preview/Import All) only
+    # when opened -- see ui.strategy_import_view.
+    strategy_import_view.render_import_panel(repo)
+
+    # Strategy Set Scan (additive, separate workflow from the grid's own
+    # Run Scan below): only rendered once a saved set is actually
+    # selected -- there is nothing to run otherwise. Captured here,
+    # acted on later once ScanSetup's contract/price/lookback/percentile
+    # values exist -- see ui.strategy_set_scan_view's module docstring.
+    ss_scan_requested = False
+    ss_scan_interval: BarInterval | None = None
+    if selected_name is not None:
+        ss_scan_requested, ss_scan_interval = strategy_set_scan_view.render_controls(selected_name)
 
     message = ss_state.pop_message()
     if message is not None:
@@ -390,7 +420,7 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
         default_market_key, default_interval,
     )
 
-    return grid_rows, position_columns
+    return grid_rows, position_columns, ss_scan_requested, ss_scan_interval
 
 
 def _render_strategy_grid(
