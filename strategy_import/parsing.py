@@ -84,9 +84,16 @@ def _is_blank(value: object) -> bool:
     return str(value).strip() == ""
 
 
-def _find_column(columns: list[str], target: str) -> str | None:
-    """Case-insensitive lookup of `target` among `columns`, returning the
-    column's ORIGINAL name (preserving the sheet's own casing) or None."""
+def _find_column(columns: list, target: str):
+    """Case-insensitive lookup of `target` among `columns` -- the
+    DataFrame's own, UN-stringified column labels (which pandas may
+    have typed as `str`, `int`, or `float` depending on how the source
+    cell was formatted -- e.g. an Excel header cell typed as a number
+    rather than text). Returns the column's ORIGINAL object (not a
+    stringified copy), so it can be used directly for Series/DataFrame
+    lookups afterward -- see _frame_to_sheet()'s module-docstring note
+    on why this matters. Returns None if not found.
+    """
     for col in columns:
         if str(col).strip().lower() == target.lower():
             return col
@@ -94,9 +101,22 @@ def _find_column(columns: list[str], target: str) -> str | None:
 
 
 def _frame_to_sheet(name: str, df: pd.DataFrame) -> SheetFrame:
-    columns = [str(c) for c in df.columns]
-    market_col = _find_column(columns, MARKET_COLUMN)
-    label_col = _find_column(columns, LABEL_COLUMN)
+    # Real-workbook regression: a trader-typed Excel header cell for a
+    # position column ("1", "2", ...) is very often stored as a NUMBER,
+    # not text -- pandas then reads df.columns as int/float for those
+    # columns, not str. Every row lookup below MUST use these ORIGINAL,
+    # un-stringified column objects (df.columns as pandas actually
+    # produced them) -- a `series.get("1")` against a Series indexed by
+    # the integer `1` returns None, silently, which previously made
+    # _is_blank() treat every real data row as blank and drop it before
+    # it ever reached validation.py. Only the OUTPUT representation
+    # (SheetFrame.position_columns / each row dict's keys) is
+    # stringified, once, at the very end -- so every downstream caller
+    # still sees a stable "1", "2", ... str key regardless of how the
+    # source file happened to type its header cells.
+    original_columns = list(df.columns)
+    market_col = _find_column(original_columns, MARKET_COLUMN)
+    label_col = _find_column(original_columns, LABEL_COLUMN)
 
     if market_col is None or label_col is None:
         missing = [
@@ -111,12 +131,13 @@ def _frame_to_sheet(name: str, df: pd.DataFrame) -> SheetFrame:
             parse_error=f"Missing required column(s): {', '.join(missing)}",
         )
 
-    position_columns = tuple(c for c in columns if c not in (market_col, label_col))
+    original_position_columns = [c for c in original_columns if c not in (market_col, label_col)]
+    position_columns = tuple(str(c) for c in original_position_columns)
 
     rows: list[dict] = []
     row_numbers: list[int] = []
     for offset, (_, series) in enumerate(df.iterrows()):
-        position_values = [series.get(col) for col in position_columns]
+        position_values = [series.get(col) for col in original_position_columns]
         if all(_is_blank(v) for v in position_values):
             continue  # a genuinely blank row -- silently skipped, not an error
 
@@ -124,7 +145,10 @@ def _frame_to_sheet(name: str, df: pd.DataFrame) -> SheetFrame:
             MARKET_COLUMN: series.get(market_col),
             LABEL_COLUMN: series.get(label_col),
         }
-        row.update({col: series.get(col) for col in position_columns})
+        row.update({
+            str_col: series.get(orig_col)
+            for str_col, orig_col in zip(position_columns, original_position_columns)
+        })
         rows.append(row)
         row_numbers.append(offset + 2)  # +1 for the header row, +1 for 1-based numbering
 

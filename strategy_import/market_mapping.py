@@ -2,9 +2,9 @@
 market_mapping.py
 
 Translates the short market codes traders use in their strategy
-workbooks/CSVs (RIC-root-style codes: "SRA", "SON", "CRA", "ER") into
-Oscill8's internal core.config.MARKETS registry keys ("SOFR", "SONIA",
-"CORRA", ...).
+workbooks/CSVs (RIC-root-style codes: "SRA", "SON", "CRA", "ER", "YBA",
+"FSR") into Oscill8's internal core.config.MARKETS registry keys
+("SOFR", "SONIA", "CORRA", ...).
 
 This mapping is deliberately NOT the same thing as core.config.MARKETS
 itself, and NOT the same thing as a MarketDefinition.ric_root lookup:
@@ -56,9 +56,19 @@ SUPPORTED_MARKET_CODES: dict[str, str] = {
 # reason shown to the user -- never a guessed RIC root or bp_per_point,
 # per core/config.py's explicit "must not be invented" note for
 # EURIBOR. Adding a market here does NOT make it importable; it only
-# changes how clearly its absence is reported.
+# changes how clearly its absence is reported (recognized-but-
+# unavailable, not an unrecognized/invalid code).
+#
+# ER/YBA/FSR RIC roots are confirmed (FEI / YBA / SARO3 respectively --
+# see the trader-confirmed mapping this table was built from), but
+# their exchange/bp_per_point/contract-rule metadata is deliberately
+# NOT supplied here or in core.config.MARKETS: adding a real
+# MarketDefinition (and the data-provider support it would need) is a
+# separate, not-yet-approved feature, out of scope for the importer.
 UNAVAILABLE_MARKET_CODES: dict[str, str] = {
     "ER": "Euribor is not currently configured in Oscill8.",
+    "YBA": "Australian exchange market data is not currently configured in Oscill8.",
+    "FSR": "SARON 3M futures data is not currently configured in Oscill8.",
 }
 
 

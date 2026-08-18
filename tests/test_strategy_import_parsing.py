@@ -150,3 +150,75 @@ def test_workbook_bad_sheet_reported_independently_of_good_sheet():
 def test_unreadable_workbook_raises_value_error():
     with pytest.raises(ValueError):
         parse_workbook(b"not an xlsx file at all")
+
+
+# ---------------------------------------------------------------------
+# Real-workbook regression: Excel header cells for position columns are
+# very often typed as NUMBERS, not text (this is exactly how a trader
+# naturally types "1", "2", "3" into a header row) -- pandas then reads
+# df.columns as int for those columns, not str. Every fixture above
+# uses string dict keys ("1", "2", ...), which pandas keeps as str
+# columns from construction, so none of them exercise this path. These
+# fixtures instead use bare int dict keys, which round-trip through
+# .to_excel()/pd.read_excel() as genuinely int-typed columns -- exactly
+# reproducing the real RBS_Template.xlsx's structure that surfaced this
+# bug (every row in every sheet was silently treated as blank and
+# dropped before ever reaching validation.py).
+# ---------------------------------------------------------------------
+
+def test_workbook_integer_typed_position_headers_parse_correctly():
+    sheet = pd.DataFrame({"Market": ["SRA"], "Label": ["3M Spread"], 1: [1], 2: [-1], 3: [0]})
+    frames = parse_workbook(_xlsx_bytes({"Sheet1": sheet}))
+    frame = frames[0]
+
+    assert frame.parse_error is None
+    assert len(frame.rows) == 1  # previously 0 -- every row was misread as blank
+    assert frame.rows[0]["Market"] == "SRA"
+    assert frame.rows[0]["Label"] == "3M Spread"
+    assert frame.rows[0]["1"] == 1
+    assert frame.rows[0]["2"] == -1
+
+
+def test_workbook_integer_headers_yield_string_position_columns():
+    # The OUTPUT representation is always str, regardless of how the
+    # source file typed its header cells -- callers (validation.py,
+    # ui.*) never need to know or care.
+    sheet = pd.DataFrame({"Market": ["SRA"], "Label": ["A"], 1: [1], 2: [-1]})
+    frame = parse_workbook(_xlsx_bytes({"Sheet1": sheet}))[0]
+
+    assert frame.position_columns == ("1", "2")
+    assert all(isinstance(c, str) for c in frame.position_columns)
+    assert all(isinstance(k, str) for k in frame.rows[0].keys())
+
+
+def test_integer_and_string_header_xlsx_produce_equivalent_sheetframes():
+    int_headed = pd.DataFrame(
+        {"Market": ["SRA", "SON"], "Label": ["3M Spread", "6M Fly"], 1: [1, 1], 2: [-1, -2], 3: [0, 1]}
+    )
+    str_headed = pd.DataFrame(
+        {
+            "Market": ["SRA", "SON"], "Label": ["3M Spread", "6M Fly"],
+            "1": [1, 1], "2": [-1, -2], "3": [0, 1],
+        }
+    )
+
+    int_frame = parse_workbook(_xlsx_bytes({"Sheet1": int_headed}))[0]
+    str_frame = parse_workbook(_xlsx_bytes({"Sheet1": str_headed}))[0]
+
+    assert int_frame.position_columns == str_frame.position_columns
+    assert int_frame.rows == str_frame.rows
+    assert int_frame.row_numbers == str_frame.row_numbers
+
+
+def test_workbook_integer_headers_blank_rows_still_dropped():
+    # The blank-row filter itself must still work correctly once real
+    # (non-blank) rows are no longer misclassified as blank.
+    sheet = pd.DataFrame(
+        {
+            "Market": ["SRA", None], "Label": ["3M Spread", None],
+            1: [1, None], 2: [-1, None], 3: [0, None],
+        }
+    )
+    frame = parse_workbook(_xlsx_bytes({"Sheet1": sheet}))[0]
+    assert len(frame.rows) == 1
+    assert frame.rows[0]["Label"] == "3M Spread"

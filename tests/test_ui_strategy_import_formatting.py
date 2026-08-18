@@ -91,6 +91,44 @@ def test_breakdown_empty_preview_is_empty():
     assert market_breakdown_lines(ImportPreview(candidates=())) == []
 
 
+def test_breakdown_shows_yba_and_fsr_as_unavailable_with_distinct_reasons():
+    candidate = _candidate(
+        "Set",
+        unavailable=[
+            UnavailableRow(38, "3M Spread", "YBA", "Australian exchange market data is not currently configured in Oscill8."),
+            UnavailableRow(43, "3M Spread", "FSR", "SARON 3M futures data is not currently configured in Oscill8."),
+        ],
+    )
+    preview = ImportPreview(candidates=(candidate,))
+
+    lines = market_breakdown_lines(preview)
+
+    assert "FSR ⚠ SARON 3M futures data is not currently configured in Oscill8." in lines
+    assert "YBA ⚠ Australian exchange market data is not currently configured in Oscill8." in lines
+
+
+def test_breakdown_with_er_yba_fsr_all_present_shows_each_distinctly():
+    candidate = _candidate(
+        "Set",
+        ready=[_ready("SOFR", "A"), _ready("SONIA", "B"), _ready("CORRA", "C")],
+        unavailable=[
+            UnavailableRow(5, "D", "ER", "Euribor is not currently configured in Oscill8."),
+            UnavailableRow(38, "E", "YBA", "Australian exchange market data is not currently configured in Oscill8."),
+            UnavailableRow(43, "F", "FSR", "SARON 3M futures data is not currently configured in Oscill8."),
+        ],
+    )
+    preview = ImportPreview(candidates=(candidate,))
+
+    lines = market_breakdown_lines(preview)
+
+    assert lines == [
+        "CRA ✓", "SON ✓", "SRA ✓",
+        "ER ⚠ Euribor is not currently configured in Oscill8.",
+        "FSR ⚠ SARON 3M futures data is not currently configured in Oscill8.",
+        "YBA ⚠ Australian exchange market data is not currently configured in Oscill8.",
+    ]
+
+
 # ---------------------------------------------------------------------
 # candidate_summary_line
 # ---------------------------------------------------------------------

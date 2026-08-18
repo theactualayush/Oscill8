@@ -13,8 +13,12 @@ unit coverage of the same rule.
 
 from __future__ import annotations
 
+from io import BytesIO
+
+import pandas as pd
+
 from strategy_import.preview import build_preview
-from strategy_import.parsing import parse_csv
+from strategy_import.parsing import parse_csv, parse_workbook
 
 
 def _never_exists(name: str) -> bool:
@@ -24,6 +28,13 @@ def _never_exists(name: str) -> bool:
 def _preview_for(csv_text: str, filename: str = "strategies.csv"):
     sheet = parse_csv(csv_text.encode("utf-8"), filename)
     return build_preview([sheet], _never_exists)
+
+
+def _xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return buffer.getvalue()
 
 
 # ---------------------------------------------------------------------
@@ -176,3 +187,121 @@ def test_rbs_template_shaped_sheet_no_longer_produces_zero_strategies():
     # is satisfied without any row being dropped.
     names = [row.entry.name for row in candidate.ready]
     assert len(names) == len(set(names))
+
+
+def test_er_yba_fsr_are_all_unavailable_never_invalid_side_by_side():
+    # Real-workbook finding: ER, YBA, and FSR are all recognized-but-
+    # unavailable markets that appear together in the actual
+    # RBS_Template.xlsx. A genuinely unknown code (typo/near-miss) must
+    # still be invalid, never swept into "unavailable" alongside them.
+    csv = (
+        "Market,Label,1,2,3\n"
+        "SRA,3M Spread,1,-1,\n"
+        "ER,3M Spread,1,-1,\n"
+        "YBA,3M Spread,1,-1,\n"
+        "FSR,3M Spread,1,-1,\n"
+        "ZZZ,3M Spread,1,-1,\n"
+    )
+    preview = _preview_for(csv, filename="strategies.csv")
+    candidate = preview.candidates[0]
+
+    assert len(candidate.ready) == 1
+    assert candidate.ready[0].entry.definition.market_key == "SOFR"
+
+    assert len(candidate.unavailable) == 3
+    assert {row.market_code for row in candidate.unavailable} == {"ER", "YBA", "FSR"}
+
+    assert len(candidate.invalid) == 1
+    assert candidate.invalid[0].message == "Unknown market 'ZZZ'"
+
+    assert preview.unavailable_by_market == {"ER": 1, "YBA": 1, "FSR": 1}
+
+
+# ---------------------------------------------------------------------
+# Real-workbook XLSX regression (parsing.py integer-column-header fix):
+# Excel header cells for position columns are typically typed as
+# NUMBERS, not text -- pandas then reads df.columns as int, not str.
+# Built with bare int dict keys (which round-trip through .to_excel()/
+# pd.read_excel() as genuinely int-typed columns), exactly reproducing
+# the real RBS_Template.xlsx structure that previously made every row
+# in every sheet silently read as blank and get dropped before ever
+# reaching validate_row()/build_preview() -- "6 Strategy Set(s)
+# detected · 0 strategies detected".
+# ---------------------------------------------------------------------
+
+def test_real_workbook_shaped_xlsx_with_integer_headers_produces_strategies():
+    sheet = pd.DataFrame(
+        {
+            "Market": ["SRA", "SON", "CRA", "ER"],
+            "Label": ["3M Spread", "3M Spread", "3M Spread", "3M Spread"],
+            1: [1, 1, 1, 1],
+            2: [-1, -1, -1, -1],
+            3: [0, 0, 0, 0],
+        }
+    )
+    frame = parse_workbook(_xlsx_bytes(sheet, "EZ8 GENERAL"))[0]
+    preview = build_preview([frame], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert candidate.sheet_error is None
+    assert len(candidate.ready) == 3  # SRA/SON/CRA
+    assert len(candidate.unavailable) == 1  # ER
+    assert {r.entry.definition.market_key for r in candidate.ready} == {"SOFR", "SONIA", "CORRA"}
+
+
+def test_real_workbook_shaped_xlsx_rebasing_dedup_case():
+    # Mirrors the actual "6mo Spreads and Flys" worksheet from the real
+    # RBS_Template.xlsx: two rows labeled "6M Sprd", raw dense weights
+    # shifted by one column ([0,1,0,-1,...] vs [1,0,-1,0,...]), which
+    # template_from_dense_weights()'s own leading-zero re-basing already
+    # normalizes to the IDENTICAL StrategyDefinition (offsets=(0,2),
+    # weights=(1,-1)) -- a genuine duplicate that must collapse to one
+    # entry, not two.
+    sheet = pd.DataFrame(
+        {
+            "Market": ["SRA", "SRA"],
+            "Label": ["6M Sprd", "6M Sprd"],
+            1: [0, 1],
+            2: [1, 0],
+            3: [0, -1],
+            4: [-1, 0],
+        }
+    )
+    frame = parse_workbook(_xlsx_bytes(sheet, "6mo Spreads and Flys"))[0]
+    preview = build_preview([frame], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert candidate.sheet_error is None
+    assert len(candidate.ready) == 1
+    entry = candidate.ready[0]
+    assert entry.entry.name == "6M Sprd"
+    assert entry.entry.definition.offsets == (0, 2)
+    assert entry.entry.definition.weights == (1.0, -1.0)
+
+
+def test_real_workbook_shaped_xlsx_blank_vs_zero_also_dedupes():
+    # Same rebasing scenario, but expressed with a genuinely blank
+    # (NaN) cell instead of an explicit 0 in one of the two rows --
+    # both blank-vs-zero AND rebasing-equivalence must compose
+    # correctly, exactly as the real "6M Fly" rows in that worksheet do.
+    sheet = pd.DataFrame(
+        {
+            "Market": ["SRA", "SRA"],
+            "Label": ["6M Fly", "6M Fly"],
+            1: [0, 1],
+            2: [1, None],
+            3: [None, -2],
+            4: [-2, None],
+            5: [None, 1],
+            6: [1, None],
+        }
+    )
+    frame = parse_workbook(_xlsx_bytes(sheet, "6mo Spreads and Flys"))[0]
+    preview = build_preview([frame], _never_exists)
+    candidate = preview.candidates[0]
+
+    assert candidate.sheet_error is None
+    assert len(candidate.ready) == 1
+    definition = candidate.ready[0].entry.definition
+    assert definition.offsets == (0, 2, 4)
+    assert definition.weights == (1.0, -2.0, 1.0)

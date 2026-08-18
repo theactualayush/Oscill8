@@ -75,6 +75,39 @@ def test_leading_and_trailing_zeros_are_gaps_not_errors():
     assert outcome.entry.definition.offsets == (0, 1)
 
 
+def test_blank_position_cell_produces_the_identical_definition_as_explicit_zero():
+    # SRA | 1Yr Fly | 1 | -2 | blank | 1  ==  SRA | 1Yr Fly | 1 | -2 | 0 | 1
+    columns = ("1", "2", "3", "4")
+    blank_row = {"Market": "SRA", "Label": "1Yr Fly", "1": 1, "2": -2, "3": None, "4": 1}
+    zero_row = {"Market": "SRA", "Label": "1Yr Fly", "1": 1, "2": -2, "3": 0, "4": 1}
+
+    blank_outcome = validate_row(blank_row, 2, columns)
+    zero_outcome = validate_row(zero_row, 3, columns)
+
+    assert isinstance(blank_outcome, ReadyRow) and isinstance(zero_outcome, ReadyRow)
+    # Byte-identical StrategyDefinition -- the same equality
+    # strategy_import.preview._dedupe_ready() relies on directly.
+    assert blank_outcome.entry.definition == zero_outcome.entry.definition
+    assert blank_outcome.entry.definition.offsets == (0, 1, 3)
+    assert blank_outcome.entry.definition.weights == (1.0, -2.0, 1.0)
+
+
+def test_nan_position_cell_is_also_treated_as_zero():
+    # pandas represents a blank Excel cell as float NaN, not None --
+    # both must normalize identically (see strategy_import.parsing's
+    # own _is_blank() using the same rule at the row-filter level).
+    import math
+
+    columns = ("1", "2", "3")
+    nan_row = {"Market": "SRA", "Label": "X", "1": 1, "2": -1, "3": math.nan}
+    zero_row = {"Market": "SRA", "Label": "X", "1": 1, "2": -1, "3": 0}
+
+    nan_outcome = validate_row(nan_row, 2, columns)
+    zero_outcome = validate_row(zero_row, 3, columns)
+
+    assert nan_outcome.entry.definition == zero_outcome.entry.definition
+
+
 # ---------------------------------------------------------------------
 # Unavailable rows (ER)
 # ---------------------------------------------------------------------
@@ -96,6 +129,24 @@ def test_unavailable_row_is_reported_even_with_a_perfectly_valid_shape():
     assert isinstance(outcome, UnavailableRow)
 
 
+def test_yba_market_is_unavailable_not_invalid_and_not_ready():
+    outcome = validate_row(_row("YBA", "3M Spread", 1, -1, 0), 38, _COLUMNS)
+    assert isinstance(outcome, UnavailableRow)
+    assert outcome.row_number == 38
+    assert outcome.label == "3M Spread"
+    assert outcome.market_code == "YBA"
+    assert "Australian" in outcome.reason
+
+
+def test_fsr_market_is_unavailable_not_invalid_and_not_ready():
+    outcome = validate_row(_row("FSR", "3M Spread", 1, -1, 0), 43, _COLUMNS)
+    assert isinstance(outcome, UnavailableRow)
+    assert outcome.row_number == 43
+    assert outcome.label == "3M Spread"
+    assert outcome.market_code == "FSR"
+    assert "SARON" in outcome.reason
+
+
 # ---------------------------------------------------------------------
 # Invalid rows
 # ---------------------------------------------------------------------
@@ -106,6 +157,15 @@ def test_unknown_market_code_is_invalid():
     assert outcome.row_number == 9
     assert outcome.label == "Bad Market"
     assert "XYZ" in outcome.message
+
+
+def test_typo_like_near_miss_of_a_known_unavailable_code_stays_invalid():
+    # "YBAA"/"FSRR" merely resemble YBA/FSR -- they must never be
+    # silently treated as the same market. Only an exact match counts.
+    for typo in ("YBAA", "FSRR"):
+        outcome = validate_row(_row(typo, "X", 1, -1, 0), 2, _COLUMNS)
+        assert isinstance(outcome, InvalidRow), f"{typo!r} should be invalid, not unavailable"
+        assert typo in outcome.message
 
 
 def test_missing_market_value_is_invalid():
