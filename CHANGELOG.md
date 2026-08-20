@@ -265,3 +265,114 @@
   current LSEG account lacks entitlement for this universe
   (`TS.Interday.UserNotPermission.70112`), a permissions issue, not an
   Oscill8 RIC bug.
+
+---
+
+## Unreleased / not individually version-numbered
+
+The work below shipped after v0.10.1 but was never assigned its own
+version number at the time — recorded here for completeness rather
+than retroactively inventing one. Listed in the order it landed
+(oldest first, matching this file's existing chronology); no release
+dates are given for the same reason. See `CLAUDE.md` for the full
+per-module design-decision writeups these summaries are drawn from.
+
+### Strategy Set Engine (Module 7A)
+- Added `strategy_sets/` — `StrategySet`/`StrategySetEntry`, JSON
+  persistence (`StrategySetRepository`: save/load/list/duplicate/
+  rename/delete, one file per set), and `expand_strategy_set()`
+  (expansion into `strategy_engine.StrategyInstance[]`, reusing
+  `template_scanner.universe` unchanged). `contract_start`/
+  `contract_end` are call-time arguments, never persisted.
+- Unit tests: `test_strategy_sets_model.py`, `test_strategy_sets_
+  serialization.py`, `test_strategy_sets_expansion.py`, `test_
+  strategy_sets_repository.py`.
+
+### Strategy Set UI — grid unification (Module 7B)
+- Integrated the Strategy Set selector, Save/"+ New"/Delete, and
+  per-row Market/Interval grid columns directly into the existing
+  Strategy Templates grid (`ui/strategy_set_view.py` and friends) — a
+  Strategy Set became a saved, named version of that one grid rather
+  than a second table or second Run Scan button.
+- Compact, trader-facing dark scanner UI redesign; friendly scan-error
+  presentation (a classified, non-technical headline with the raw
+  exception/traceback moved into a collapsed "Technical details"
+  expander).
+- Unit tests: `test_ui_strategy_set_formatting.py`, `test_ui_strategy_
+  set_state.py`, `test_ui_strategy_set_selector_lifecycle.py`, `test_
+  ui_strategy_set_multimarket_roundtrip.py`.
+
+### Strategy Set Import — CSV/XLSX (Module 8)
+- Added `strategy_import/` — imports a CSV file or Excel workbook (one
+  worksheet = one Strategy Set; one CSV = one Strategy Set) into
+  ordinary `StrategySet` objects via an in-memory parse -> validate ->
+  preview pipeline; nothing is written to `StrategySetRepository`
+  until the user explicitly confirms Import.
+- Every row classified three ways (never silently dropped): ready,
+  unavailable (a recognized market with no data-provider
+  configuration — `ER`/`YBA`/`FSR`), or invalid (unrecognized market
+  code, non-numeric value, or other malformed row) — shown with row
+  number, label, and reason.
+- Added `ui/strategy_import_view.py` and friends (upload -> preview ->
+  Cancel/Import All).
+
+### Fixed (within Strategy Set Import)
+- **Duplicate-label handling.** Strategy identity for import
+  deduplication is now the resulting `StrategyDefinition` (market +
+  offsets + weights), never the human-facing Label — a real-workbook
+  finding that the same Label legitimately recurs across markets and,
+  within one market, across genuinely different position structures.
+  Previously any repeated Label within a sheet blocked the whole sheet
+  from importing via `StrategySet`'s own duplicate-entry-name
+  validation, even when every row was individually valid.
+- **Integer-typed Excel column headers.** A trader-typed position-
+  column header cell is very often stored by Excel as a number, not
+  text; `strategy_import/parsing.py` previously stringified column
+  labels before doing row lookups while each row stayed indexed by the
+  original, un-stringified labels, so every position-value lookup
+  silently returned `None` and every row in every worksheet of an
+  affected workbook was misclassified as blank and dropped before ever
+  reaching validation. CSV files were never affected. Fixed by keeping
+  the original column objects for every actual lookup and stringifying
+  only the output representation.
+- Unit tests: `test_strategy_import_parsing.py`, `test_strategy_
+  import_market_mapping.py`, `test_strategy_import_validation.py`,
+  `test_strategy_import_preview.py`, `test_strategy_import_naming.py`,
+  `test_strategy_import_commit.py`, `test_strategy_import_dedup.py`,
+  `test_ui_strategy_import.py`, `test_ui_strategy_import_formatting.py`.
+
+### Strategy Set Scan — run-time execution (Module 9)
+- Added `strategy_sets/execution.py`: runs an already-saved Strategy
+  Set at one user-chosen interval, applied to a transient, in-memory
+  copy of the set for that run only — the persisted Strategy Set is
+  never modified, and the same set can be run at a different interval
+  on a later occasion without re-import. Composes the unmodified
+  `expand_strategy_set()` -> `run_scan_on_instances()` — zero changes
+  to the scanner or to the grid's own Run Scan path.
+- Added `ui/strategy_set_scan_view.py` (interval selectbox + Run
+  button, shown only when a saved set is selected).
+- Unit tests: `test_strategy_sets_execution.py`.
+
+### Fixed — CORRA entitlement error (`70112`) no longer aborts a scan
+- `core/downloader.py`: added `_is_confirmed_no_permission()`, a
+  sibling to the existing `_is_confirmed_universe_not_found()`, using
+  the same narrow, exact-match philosophy (LSEG's `LDError` type + the
+  exact confirmed code `TS.Interday.UserNotPermission.70112` + the
+  exact confirmed phrase "User does not have permission for this
+  universe"). Both conditions now translate to the same, existing
+  `MarketDataUnavailableError` — `run_scan_on_instances()`'s existing
+  per-candidate skip-and-continue machinery needed no changes of its
+  own. Previously, one CORRA leg's entitlement error propagated
+  uncaught and aborted an entire mixed-market scan, discarding
+  otherwise-successful results for every other market in it.
+- SONIA's `HOURLY`/`4H` data availability was investigated separately
+  and found to have no supporting repository evidence for its exact
+  error code — deliberately **not** addressed by this fix; left open.
+- Unit tests: `tests/test_downloader.py` (+10), `tests/test_template_
+  scanner_scanner.py` (+2, a mixed SOFR+CORRA scan).
+
+### Test suite
+- 879 tests passing, 1 skipped as of this section (verified directly;
+  see `README.md`'s Testing section for what the skip is and is not —
+  re-run `pytest -q` for the current count, do not trust this number
+  blindly).

@@ -106,6 +106,31 @@ and formats that API's output for display.
   with its robust low/median/high levels overlaid, built entirely from
   data the scan already fetched/computed — selecting a row or switching
   the chart's horizon never re-downloads market data or re-runs analytics.
+- **Module 7A — Strategy Set Engine** (`strategy_sets/`): named,
+  JSON-persisted collections of strategy definitions (`StrategySet`)
+  that expand into the existing `strategy_engine.StrategyInstance`
+  architecture via `expand_strategy_set()`. `contract_start`/
+  `contract_end` are call-time arguments, never persisted, matching
+  `ScanRequest`'s own convention.
+- **Module 7B — Strategy Set UI** (`ui/strategy_set_view.py` and
+  friends): the Strategy Set selector, Save/"+ New"/Delete controls,
+  and per-row Market/Interval grid columns, integrated directly into
+  the existing Strategy Templates grid — a Strategy Set is a saved,
+  named version of that one grid, not a second table or a second Run
+  Scan button.
+- **Module 8 — Strategy Set Import** (`strategy_import/`): imports a
+  CSV file or an Excel workbook (one worksheet = one Strategy Set; one
+  CSV file = one Strategy Set) into ordinary `StrategySet` objects, via
+  an in-memory parse → validate → preview pipeline — nothing is written
+  to disk until the user explicitly confirms Import. See [Strategy
+  Sets, Import & Run-Time Scanning](#strategy-sets-import--run-time-scanning)
+  below.
+- **Module 9 — Strategy Set Scan** (`strategy_sets/execution.py`): runs
+  an already-saved Strategy Set at one user-chosen interval, applied
+  transiently to every entry for that run only — the saved Strategy
+  Set is never modified. A second, additive execution path alongside
+  Module 6A's grid-based Run Scan, sharing the same underlying
+  `run_scan_on_instances()`.
 
 ## Supported intervals
 
@@ -148,8 +173,29 @@ _normalize_columns` (never a per-market special case):
   from `SETTLE`.
 - **CORRA** — RIC construction is correct (`CRAU6`, `CRAH7`, ...), but the
   current LSEG account lacks entitlement for this universe
-  (`TS.Interday.UserNotPermission.70112`) — a permissions issue, not an
-  Oscill8 bug.
+  (`TS.Interday.UserNotPermission.70112`, "User does not have
+  permission for this universe") — a permissions issue, not an Oscill8
+  bug. This exact, confirmed condition is now translated into the same
+  typed `MarketDataUnavailableError` as the `70005` case above (`core/
+  downloader.py::_is_confirmed_no_permission()`), so a scan containing
+  CORRA alongside other markets skips the CORRA candidates and still
+  returns results for the rest — it no longer aborts the whole scan.
+  CORRA's entitlement gap is interval-independent (skipped identically
+  at `DAILY`/`HOURLY`/`4H`). SONIA's own `HOURLY`/`4H` data
+  availability is a separate, still-unverified question — see [Current
+  limitations](#current-limitations--deferred-work).
+
+Note the distinction between three separate vocabularies, kept
+structurally separate in the codebase: a market's **LSEG RIC root**
+(this table, e.g. `SRA`), Oscill8's **internal registry key**
+(`core.config.MARKETS`'s dict keys, e.g. `"SOFR"`), and a **vendor/
+workbook market code** used in an imported strategy file (e.g. `SRA`,
+`SON`, `CRA`, `ER`, `YBA`, `FSR` — see [Strategy Sets, Import &
+Run-Time Scanning](#strategy-sets-import--run-time-scanning) below).
+The first two happen to coincide with the RIC root for some markets
+here, but nothing in the codebase assumes they always will —
+`strategy_import.market_mapping` is the one explicit bridge from the
+third vocabulary to the second.
 
 ## Templates and candidate generation
 
@@ -226,6 +272,72 @@ The workflow, top to bottom:
    fetched/computed — no new LSEG call, no new SQLite fetch beyond a
    cache hit for the single already-scanned candidate, no analytics
    recomputation.
+
+## Strategy Sets, Import & Run-Time Scanning
+
+A **Strategy Set** (Module 7A) is a named, JSON-persisted collection of
+strategy definitions — e.g. "Churning", "6M Strategies". Module 7B
+integrates it directly into the Strategy Templates grid: the selector,
+Save/"+ New"/Delete controls sit in that section's own header, and a
+loaded Strategy Set becomes ordinary grid rows, run through the exact
+same Run Scan button and `run_scan()` call a manually-typed row uses —
+there is no second table, no second Run Scan button, and no separate
+Strategy-Set-specific scan path for the grid.
+
+### Import (CSV/XLSX)
+
+Module 8 imports a Strategy Set from an external file:
+
+- **One CSV file = one Strategy Set.** **One Excel worksheet = one
+  Strategy Set** — a multi-sheet workbook produces multiple Strategy
+  Sets in one import.
+- **Nothing is written until the user explicitly confirms Import.**
+  Uploading a file only builds an in-memory preview (parse → validate →
+  preview); `StrategySetRepository` is only ever written to from the
+  one explicit "Import All" confirmation.
+- **Every row is classified three ways**, never silently dropped:
+  **ready** (a valid, importable strategy), **unavailable** (a
+  recognized market with no data-provider configuration — see below),
+  or **invalid** (an unrecognized market code, a non-numeric position
+  value, or another structurally malformed row) — shown with its row
+  number, label, and exact reason.
+- **A trader's Label is not a unique identifier.** Strategy identity for
+  deduplication is the resulting `StrategyDefinition` (market + offsets
+  + weights), never the Label — the same Label legitimately recurs
+  across markets and, within one market, across genuinely different
+  position structures. A blank position cell and an explicit `0` are
+  treated identically.
+- **Duplicate Strategy Set names are never overwritten** — re-importing
+  produces `"Name"`, `"Name 2"`, `"Name 3"`, ... rather than silently
+  replacing an existing set.
+- **Market codes** used in an imported file (short, RIC-root-*style*
+  codes, not necessarily identical to the market's actual LSEG RIC
+  root or Oscill8's internal registry key — see [Market RIC
+  conventions](#market-ric-conventions--data-field-differences) above):
+
+  | Workbook code | Resolves to | Status |
+  |---|---|---|
+  | `SRA` | `SOFR` | Ready — configured, scannable via LSEG |
+  | `SON` | `SONIA` | Ready — configured, scannable via LSEG |
+  | `CRA` | `CORRA` | Ready — configured; LSEG entitlement currently missing (see above), skipped per-scan, not per-import |
+  | `ER` | Euribor | Recognized, **not** configured — no `MarketDefinition` exists |
+  | `YBA` | an Australian exchange market | Recognized, **not** configured — no `MarketDefinition` exists |
+  | `FSR` | SARON 3M futures | Recognized, **not** configured — no `MarketDefinition` exists |
+
+  `ER`/`YBA`/`FSR` rows are never dropped or misreported as errors —
+  they're classified **unavailable**, with their own specific reason,
+  and simply never persisted. Any other code is **invalid**
+  (unrecognized).
+
+### Strategy Set Scan (run-time interval selection)
+
+Module 9 adds a second, additive way to run a saved Strategy Set: pick
+the set, pick ONE interval, and that interval is applied to every
+entry in the set **for that run only** — a transient, in-memory copy,
+never written back to the saved file. The same saved Strategy Set can
+be run at a different interval on a later occasion without any
+modification or re-import. This does not change the grid's own
+per-row Market/Interval behavior in any way.
 
 ## Range-Bound Metrics
 
@@ -343,7 +455,28 @@ object.
   ships exactly one primary strategy-history chart.
 - **Saved scans / export workflow** — not implemented; there is no
   persistence of a `ScanRequest`/`ScanReport` beyond the current browser
-  session's `st.session_state`.
+  session's `st.session_state`. A Strategy Set (Module 7A) is a named
+  collection of strategy definitions only — it does not capture a
+  price window, lookbacks, results, or (Module 9) the run-time interval
+  a scan was run at.
+- **Full `MarketDefinition` configuration for Euribor, YBA (an
+  Australian exchange market), and SARON 3M futures (`FSR`)** — not
+  implemented. `strategy_import.market_mapping` recognizes all three
+  by name and their RIC roots are confirmed, but none has the
+  mandatory `exchange`/`bp_per_point` metadata, which must never be
+  guessed (see [Strategy Sets, Import & Run-Time Scanning](#strategy-sets-import--run-time-scanning)
+  above). **None of the three is currently tradable/scannable through
+  LSEG or any other data provider.**
+- **SONIA `HOURLY`/`4H` data availability** — unverified. SONIA's
+  `DAILY` behavior is confirmed working live; no repository evidence
+  exists for what LSEG returns for SONIA at intraday intervals, and
+  nothing has been implemented for it. Do not assume it behaves like
+  CORRA's `70112` entitlement case above — that requires a live LSEG
+  call to confirm before any code is written.
+- **QuantHub (QH) as a secondary/fallback data provider** — mentioned
+  as a future direction for markets whose LSEG entitlement is
+  currently missing (e.g. CORRA), but **no QH code, integration, or
+  design exists anywhere in this repository today.**
 
 ## Running the application
 
@@ -365,14 +498,20 @@ an already-selected candidate's chart never touch LSEG (see
 pytest -q
 ```
 
-Current suite: **422 tests** (421 passing, 1 known environment-specific
-failure — see below; unit tests, LSEG fully mocked — no live session
-required; this is a snapshot as of the market-data correctness patch
-described above — re-run the command above for the up-to-date count).
+Current suite: **879 passed, 1 skipped** (unit tests, LSEG fully mocked
+— no live session required; this is a snapshot as of the Strategy Set
+Scan / Module 8-9 / CORRA-classification work described above — re-run
+the command above for the up-to-date count, do not trust this number
+blindly). Verified directly (`pytest -q -rs`): the 1 skip is `tests/
+test_ui_keyboard_browser.py`, a real-browser keyboard-workflow check
+that skips when Playwright/Chromium isn't available in the current
+environment (it wasn't in the environment this count was verified
+in) — unrelated to LSEG; see below for `test_live_connection.py`.
 `tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema`
-fails in environments with pandas >= 3.0 (asserts `datetime64[ns]`; newer
-pandas defaults to `datetime64[us]`) — pre-existing, unrelated to any
-market-data change, not fixed here.
+may fail in environments with pandas >= 3.0 (asserts `datetime64[ns]`;
+newer pandas defaults to `datetime64[us]`) — pre-existing, unrelated to
+any Strategy Set/import work, not fixed here; passes with the pinned
+`requirements.txt` pandas version.
 
 `test_live_connection.py` is a manual smoke test, not part of the pytest
 suite — run it directly (`python test_live_connection.py`) on a machine
@@ -391,14 +530,23 @@ database/          SQLite cache (get_history) sitting between core and everythin
 strategy_engine/   StrategyDefinition, rolling contract combinations, historical pricing
 range_analytics/   Range-bound (4A) and multi-lookback stability (4B) measurements
 template_scanner/  Dense-grid templates, candidate universe, scan orchestration, filtering/ranking (5A/5B)
-ui/                Streamlit UI (6A/6B) -- app.py, state.py, controls.py, scan_view.py,
-                   results_view.py, chart_view.py, formatting.py
+strategy_sets/     Strategy Set domain model, JSON persistence, expansion (7A), run-time
+                   interval-override execution (9) -- execution.py, expansion.py, model.py,
+                   repository.py, serialization.py
+strategy_import/   CSV/XLSX Strategy Set import: parse -> validate -> preview -> commit (8)
+ui/                Streamlit UI (6A/6B/7B/8/9) -- app.py, state.py, controls.py, scan_view.py,
+                   results_view.py, chart_view.py, formatting.py, strategy_set_view.py,
+                   strategy_set_scan_view.py, strategy_import_view.py
 tests/             Unit tests for every module above (pytest, LSEG mocked)
 ```
 
 ## Current status
 
-Modules 1 through 6B (LSEG data layer through the Streamlit scanner UI
-and selected-strategy history chart) are complete and tested. See
-[Current limitations / deferred work](#current-limitations--deferred-work)
-for what is explicitly out of scope today.
+Modules 1 through 9 (LSEG data layer through Strategy Set import and
+run-time scanning) are complete and tested, along with the CORRA
+entitlement-error classification fix. See [Current limitations /
+deferred work](#current-limitations--deferred-work) for what is
+explicitly out of scope today — in particular, Euribor/YBA/SARON have
+no configured `MarketDefinition` and are not scannable through any
+data provider, SONIA's `HOURLY`/`4H` availability is unverified, and
+QuantHub (QH) integration does not exist.

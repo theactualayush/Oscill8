@@ -6,13 +6,16 @@ Module 7B -- Strategy Set integration (simplified): "Strategy Templates
 is the working strategy grid; a Strategy Set is simply a saved named
 version of that grid." One strategy grid, one Run Scan button -- a
 loaded Strategy Set becomes ordinary grid rows and is run exactly like
-manual entry. A thin Streamlit layer over the existing, unmodified
-backend (strategy_engine, range_analytics, template_scanner,
-strategy_sets). This package never computes analytics, never
-duplicates filtering/ranking/derived-metric formulas or Strategy Set
-persistence logic, and never talks to LSEG directly -- it only parses
-UI input into calls against those packages' public APIs and formats
-their output for display.
+manual entry. Module 8 -- Strategy Set Import (CSV/XLSX upload ->
+preview -> Import All). Module 9 -- Strategy Set Scan, a separate,
+additive way to run a saved Strategy Set at one chosen interval
+without touching the grid. A thin Streamlit layer over the existing,
+unmodified backend (strategy_engine, range_analytics, template_scanner,
+strategy_sets, strategy_import). This package never computes
+analytics, never duplicates filtering/ranking/derived-metric formulas
+or Strategy Set persistence logic, and never talks to LSEG directly --
+it only parses UI input into calls against those packages' public APIs
+and formats their output for display.
 
 app.py            Entry point / page orchestration.
 state.py          Session-state keys for the expensive scan result and
@@ -53,4 +56,26 @@ strategy_set_view.py         The Strategy Set selector + Save/"+ New"/
                              button. Delete requires an explicit confirm
                              dialog naming the set before it removes
                              anything.
+strategy_set_scan_view.py    Module 9: a SEPARATE, additive way to run a
+                             saved Strategy Set -- interval selectbox +
+                             Run button, shown only when a set is
+                             selected. Applies the chosen interval to a
+                             transient copy of the set for that run
+                             only (strategy_sets.execution); the grid's
+                             own Run Scan / per-row Market-Interval are
+                             completely unaffected.
+strategy_import_state.py     Module 8: session-state for the Import
+                             Strategies panel -- whether it's open, the
+                             current in-memory ImportPreview, and the
+                             one-shot post-import summary. Never touches
+                             StrategySetRepository itself.
+strategy_import_formatting.py  Module 8: pure text-formatting helpers
+                             for the import preview (market breakdown,
+                             per-candidate summary, invalid/unavailable
+                             row lines) -- no Streamlit import.
+strategy_import_view.py      Module 8: upload -> preview -> Cancel/
+                             Import All. commit_import() (the only
+                             StrategySetRepository write in the whole
+                             strategy_import package) is called from
+                             exactly one place, the Import All button.
 """
