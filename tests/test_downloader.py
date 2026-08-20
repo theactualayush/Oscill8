@@ -77,6 +77,14 @@ _UNIVERSE_NOT_FOUND_MESSAGE = (
     "(TS.Interday.UserRequestError.70005, The universe is not found)"
 )
 
+# CORRA's own documented, live-confirmed entitlement gap (CLAUDE.md's
+# Module 1 findings) -- exact wording quoted verbatim from that live
+# confirmation, not guessed.
+_NO_PERMISSION_MESSAGE = (
+    "No data to return, please check errors: ERROR: No successful response. "
+    "(TS.Interday.UserNotPermission.70112, User does not have permission for this universe)"
+)
+
 
 def _make_lseg_df(dates: list[str], seed: float = 100.0) -> pd.DataFrame:
     """Build a fake DataFrame shaped like what lseg.data.get_history returns."""
@@ -511,6 +519,73 @@ def test_is_confirmed_universe_not_found_false_for_matching_message_wrong_type()
     assert downloader._is_confirmed_universe_not_found(exc) is False
 
 
+def test_is_confirmed_universe_not_found_false_for_the_no_permission_message():
+    # The two conditions must never be conflated by the 70005-specific
+    # predicate -- CORRA's real 70112 message must not accidentally
+    # satisfy this one.
+    exc = _make_ld_error(_NO_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
+# ---------------------------------------------------------------------
+# _is_confirmed_no_permission: narrow classification for CORRA's own
+# documented 70112 entitlement gap (CLAUDE.md's Module 1 findings)
+# ---------------------------------------------------------------------
+
+def test_is_confirmed_no_permission_true_for_exact_match():
+    exc = _make_ld_error(_NO_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_no_permission(exc) is True
+
+
+def test_is_confirmed_no_permission_false_for_generic_no_data_message():
+    exc = _make_ld_error("No data to return, please check errors: ERROR: No successful response.")
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_different_error_code():
+    exc = _make_ld_error(
+        "No data to return (TS.Interday.UserNotPermission.99999, User does not have permission for this universe)"
+    )
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_matching_code_different_phrase():
+    exc = _make_ld_error("(TS.Interday.UserNotPermission.70112, Some unrelated reason)")
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_generic_permission_mention():
+    # "permission" alone, without the specific code+phrase, must NOT be
+    # classified.
+    exc = _make_ld_error("Some unrelated permission configuration issue")
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_matching_message_wrong_type():
+    # Even the exact code+phrase must NOT be classified unless the
+    # exception is actually LSEG's LDError type.
+    exc = RuntimeError(_NO_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_the_universe_not_found_message():
+    # The two conditions must never be conflated by the 70112-specific
+    # predicate either -- symmetric to the test above.
+    exc = _make_ld_error(_UNIVERSE_NOT_FOUND_MESSAGE)
+    assert downloader._is_confirmed_no_permission(exc) is False
+
+
+def test_is_confirmed_no_permission_false_for_a_completely_different_code():
+    # e.g. SONIA's current failure -- no evidence of its exact error
+    # code exists anywhere in this repository/documentation, so it must
+    # NOT be classified as unavailable by either predicate. This
+    # deliberately does not guess at what SONIA's real message looks
+    # like; it only proves an arbitrary different code is rejected.
+    exc = _make_ld_error("(TS.Interday.SomeOtherError.12345, A completely different problem)")
+    assert downloader._is_confirmed_no_permission(exc) is False
+    assert downloader._is_confirmed_universe_not_found(exc) is False
+
+
 # ---------------------------------------------------------------------
 # download_history: MarketDataUnavailableError translation + retry bypass
 # ---------------------------------------------------------------------
@@ -523,6 +598,21 @@ def test_download_history_confirmed_universe_not_found_raises_typed_error_not_re
 
     assert exc_info.value.ric == "SRAH26"
     assert "70005" in exc_info.value.message
+    # Confirmed-permanent condition -- must NOT be retried.
+    assert fake_lseg_data.get_history.call_count == 1
+
+
+def test_download_history_confirmed_no_permission_raises_typed_error_not_retried():
+    # CORRA's real, documented entitlement gap -- must be translated to
+    # the SAME typed error as the 70005 case, so callers (e.g.
+    # run_scan_on_instances()) need no changes of their own to handle it.
+    fake_lseg_data.get_history.side_effect = _make_ld_error(_NO_PERMISSION_MESSAGE)
+
+    with pytest.raises(downloader.MarketDataUnavailableError) as exc_info:
+        downloader.download_history("CRAH6", "DAILY", "2026-01-01", "2026-01-05")
+
+    assert exc_info.value.ric == "CRAH6"
+    assert "70112" in exc_info.value.message
     # Confirmed-permanent condition -- must NOT be retried.
     assert fake_lseg_data.get_history.call_count == 1
 

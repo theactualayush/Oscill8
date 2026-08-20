@@ -37,8 +37,15 @@ logger = get_logger(__name__)
 
 class MarketDataUnavailableError(Exception):
     """Raised when LSEG has confirmed a requested RIC has no market data
-    available at all (TS.Interday.UserRequestError.70005, "The universe
-    is not found") -- a permanent, per-RIC condition.
+    available at all -- a permanent, per-RIC condition. Two narrow,
+    LSEG-confirmed conditions are translated to this today:
+    - TS.Interday.UserRequestError.70005, "The universe is not found"
+    - TS.Interday.UserNotPermission.70112, "User does not have
+      permission for this universe" (e.g. CORRA's documented current
+      entitlement gap -- see CLAUDE.md's Module 1 findings; a
+      permissions issue, not an Oscill8 RIC bug, but functionally the
+      same "this RIC's data is not accessible to us right now"
+      condition a caller needs to skip-and-continue past)
 
     Distinct from:
     - a valid RIC with no bars in the requested date range (returns an
@@ -96,6 +103,45 @@ def _is_confirmed_universe_not_found(exc: Exception) -> bool:
     return (
         "TS.Interday.UserRequestError.70005" in message
         and "The universe is not found" in message
+    )
+
+
+def _is_confirmed_no_permission(exc: Exception) -> bool:
+    """True only for the narrow, LSEG-confirmed "no permission for this
+    universe" condition (TS.Interday.UserNotPermission.70112) -- CORRA's
+    own documented, live-confirmed entitlement gap (see CLAUDE.md's
+    Module 1 findings; the exact wording below is quoted verbatim from
+    that live confirmation, not guessed). Same duck-typing/exact-match
+    philosophy as _is_confirmed_universe_not_found() above -- a
+    different, equally permanent, per-RIC condition LSEG itself
+    confirms, so it gets the same narrow treatment; this is NOT a
+    broadening of what counts as "unavailable", it is one more
+    specific, confirmed code recognized alongside 70005.
+
+    Requires ALL of:
+    - the exception is LSEG's LDError type (module "lseg.data._errors",
+      class "LDError")
+    - its message contains the exact error code
+      "TS.Interday.UserNotPermission.70112"
+    - its message contains the exact phrase "User does not have
+      permission for this universe"
+
+    A generic permission-flavored message without this exact code, or
+    this exact code with different wording, or a non-LDError exception,
+    all return False and are left untranslated -- exactly as narrow as
+    _is_confirmed_universe_not_found(). No other error code is treated
+    as unavailable by this function; a market whose actual failure mode
+    turns out to be something else (e.g. SONIA's current, undocumented
+    failure) is deliberately left unclassified rather than guessed at.
+    """
+    exc_type = type(exc)
+    if exc_type.__module__ != "lseg.data._errors" or exc_type.__name__ != "LDError":
+        return False
+
+    message = getattr(exc, "message", None) or str(exc)
+    return (
+        "TS.Interday.UserNotPermission.70112" in message
+        and "User does not have permission for this universe" in message
     )
 
 # --------------------------------------------------------------------------
@@ -282,18 +328,20 @@ def _chunk_date_range(start: date, end: date, max_days: int) -> list[tuple[date,
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    # A confirmed "universe is not found" is a permanent, per-RIC
-    # condition -- retrying it 3x with backoff can never succeed, so it
-    # is excluded here (translated to MarketDataUnavailableError before
-    # this predicate ever sees it, immediately below). Every other
-    # exception keeps its existing retry behaviour unchanged.
+    # A confirmed "universe is not found" or "no permission for this
+    # universe" is a permanent, per-RIC condition -- retrying it 3x
+    # with backoff can never succeed, so both are excluded here
+    # (translated to MarketDataUnavailableError before this predicate
+    # ever sees them, immediately below). Every other exception keeps
+    # its existing retry behaviour unchanged.
     retry=retry_if_exception_type(Exception) & retry_if_not_exception_type(MarketDataUnavailableError),
 )
 def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.DataFrame:
     """Fetch a single chunk of history from LSEG, with retry on failure.
 
-    A confirmed "universe is not found" LDError (see
-    _is_confirmed_universe_not_found) is translated to
+    A confirmed "universe is not found" or "no permission for this
+    universe" LDError (see _is_confirmed_universe_not_found /
+    _is_confirmed_no_permission) is translated to
     MarketDataUnavailableError right here, before the @retry decorator
     above ever evaluates whether to retry it -- this is what lets the
     retry predicate exclude it cleanly rather than retrying a condition
@@ -315,7 +363,7 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
             fields=None,
         )
     except Exception as exc:
-        if _is_confirmed_universe_not_found(exc):
+        if _is_confirmed_universe_not_found(exc) or _is_confirmed_no_permission(exc):
             raise MarketDataUnavailableError(ric, getattr(exc, "message", None) or str(exc)) from exc
         raise
 

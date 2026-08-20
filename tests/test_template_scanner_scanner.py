@@ -372,6 +372,73 @@ def test_run_scan_unrelated_exception_after_a_skip_still_aborts(mocker):
         run_scan(request)
 
 
+# ---------------------------------------------------------------------
+# Mixed-market scan: an available SOFR candidate alongside a CORRA
+# candidate whose leg raises MarketDataUnavailableError (as core.
+# downloader now translates CORRA's real, documented 70112 entitlement
+# error into -- see core/downloader.py's _is_confirmed_no_permission()).
+# run_scan_on_instances() is called directly with hand-built instances
+# so this test is agnostic to real contract-calendar rolling; the
+# translation itself is covered separately in tests/test_downloader.py.
+# ---------------------------------------------------------------------
+
+def _sofr_outright_instance(ric: str = "SRAH26") -> StrategyInstance:
+    definition = template_from_dense_weights("SOFR", (1,), BarInterval.DAILY)
+    return StrategyInstance(definition=definition, rics=(ric,))
+
+
+def _corra_outright_instance(ric: str = "CRAH6") -> StrategyInstance:
+    definition = template_from_dense_weights("CORRA", (1,), BarInterval.DAILY)
+    return StrategyInstance(definition=definition, rics=(ric,))
+
+
+def test_mixed_scan_skips_unavailable_corra_candidate_and_still_returns_sofr_results(mocker):
+    # Simulates core.downloader having already translated CORRA's real
+    # 70112 entitlement error into MarketDataUnavailableError -- proves
+    # run_scan_on_instances()'s EXISTING skip machinery (no changes of
+    # its own) correctly keeps the available SOFR candidate.
+    def _get_history(ric, interval, start, end):
+        if ric == "CRAH6":
+            raise MarketDataUnavailableError(ric, "User does not have permission for this universe")
+        return _leg_df()
+
+    mocker.patch("strategy_engine.pricing.get_history", side_effect=_get_history)
+
+    instances = [_sofr_outright_instance(), _corra_outright_instance()]
+    report = run_scan_on_instances(
+        instances, price_start="2020-01-01", price_end="2020-06-30", lookbacks=(20,),
+    )
+
+    assert len(report.results) == 1
+    assert report.results[0].rics == ("SRAH26",)
+    assert report.results[0].market_key == "SOFR"
+
+    assert len(report.skipped) == 1
+    assert report.skipped[0].unavailable_ric == "CRAH6"
+    assert report.skipped[0].instance.rics == ("CRAH6",)
+
+
+def test_mixed_scan_unrelated_corra_exception_still_aborts_and_loses_sofr_results(mocker):
+    # An UNRELATED exception on the CORRA leg (not the confirmed 70112
+    # condition) must still abort the whole scan, per the deliberately
+    # narrow exception policy -- even though the SOFR candidate would
+    # otherwise have priced successfully. Order matters: SOFR is fetched
+    # first and succeeds, CORRA fails second, proving the already-
+    # computed SOFR result is discarded when the function raises.
+    def _get_history(ric, interval, start, end):
+        if ric == "CRAH6":
+            raise RuntimeError("simulated unrelated failure")
+        return _leg_df()
+
+    mocker.patch("strategy_engine.pricing.get_history", side_effect=_get_history)
+
+    instances = [_sofr_outright_instance(), _corra_outright_instance()]
+    with pytest.raises(RuntimeError, match="simulated unrelated failure"):
+        run_scan_on_instances(
+            instances, price_start="2020-01-01", price_end="2020-06-30", lookbacks=(20,),
+        )
+
+
 def test_run_scan_carries_configured_percentiles_through_to_results(mocker):
     mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
 
