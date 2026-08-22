@@ -1,7 +1,7 @@
 """
 controls.py
 
-The scan configuration panel (Market/Data, Universe, History, Analytics,
+The scan configuration panel (Interval, Contracts, History, Analytics,
 Run Scan) and the Strategy Templates section -- ONE working strategy
 grid (curve positions as columns, one row per template, each row
 carrying its OWN Market/Interval), with the Strategy Set selector/Save
@@ -11,6 +11,21 @@ current values as a plain ScanSetup -- it builds no StrategyDefinition/
 ScanRequest itself; that translation belongs to ui.scan_view +
 ui.formatting, unchanged regardless of whether a row was typed manually
 or loaded from a saved Strategy Set.
+
+Single Run Scan path (Task 1 simplification): there is exactly one way
+to execute a scan -- the "▶ Run Scan" button at the bottom of Scan
+Configuration, handled by ui.scan_view.handle_run_scan(). The separate
+"Run '<Strategy Set>'" button that used to render above the grid (with
+its own, independently-editable interval selector) is gone, along with
+the global Market dropdown Scan Configuration used to carry -- a
+Strategy Set's markets are exactly the markets its rows carry (the
+grid's own per-row Market column), so there is nothing left for a
+global Market selector to do. Scan Configuration's one Interval
+selector (`interval` on ScanSetup) is the single runtime interval for
+every leg of a scan -- see ui.formatting.apply_interval_override(),
+applied by handle_run_scan() -- so a saved Strategy Set's own persisted
+per-row interval (still shown/edited in the grid, still what gets
+saved) can never silently conflict with what a scan actually runs at.
 
 The grid's position-column headers are bare curve-position numbers,
 not real contract codes: template_from_dense_weights() +
@@ -22,18 +37,20 @@ CURVE_POSITION_HELP for the caption that explains this once, rather
 than repeating it per column.
 
 Per-row Market/Interval (multi-market fix): the grid has its own
-Market/Interval SelectboxColumns, defaulting new rows to whatever the
-scan bar's own Market/Interval selectors currently show but otherwise
-fully independent per row. This is what lets a Strategy Set mixing
-markets (e.g. "Intermarket Churning": SOFR + SONIA + CORRA entries)
-round-trip through load -> edit -> save -> reload without any entry's
-market/interval silently changing -- see ui.strategy_set_formatting's
-module docstring for the full rationale. The scan bar's own Market/
-Interval selectors remain exactly what they were for Module 6A: the
-default for a brand-new grid row and the market/interval Run Scan's
-own ScanRequest metadata quotes; ui.formatting.build_definitions_from_
-grid() resolves each row's OWN Market/Interval first, falling back to
-those scan-bar selectors only for a row that somehow lacks them.
+Market/Interval SelectboxColumns, defaulting new rows to a fixed
+default market plus whatever the scan bar's own Interval selector
+currently shows, but otherwise fully independent per row. This is what
+lets a Strategy Set mixing markets (e.g. "Intermarket Churning": SOFR +
+SONIA + CORRA entries) round-trip through load -> edit -> save ->
+reload without any entry's market/interval silently changing -- see
+ui.strategy_set_formatting's module docstring for the full rationale.
+Task 1 simplification: the scan bar no longer has a Market selector at
+all (removed -- see the module docstring's "Single Run Scan path"
+note), and its Interval selector is no longer merely a per-row default/
+fallback -- ui.scan_view.handle_run_scan() now forces every row's
+Interval to it at RUN time via ui.formatting.apply_interval_override(),
+after build_definitions_from_grid() has resolved each row's OWN,
+persisted Market/Interval (Market is never overridden).
 
 Render order (UI/UX redesign pass): the Strategy Workspace (this
 section) now renders ABOVE Scan Configuration (_render_scan_bar()) in
@@ -42,11 +59,13 @@ should it be measured" hierarchy -- reversed from the original Module
 6A order, where the scan bar rendered first specifically to hand this
 section its Market/Interval defaults. Since the grid's own per-row
 Market/Interval is what actually matters for correctness (see above),
-_peek_current_market_and_interval() reads the scan bar's widget keys
-as they stood after the PREVIOUS rerun (Streamlit session_state
-persists a widget's key across reruns) purely to seed a brand-new
-blank row's default cells -- a cosmetic seed value only, never
-authoritative. The Strategy Set selector's Save/+New/Delete controls
+_peek_current_interval() reads the scan bar's own Interval widget key
+as it stood after the PREVIOUS rerun (Streamlit session_state persists
+a widget's key across reruns) purely to seed a brand-new blank row's
+default Interval cell -- a cosmetic seed value only, never
+authoritative; a blank row's default Market is simply the first
+configured market (see _render_strategy_templates()), since there is no
+scan-bar Market widget left to peek. The Strategy Set selector's Save/+New/Delete controls
 (ui.strategy_set_view.render_save_button()/render_new_button()/
 render_delete_control()/process_save()) are split the same way: the
 buttons render in this section's header (next to the selector), but
@@ -90,7 +109,6 @@ from strategy_sets.repository import StrategySetRepository
 
 from ui import state
 from ui import strategy_import_view
-from ui import strategy_set_scan_view
 from ui import strategy_set_state as ss_state
 from ui import strategy_set_view
 from ui.formatting import (
@@ -125,15 +143,28 @@ _UNIVERSE_FORWARD_DAYS = 730
 # the module docstring's "History" paragraph.
 _HISTORY_LOOKBACK_DAYS = 182
 
+_RUNTIME_INTERVAL_HELP = (
+    "Applied to every strategy in the scan -- the grid's own per-row Interval (and a loaded "
+    "Strategy Set's saved interval) stays what gets persisted, but this is the single runtime "
+    "interval every leg actually prices and analyzes at."
+)
+
 
 @dataclass(frozen=True)
 class ScanSetup:
     """Everything the scan panel and strategy grid currently hold, read
     live from widget state -- not yet validated or translated into
     backend objects. contract_start/contract_end are computed
-    automatically (see _default_universe_window()), never user-entered."""
+    automatically (see _default_universe_window()), never user-entered.
 
-    market_key: str
+    No market_key field: Scan Configuration has no global Market
+    selector (removed -- see the module docstring's "Single Run Scan
+    path" note). `interval` is the one runtime interval every leg of
+    the scan is forced to via ui.formatting.apply_interval_override(),
+    regardless of what the grid's own per-row Interval column (or a
+    loaded Strategy Set's persisted interval) says.
+    """
+
     interval: BarInterval
     contract_start: date
     contract_end: date
@@ -146,12 +177,6 @@ class ScanSetup:
     grid_rows: list[dict]
     position_columns: tuple[str, ...]
     run_clicked: bool
-    # Strategy Set Scan (additive, separate from the grid's own Run
-    # Scan above): captured in _render_strategy_templates(), acted on
-    # by ui.strategy_set_scan_view.handle_run_strategy_set_scan() once
-    # this ScanSetup is fully built -- see that module's docstring.
-    strategy_set_scan_requested: bool
-    strategy_set_scan_interval: BarInterval | None
 
 
 def _clamp_session_value(key: str, valid_options: tuple, fallback) -> None:
@@ -196,53 +221,44 @@ def _default_history_window(today: date) -> tuple[date, date]:
 
 def render_scan_setup() -> ScanSetup:
     """Renders the Strategy Workspace (Strategy Set controls + grid)
-    ABOVE Scan Configuration (Data/Contracts/History/Analytics/Run
+    ABOVE Scan Configuration (Interval/Contracts/History/Analytics/Run
     Scan), per the UI/UX spec's workflow hierarchy ("what am I
     scanning?" before "how should it be measured?"). The Strategy
-    Workspace no longer needs a completed scan-bar Market/Interval
-    selection to render first -- _render_strategy_templates() peeks the
-    scan bar's own widget keys from the PREVIOUS rerun (see
-    _peek_current_market_and_interval()) purely to seed a brand-new
-    blank row's default Market/Interval cells; every already-populated
-    grid row keeps carrying its own Market/Interval regardless of
-    render order.
+    Workspace no longer needs a completed scan-bar Interval selection to
+    render first -- _render_strategy_templates() peeks the scan bar's
+    own Interval widget key from the PREVIOUS rerun (see
+    _peek_current_interval()) purely to seed a brand-new blank row's
+    default Interval cell; every already-populated grid row keeps
+    carrying its own Market/Interval regardless of render order.
     """
     main, _ = st.columns([5, 1])
     with main:
         st.subheader("Oscill8 — Range-Bound Scanner")
 
         with st.container(border=True):
-            grid_rows, position_columns, ss_scan_requested, ss_scan_interval = (
-                _render_strategy_templates()
-            )
+            grid_rows, position_columns = _render_strategy_templates()
 
         with st.container(border=True):
             setup_values = _render_scan_bar()
 
-    return ScanSetup(
-        grid_rows=grid_rows,
-        position_columns=position_columns,
-        strategy_set_scan_requested=ss_scan_requested,
-        strategy_set_scan_interval=ss_scan_interval,
-        **setup_values,
-    )
+    return ScanSetup(grid_rows=grid_rows, position_columns=position_columns, **setup_values)
 
 
-def _peek_current_market_and_interval() -> tuple[str, BarInterval]:
-    """Best-effort read of the scan bar's Market/Interval widget values
-    as they stood after the PREVIOUS rerun (st.session_state persists a
-    widget's key across reruns even before that widget is re-instantiated
-    later in the current one) -- used only to seed a brand-new "+ New
-    Strategy Set" blank row's default Market/Interval cells. Falls back
-    to the first configured market / DAILY on the very first render,
-    before those widget keys exist at all."""
-    market_key = st.session_state.get("oscill8_market")
-    if market_key not in MARKETS:
-        market_key = next(iter(MARKETS))
+def _peek_current_interval() -> BarInterval:
+    """Best-effort read of the scan bar's Interval widget value as it
+    stood after the PREVIOUS rerun (st.session_state persists a widget's
+    key across reruns even before that widget is re-instantiated later
+    in the current one) -- used only to seed a brand-new "+ New Strategy
+    Set" blank row's default Interval cell. Falls back to DAILY on the
+    very first render, before that widget key exists at all. Market has
+    no equivalent peek: Scan Configuration has no global Market selector
+    (see the module docstring), so a blank row's default Market is
+    always simply the first configured market (see
+    _render_strategy_templates())."""
     interval = st.session_state.get("oscill8_interval")
     if not isinstance(interval, BarInterval):
         interval = BarInterval.DAILY
-    return market_key, interval
+    return interval
 
 
 def _render_scan_bar() -> dict:
@@ -251,21 +267,19 @@ def _render_scan_bar() -> dict:
     universe_start, universe_end = _default_universe_window(today)
     history_start, history_end = _default_history_window(today)
 
-    col_market, col_universe, col_history, col_analytics = st.columns([1.1, 1.4, 1.8, 2.6])
+    col_interval, col_universe, col_history, col_analytics = st.columns([1.1, 1.4, 1.8, 2.6])
 
-    with col_market:
-        st.caption("DATA")
-        market_key = st.selectbox(
-            "Market", list(MARKETS.keys()), format_func=lambda k: MARKETS[k].name, key="oscill8_market"
-        )
+    with col_interval:
+        st.caption("INTERVAL", help=_RUNTIME_INTERVAL_HELP)
         interval = st.selectbox(
-            "Interval", _INTERVALS, format_func=lambda i: i.value, key="oscill8_interval"
+            "Interval", _INTERVALS, format_func=lambda i: i.value, key="oscill8_interval",
+            help=_RUNTIME_INTERVAL_HELP,
         )
 
     with col_universe:
         st.caption("CONTRACTS", help=UNIVERSE_HELP)
         # A disabled text_input, not st.info: it renders with the exact
-        # same label-row + control-row height as Market/Price History
+        # same label-row + control-row height as Interval/Price History
         # Start/Lookbacks (bars) in the other three columns, so this
         # row's boxes line up with theirs instead of an st.info banner's
         # own (taller, label-less) height sitting a row higher.
@@ -273,9 +287,6 @@ def _render_scan_bar() -> dict:
             "Active Contracts", value="📈 Automatic", disabled=True, key="oscill8_universe_display",
         )
         st.caption(f"{universe_start:%Y/%m/%d} → {universe_end:%Y/%m/%d}", help=UNIVERSE_HELP)
-        first_active = _first_active_contract(market_key, today)
-        if first_active:
-            st.caption(f"First active ({MARKETS[market_key].name}): **{first_active}**")
 
     with col_history:
         st.caption("HISTORY", help=HISTORY_HELP)
@@ -330,7 +341,6 @@ def _render_scan_bar() -> dict:
             st.caption("✓ Scan complete")
 
     return {
-        "market_key": market_key,
         "interval": interval,
         "contract_start": universe_start,
         "contract_end": universe_end,
@@ -344,9 +354,10 @@ def _render_scan_bar() -> dict:
     }
 
 
-def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...], bool, BarInterval | None]:
+def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     repo = StrategySetRepository()
-    default_market_key, default_interval = _peek_current_market_and_interval()
+    default_market_key = next(iter(MARKETS))
+    default_interval = _peek_current_interval()
 
     st.subheader("Strategy Workspace")
     st.caption("STRATEGY SET")
@@ -393,16 +404,6 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...], bool, Bar
     # when opened -- see ui.strategy_import_view.
     strategy_import_view.render_import_panel(repo)
 
-    # Strategy Set Scan (additive, separate workflow from the grid's own
-    # Run Scan below): only rendered once a saved set is actually
-    # selected -- there is nothing to run otherwise. Captured here,
-    # acted on later once ScanSetup's contract/price/lookback/percentile
-    # values exist -- see ui.strategy_set_scan_view's module docstring.
-    ss_scan_requested = False
-    ss_scan_interval: BarInterval | None = None
-    if selected_name is not None:
-        ss_scan_requested, ss_scan_interval = strategy_set_scan_view.render_controls(selected_name)
-
     message = ss_state.pop_message()
     if message is not None:
         level, text = message
@@ -420,7 +421,7 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...], bool, Bar
         default_market_key, default_interval,
     )
 
-    return grid_rows, position_columns, ss_scan_requested, ss_scan_interval
+    return grid_rows, position_columns
 
 
 def _render_strategy_grid(

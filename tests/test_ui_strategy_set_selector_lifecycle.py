@@ -71,6 +71,10 @@ def _selector(at: AppTest):
     return [s for s in at.selectbox if s.label == "Strategy Set"][0]
 
 
+def _selectbox(at: AppTest, label: str):
+    return [s for s in at.selectbox if s.label == label][0]
+
+
 def _button(at: AppTest, label: str):
     return [b for b in at.button if b.label == label][0]
 
@@ -135,15 +139,38 @@ def test_no_manage_strategy_set_panel_or_removed_lifecycle_buttons_exist(repo):
     assert "Manage Strategy Set" not in expander_titles
 
 
+def test_no_upper_per_set_run_button_once_a_strategy_set_is_selected(repo):
+    """Task 1: the former separate "▶ Run '<Strategy Set>'" button (with
+    its own independently-editable interval selector) is gone entirely
+    -- "▶ Run Scan" at the bottom of Scan Configuration is the only
+    execution path, whether or not a saved Strategy Set is selected."""
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+    _assert_no_exception(at)
+
+    run_labels = [b.label for b in at.button if "Run" in b.label]
+    assert run_labels == ["▶ Run Scan"]
+    assert not any(label.startswith("▶ Run '") for label in {b.label for b in at.button})
+    # The old per-set scan's own separate interval selector is gone too
+    # -- "Interval" (Scan Configuration's) is the only one left.
+    assert [s.label for s in at.selectbox].count("Interval") == 1
+    assert not any(s.key == "oscill8_ss_scan_interval" for s in at.selectbox)
+
+
 # ---------------------------------------------------------------------
 # 2/8/9: existing Strategy Set loads into the SAME grid; Run Scan uses it
 # ---------------------------------------------------------------------
 
 def test_selecting_an_existing_set_loads_its_own_market_and_interval_into_the_grid_row(repo):
     # The grid carries its OWN per-row Market/Interval (the multi-market
-    # fix) -- loading a set never needs to, and no longer does, touch
-    # the scan bar's top-level Market/Interval selectors. What matters
-    # for correctness is the loaded ROW's own cell values.
+    # fix) -- loading a set never touches anything else. Scan
+    # Configuration has no Market selector at all (Task 1: a Strategy
+    # Set's markets are exactly the markets its rows carry), and its
+    # Interval selector is a separate, RUNTIME-only concept -- see
+    # apply_interval_override() -- not a mirror of the grid's own cell.
+    # What matters for correctness here is the loaded ROW's own values.
     repo.save(
         StrategySet(
             name="6M Strategies",
@@ -299,8 +326,8 @@ def test_universe_indicator_is_shown_instead_of_date_inputs(repo):
     _assert_no_exception(at)
 
     # Rendered as a disabled text_input (not st.info) so its label-row +
-    # control-row height matches Market/Price History Start/Lookbacks in
-    # the other three Scan Configuration columns (alignment pass) --
+    # control-row height matches Interval/Price History Start/Lookbacks
+    # in the other three Scan Configuration columns (alignment pass) --
     # "Automatic" still appears somewhere in that indicator either way.
     all_text = " ".join(m.value for m in at.markdown) + " ".join(c.value for c in at.caption)
     infos = " ".join(i.value for i in at.info) if hasattr(at, "info") else ""
@@ -541,3 +568,210 @@ def test_delete_never_triggers_a_scan(repo, mocker):
     mock_run.assert_not_called()
 
     assert not repo.exists("Fresh Set")
+
+
+# ---------------------------------------------------------------------
+# Task 1: single Run Scan path, no global Market selector, Scan
+# Configuration's Interval is the one runtime interval control
+# ---------------------------------------------------------------------
+
+def test_no_global_market_selector_in_scan_configuration(repo):
+    """Removed entirely (Task 1): a Strategy Set's markets are exactly
+    the markets its rows carry (the grid's own per-row Market column) --
+    there is no global Market dropdown left to force everything onto
+    one market."""
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+
+    labels = {s.label for s in at.selectbox}
+    assert "Market" not in labels
+    assert "Interval" in labels
+
+
+def test_selecting_daily_runs_the_whole_strategy_set_at_daily(repo, mocker):
+    repo.save(
+        StrategySet(
+            name="Mixed Interval",
+            entries=(
+                _entry(name="SOFR Fly", market_key="SOFR", interval=BarInterval.HOURLY),
+                _entry(name="SONIA Fly", market_key="SONIA", interval=BarInterval.FOUR_HOUR),
+            ),
+        )
+    )
+    at = _app()
+    at.run()
+    _selector(at).select("Mixed Interval").run()
+
+    _selectbox(at, "Interval").select(BarInterval.DAILY).run()
+    _assert_no_exception(at)
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert len(request.definitions) == 2
+    # Every leg runs at the Scan Configuration interval, regardless of
+    # what each entry had persisted (HOURLY / FOUR_HOUR above).
+    assert {d.interval for d in request.definitions} == {BarInterval.DAILY}
+
+
+def test_selecting_1h_runs_the_whole_strategy_set_at_1h(repo, mocker):
+    repo.save(
+        StrategySet(
+            name="Mixed Interval",
+            entries=(
+                _entry(name="SOFR Fly", market_key="SOFR", interval=BarInterval.DAILY),
+                _entry(name="SONIA Fly", market_key="SONIA", interval=BarInterval.DAILY),
+            ),
+        )
+    )
+    at = _app()
+    at.run()
+    _selector(at).select("Mixed Interval").run()
+
+    _selectbox(at, "Interval").select(BarInterval.HOURLY).run()
+    _assert_no_exception(at)
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert {d.interval for d in request.definitions} == {BarInterval.HOURLY}
+
+
+def test_runtime_interval_does_not_silently_revert_to_daily(repo, mocker):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(interval=BarInterval.DAILY),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    _selectbox(at, "Interval").select(BarInterval.FOUR_HOUR).run()
+    _assert_no_exception(at)
+    assert _selectbox(at, "Interval").value == BarInterval.FOUR_HOUR
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert request.definitions[0].interval == BarInterval.FOUR_HOUR
+
+
+def test_lookbacks_primary_lookback_and_percentiles_pass_through_the_single_run_scan_path(repo, mocker):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    [m for m in at.multiselect if m.label == "Lookbacks (bars)"][0].set_value([20, 60]).run()
+    _selectbox(at, "Primary Lookback").select(60).run()
+    [n for n in at.number_input if n.label == "Lower %ile"][0].set_value(10).run()
+    [n for n in at.number_input if n.label == "Upper %ile"][0].set_value(90).run()
+    _assert_no_exception(at)
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert request.lookbacks == (20, 60)
+    assert request.lower_percentile == 10.0
+    assert request.upper_percentile == 90.0
+
+
+def test_active_contracts_and_history_window_still_configurable_from_the_single_run_scan_path(repo, mocker):
+    repo.save(StrategySet(name="6M Strategies", entries=(_entry(),)))
+    at = _app()
+    at.run()
+    _selector(at).select("6M Strategies").run()
+
+    custom_start = _TODAY - timedelta(days=45)
+    [d for d in at.date_input if d.label == "Price History Start"][0].set_value(custom_start).run()
+    _assert_no_exception(at)
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert request.price_start == custom_start
+    # Active Contracts stays fully automatic -- from today.
+    assert request.contract_start == _TODAY
+
+
+def test_existing_persisted_strategy_set_still_loads_after_the_simplification(repo):
+    """Persistence compatibility: a StrategySet saved before Task 1 (with
+    its own per-entry market/interval, exactly as strategy_sets.model/
+    serialization always wrote it) loads into the grid unchanged --
+    Task 1 only removed a second RUNTIME execution path/control, it
+    never touched the saved JSON schema."""
+    repo.save(
+        StrategySet(
+            name="Legacy Set",
+            entries=(
+                _entry(name="SOFR Fly", market_key="SOFR", interval=BarInterval.DAILY),
+                _entry(name="SONIA Fly", market_key="SONIA", interval=BarInterval.HOURLY),
+            ),
+        )
+    )
+    at = _app()
+    at.run()
+    _selector(at).select("Legacy Set").run()
+    _assert_no_exception(at)
+
+    grid = [df.value for df in at.dataframe if "Label" in df.value.columns][0]
+    by_label = grid.set_index("Label")
+    assert by_label.loc["SOFR Fly", "Market"] == "SOFR"
+    assert by_label.loc["SONIA Fly", "Interval"] == "HOURLY"
+
+
+def test_manual_scan_still_errors_cleanly_on_a_blank_grid_via_the_single_run_scan_path(repo, mocker):
+    """Non-Strategy-Set/grid scanning behavior (item 13), re-verified
+    after the Task 1 simplification: with no Strategy Set selected, a
+    blank "+ New Strategy Set" workspace still goes through the exact
+    same, single ui.scan_view.handle_run_scan() path -- there is no
+    special-cased "Strategy Set scan" branch left to diverge from it.
+    st.data_editor content itself isn't drivable via AppTest (see the
+    module docstring), so a positive manually-typed-row scan is covered
+    at the pure-function level instead -- see
+    tests/test_ui_formatting.py's build_definitions_from_grid/
+    apply_interval_override coverage, and the mixed-market/interval-
+    override tests above, which exercise this identical grid ->
+    handle_run_scan() path via a loaded Strategy Set."""
+    at = _app()
+    at.run()
+    _assert_no_exception(at)
+    assert _selector(at).value == "+ New Strategy Set"
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+    mock_run.assert_not_called()
+    assert any(e.value for e in at.error)
+
+
+def test_mixed_market_strategy_set_is_allowed_and_scans_every_market_in_one_run(repo, mocker):
+    repo.save(
+        StrategySet(
+            name="STIR Intermarket",
+            entries=(
+                _entry(name="SOFR Fly", market_key="SOFR"),
+                _entry(name="SONIA Fly", market_key="SONIA"),
+                _entry(name="CORRA Fly", market_key="CORRA"),
+            ),
+        )
+    )
+    at = _app()
+    at.run()
+    _selector(at).select("STIR Intermarket").run()
+    _assert_no_exception(at)
+
+    mock_run = mocker.patch.object(scan_view, "run_scan", return_value=ScanReport(results=()))
+    _button(at, "▶ Run Scan").click().run()
+    _assert_no_exception(at)
+
+    request = mock_run.call_args[0][0]
+    assert {d.market_key for d in request.definitions} == {"SOFR", "SONIA", "CORRA"}

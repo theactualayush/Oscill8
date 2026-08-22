@@ -19,7 +19,7 @@ display.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import pandas as pd
@@ -222,6 +222,15 @@ def build_definitions_from_grid(
     the fallback for rows that don't carry them (e.g. legacy callers/
     tests that only ever passed one grid-wide market_key/interval,
     which keeps this function fully backward compatible).
+
+    Task 1 simplification note: the per-row Interval this function reads
+    is still what a Strategy Set persists (see ui.strategy_set_view/
+    ui.strategy_set_formatting) and still seeds a freshly-typed row, but
+    it is no longer the runtime interval a scan actually executes at --
+    see apply_interval_override() below, which ui.scan_view.
+    handle_run_scan() applies to this function's output before running.
+    Market has no equivalent override: each row's own Market always
+    determines which market that leg prices against.
     """
     results: list[TemplateRowResult] = []
     for i, row in enumerate(rows):
@@ -237,6 +246,21 @@ def build_definitions_from_grid(
         except ValueError as exc:
             results.append(TemplateRowResult(i, label, None, str(exc)))
     return results
+
+
+def apply_interval_override(
+    definitions: Sequence[StrategyDefinition], interval: BarInterval
+) -> list[StrategyDefinition]:
+    """Force every definition to run at ONE interval -- Scan
+    Configuration's own Interval selector (see ui.controls), the single
+    runtime source of truth for a scan (Task 1 simplification: the grid's
+    per-row Interval column, and a saved Strategy Set's persisted
+    per-entry interval, no longer drive execution -- they remain only
+    for what gets saved/edited). Never mutates `definitions`; each row
+    keeps its own market/offsets/weights/price_field unchanged, only
+    `interval` is replaced.
+    """
+    return [replace(d, interval=interval) for d in definitions]
 
 
 # ---------------------------------------------------------------------

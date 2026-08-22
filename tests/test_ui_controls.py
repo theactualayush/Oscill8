@@ -158,3 +158,24 @@ def test_scan_setup_still_carries_contract_start_end_even_though_automatic():
     # (see _default_universe_window) rather than removed.
     field_names = {f.name for f in dataclasses.fields(ScanSetup)}
     assert {"contract_start", "contract_end"}.issubset(field_names)
+
+
+# ---------------------------------------------------------------------
+# Task 1: no global Market field, no second Strategy Set Scan path
+# ---------------------------------------------------------------------
+
+def test_scan_setup_has_no_global_market_field():
+    # Scan Configuration's Market dropdown is removed entirely -- a
+    # Strategy Set's markets are exactly the markets its rows carry (the
+    # grid's own per-row Market column), so there is no grid-wide market
+    # for ScanSetup to hold.
+    field_names = {f.name for f in dataclasses.fields(ScanSetup)}
+    assert "market_key" not in field_names
+
+
+def test_scan_setup_has_no_separate_strategy_set_scan_fields():
+    # The former separate "Run '<Strategy Set>'" button/interval are
+    # gone -- "▶ Run Scan" (run_clicked) is the only execution trigger.
+    field_names = {f.name for f in dataclasses.fields(ScanSetup)}
+    assert "strategy_set_scan_requested" not in field_names
+    assert "strategy_set_scan_interval" not in field_names
