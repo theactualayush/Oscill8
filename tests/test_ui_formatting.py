@@ -33,6 +33,7 @@ from ui.formatting import (
     RESULT_COLUMN_HELP,
     STABILITY_FILTER_SPEC,
     add_rank_column,
+    apply_interval_override,
     build_definitions_from_grid,
     build_filter_criteria,
     build_sort_keys,
@@ -147,6 +148,47 @@ def test_build_definitions_from_grid_defaults_label_when_blank():
     rows = [{"Label": "", _POS3[0]: 1, _POS3[1]: -1, _POS3[2]: 0}]
     results = build_definitions_from_grid(rows, _POS3, "SOFR", BarInterval.DAILY)
     assert results[0].label == "Strategy 1"
+
+
+# ---------------------------------------------------------------------
+# apply_interval_override (Task 1: Scan Configuration's Interval is the
+# single runtime interval for every leg of a scan)
+# ---------------------------------------------------------------------
+
+def _definition(market_key="SOFR", interval=BarInterval.DAILY, weights=(1.0, -2.0, 1.0)) -> StrategyDefinition:
+    return StrategyDefinition(
+        market_key=market_key, offsets=tuple(range(len(weights))), weights=weights, interval=interval,
+    )
+
+
+def test_apply_interval_override_forces_every_definition_to_one_interval():
+    definitions = [
+        _definition(market_key="SOFR", interval=BarInterval.HOURLY),
+        _definition(market_key="SONIA", interval=BarInterval.FOUR_HOUR),
+        _definition(market_key="CORRA", interval=BarInterval.DAILY),
+    ]
+    overridden = apply_interval_override(definitions, BarInterval.DAILY)
+    assert [d.interval for d in overridden] == [BarInterval.DAILY] * 3
+
+
+def test_apply_interval_override_leaves_market_offsets_weights_untouched():
+    original = _definition(market_key="SONIA", interval=BarInterval.DAILY, weights=(1.0, -1.0))
+    (overridden,) = apply_interval_override([original], BarInterval.HOURLY)
+    assert overridden.market_key == original.market_key
+    assert overridden.offsets == original.offsets
+    assert overridden.weights == original.weights
+    assert overridden.price_field == original.price_field
+    assert overridden.interval == BarInterval.HOURLY
+
+
+def test_apply_interval_override_does_not_mutate_the_original_definitions():
+    original = _definition(interval=BarInterval.DAILY)
+    apply_interval_override([original], BarInterval.HOURLY)
+    assert original.interval == BarInterval.DAILY
+
+
+def test_apply_interval_override_on_empty_list():
+    assert apply_interval_override([], BarInterval.DAILY) == []
 
 
 # ---------------------------------------------------------------------

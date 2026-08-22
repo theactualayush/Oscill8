@@ -9,9 +9,9 @@ unmodified strategy_sets.repository.StrategySetRepository.save() --
 there is no separate "imported Strategy Set" model; a saved imported
 set is byte-for-byte the same object a hand-built one is, and is
 immediately visible to and usable by ui.strategy_set_view's selector
-and ui.strategy_set_scan_view's Strategy Set Scan (both just read
-StrategySetRepository.list_names()/load(), unaware of how a given file
-got there).
+(loading it into the grid, which is what ui.scan_view.handle_run_scan()
+-- the single Run Scan path -- actually scans, see that module's
+docstring), unaware of how a given file got there.
 
 parse -> preview -> import, all client-side of this module:
     strategy_import.parsing.parse_csv()/parse_workbook()  -- pure, no writes
@@ -27,12 +27,13 @@ strategy_import.validation.DEFAULT_IMPORT_INTERVAL (a required
 placeholder value; StrategyDefinition.interval has no optional/None
 state in the existing, unmodified schema) purely so it can be
 constructed at all. The interval a trader actually cares about is
-chosen at RUN time via ui.strategy_set_scan_view's own selector, which
-overrides it unconditionally on every run regardless of what's stored
--- so this placeholder is inert for that workflow. It only becomes
-visible/relevant if an imported set's rows are loaded into the manual
-grid (ui.controls), where it behaves exactly like any freshly-typed
-row's Interval cell: editable, not authoritative.
+chosen at RUN time via Scan Configuration's own Interval selector,
+which ui.formatting.apply_interval_override() applies to every leg of
+every scan regardless of what's stored -- so this placeholder is inert
+for that workflow. It only becomes visible/relevant as the grid's own
+per-row Interval cell (still shown/edited, still what gets saved) once
+an imported set is loaded, where it behaves exactly like any
+freshly-typed row's Interval cell: editable, not authoritative.
 """
 
 from __future__ import annotations

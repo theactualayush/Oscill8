@@ -68,7 +68,7 @@ same script pass. So render_save_button() only captures whether the
 Save button was clicked (a plain bool, returned to the caller) --
 process_save() performs the actual save once grid_rows is available,
 exactly mirroring the split ui.controls' render order already needs
-for _peek_current_market_and_interval().
+for _peek_current_interval().
 
 Delete confirmation: clicking Delete never deletes immediately -- it
 only sets a session-state flag that opens an `@st.dialog` confirmation

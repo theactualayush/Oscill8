@@ -207,7 +207,10 @@ def test_xlsx_import_creates_one_strategy_set_per_worksheet(repo):
 # Imported sets are immediately usable by Strategy Set Scan
 # ---------------------------------------------------------------------
 
-def test_imported_set_is_immediately_selectable_for_strategy_set_scan(repo):
+def test_imported_set_is_immediately_selectable_and_runnable(repo):
+    # Task 1: there is exactly one Run Scan path -- an imported set
+    # becomes selectable and its rows load into the SAME grid "▶ Run
+    # Scan" always scans, with no separate per-set run button/interval.
     at = _app()
     at.run()
     at = _open_import_panel(at)
@@ -220,5 +223,5 @@ def test_imported_set_is_immediately_selectable_for_strategy_set_scan(repo):
     selector = [s for s in at.selectbox if s.label == "Strategy Set"][0]
     assert selector.value == "csv_import"
 
-    run_buttons = [b for b in at.button if b.label == "▶ Run 'csv_import'"]
-    assert len(run_buttons) == 1
+    run_labels = [b.label for b in at.button if "Run" in b.label]
+    assert run_labels == ["▶ Run Scan"]

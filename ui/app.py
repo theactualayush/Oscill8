@@ -1,18 +1,19 @@
 """
 app.py
 
-Module 6A/6B/7B entry point: scan panel (Market/Data, Universe,
-History, Analytics, Run Scan) + Strategy Templates grid (with its
-integrated Strategy Set selector/Save) -> Run Scan -> Range-Bound
-Opportunities (status, ranking/filters, ranked result grid, skipped
-candidates) -> Selected Strategy summary -> Selected Strategy history
-chart. Thin orchestration only -- every analytics, filtering, ranking,
-pricing, and Strategy Set persistence computation is delegated to
-strategy_engine / range_analytics / template_scanner / strategy_sets,
-unmodified. There is exactly one strategy grid and one Run Scan button
--- a loaded Strategy Set becomes ordinary grid rows and takes the same
-Run Scan path a manually-typed row does (see ui.controls/ui.
-strategy_set_view).
+Module 6A/6B/7B entry point: scan panel (Interval, Contracts, History,
+Analytics, Run Scan) + Strategy Templates grid (with its integrated
+Strategy Set selector/Save) -> Run Scan -> Range-Bound Opportunities
+(status, ranking/filters, ranked result grid, skipped candidates) ->
+Selected Strategy summary -> Selected Strategy history chart. Thin
+orchestration only -- every analytics, filtering, ranking, pricing, and
+Strategy Set persistence computation is delegated to strategy_engine /
+range_analytics / template_scanner / strategy_sets, unmodified. There
+is exactly one strategy grid and exactly one Run Scan button (Task 1
+simplification: the former separate "Run '<Strategy Set>'" button and
+its own interval selector are gone) -- a loaded Strategy Set becomes
+ordinary grid rows and takes the same Run Scan path a manually-typed
+row does (see ui.controls/ui.scan_view/ui.strategy_set_view).
 
 Run with: streamlit run ui/app.py
 """
@@ -37,7 +38,6 @@ from ui import strategy_set_state as ss_state
 from ui.controls import render_scan_setup
 from ui.results_view import render_results
 from ui.scan_view import handle_run_scan, render_scan_error
-from ui.strategy_set_scan_view import handle_run_strategy_set_scan
 
 st.set_page_config(page_title="Oscill8 Scanner", layout="wide")
 
@@ -65,9 +65,6 @@ setup = render_scan_setup()
 
 if setup.run_clicked:
     handle_run_scan(setup)
-
-if setup.strategy_set_scan_requested:
-    handle_run_strategy_set_scan(setup)
 
 render_scan_error()
 
