@@ -44,6 +44,19 @@ QuantHub does NOT support a start/end date-range request shape
 count= works). This module therefore estimates a `count` generous
 enough to cover [start, end] and filters client-side -- see
 _estimate_count()'s docstring for the known limitation this carries.
+
+Live testing (see QUANTHUB_MAX_REQUEST_COUNT) also confirmed count=3000
+is safe for at least 4 different instruments across 2 exchanges, while
+count=4416 for one of them (YBAH28) returned HTTP 429 -- so this module
+caps every single-request count at 3000 and NEVER makes multiple
+requests or paginates to compensate (no such mechanism is known to
+exist for this API): a request whose true required history exceeds the
+cap simply retrieves a shorter window than asked for, exactly like an
+instrument whose own real history is shorter than the requested count
+(both are normal, expected outcomes here, never treated as errors and
+never padded/fabricated). HTTP 429 itself is raised as a distinct,
+non-retried QuantHubRateLimitError -- see that class and
+_fetch_quanthub_records for the retry-policy detail.
 """
 
 from __future__ import annotations
@@ -52,7 +65,13 @@ from datetime import datetime
 
 import pandas as pd
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from core import config
 from core.config import BarInterval, FUTURES_MONTH_CODES
@@ -69,6 +88,23 @@ class QuantHubCredentialsMissingError(Exception):
     the way that narrow, LSEG-specific exception is. A market routed to
     LSEG must remain fully usable with no QuantHub credentials present
     at all -- this exception only ever fires on the QuantHub call path.
+    """
+
+
+class QuantHubRateLimitError(Exception):
+    """Raised when QuantHub returns HTTP 429 (rate limited) -- live-
+    confirmed to occur (a count=4416 request for YBAH28 returned 429).
+    Deliberately NOT retried by the generic tenacity policy on
+    _fetch_quanthub_records: unlike a 5xx or network failure, we have no
+    evidence of a Retry-After header or any other cooldown signal in the
+    response, so blindly retrying on the same short exponential backoff
+    used for transient errors risks compounding the rate-limit condition
+    rather than resolving it. Whether 429 here is caused by request size
+    or by a request-rate limit is NOT established -- this exception only
+    makes the condition distinguishable to callers, it does not claim a
+    cause. Distinct from QuantHubCredentialsMissingError (a configuration
+    problem) and from core.downloader.MarketDataUnavailableError (LSEG's
+    own narrow "no market data for this RIC" classification, unrelated).
     """
 
 
@@ -144,27 +180,50 @@ _DAILY_COUNT_BUFFER = 5
 # since QuantHub returns the most recent N bars, not a specific range.
 _HOURLY_BARS_PER_DAY = 24
 
+# Conservative maximum single-request `count`, based on live testing
+# (see the QuantHub history investigation): count=3000 returned HTTP 200
+# with real data for FOUR different instruments across two exchanges
+# (YBAH28, ERH26, FSRH26, SONH26); count=4416 for YBAH28 returned HTTP
+# 429. This is NOT a claim that 3000 is QuantHub's actual limit, nor
+# that every instrument has 3000 bars of real history (YBAH28 itself
+# only ever returned 2995 regardless of whether 3000 or 4000 was
+# requested -- available history is instrument-specific, never padded
+# or fabricated here) -- it is simply the largest count value this
+# integration has live evidence is safe to request in one call. Whether
+# HTTP 429 is triggered by request size specifically, by a request-rate
+# limit, or something else, is NOT established -- this cap addresses
+# the one confirmed-safe data point without guessing at the cause.
+QUANTHUB_MAX_REQUEST_COUNT = 3000
+
 
 def _estimate_count(native_interval: str, start: datetime, end: datetime) -> int:
-    """Estimate a QuantHub `count` generous enough to cover [start, end].
+    """Estimate a QuantHub `count` generous enough to cover [start, end],
+    capped at QUANTHUB_MAX_REQUEST_COUNT.
 
     KNOWN LIMITATION (see CLAUDE.md / the original QuantHub-integration
-    task notes): whether `count` truly means "newest N observations",
-    what QuantHub's maximum allowed count actually is, and whether
-    pagination exists, are all UNVERIFIED as of this implementation --
-    this heuristic is deliberately over-generous and cannot be proven
-    correct for a very old/wide date range without further live testing
-    against the real API. _fetch_quanthub_records() logs a warning
-    whenever the returned data does not reach back to `start`, so a
-    too-small count fails loudly (a gap in cached history, visible in
-    logs) rather than silently.
+    task notes): whether `count` truly means "newest N observations" is
+    unverified beyond the live tests QUANTHUB_MAX_REQUEST_COUNT is based
+    on, and no pagination/start/end/offset/cursor mechanism is known to
+    exist (confirmed absent from both this client and any documentation
+    available to this repo) -- so a request whose true required count
+    would exceed the cap simply retrieves a shorter history than the
+    requested [start, end] window, never multiple requests, never
+    fabricated bars. This heuristic is deliberately over-generous UNDER
+    the cap and cannot be proven correct for a very old/wide date range
+    without further live testing. _fetch_quanthub_records() logs a
+    warning whenever the returned data does not reach back to `start`
+    despite the full (possibly capped) count being consumed, so a
+    too-small effective count fails loudly (a gap in cached history,
+    visible in logs) rather than silently.
     """
     calendar_days = max((end.date() - start.date()).days + 1, 1)
     if native_interval == "1D":
-        return calendar_days + _DAILY_COUNT_BUFFER
-    if native_interval == "1H":
-        return calendar_days * _HOURLY_BARS_PER_DAY + _HOURLY_BARS_PER_DAY
-    raise ValueError(f"No count-estimation rule for QuantHub native_interval={native_interval!r}")
+        estimated = calendar_days + _DAILY_COUNT_BUFFER
+    elif native_interval == "1H":
+        estimated = calendar_days * _HOURLY_BARS_PER_DAY + _HOURLY_BARS_PER_DAY
+    else:
+        raise ValueError(f"No count-estimation rule for QuantHub native_interval={native_interval!r}")
+    return min(estimated, QUANTHUB_MAX_REQUEST_COUNT)
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +244,14 @@ def _auth_headers() -> dict:
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
+    # A 429 (QuantHubRateLimitError) is deliberately excluded from retry
+    # -- see that exception's own docstring for why blindly retrying a
+    # rate-limit response on this short backoff is not safe to assume.
+    # Every other exception (5xx, network/timeout failures, etc.) keeps
+    # the existing retry behaviour unchanged -- mirrors core.downloader.
+    # _fetch_chunk's own retry_if_exception_type & retry_if_not_
+    # exception_type pattern for its own narrow exclusion.
+    retry=retry_if_exception_type(Exception) & retry_if_not_exception_type(QuantHubRateLimitError),
 )
 def _fetch_quanthub_records(
     instruments: list[str], native_interval: str, count: int
@@ -204,11 +271,18 @@ def _fetch_quanthub_records(
     result, e.g. {"status": "SUCCESS", "data": []}). Both are handled;
     no other wrapper shape has been observed or is assumed.
 
-    Deliberately does NOT classify an HTTP 500 (observed live, as an
-    HTML error page) as market-data-unavailable -- that would invent
-    QuantHub error semantics we do not have evidence for (see CLAUDE.md
-    Part 8). raise_for_status() lets it propagate as a plain
-    requests.HTTPError, a real, unclassified provider failure.
+    HTTP 429 (live-confirmed, see QuantHubRateLimitError) is raised as
+    that specific exception BEFORE raise_for_status() and is excluded
+    from this function's own retry policy above. Deliberately does NOT
+    classify an HTTP 500 (observed live, as an HTML error page) as
+    market-data-unavailable -- that would invent QuantHub error
+    semantics we do not have evidence for (see CLAUDE.md Part 8).
+    raise_for_status() lets a 500 (or any other non-429 error status)
+    propagate as a plain requests.HTTPError, a real, unclassified
+    provider failure that DOES still retry per the policy above -- no
+    Retry-After or other cooldown header handling is implemented for
+    429 or anything else, since none has been observed in this API's
+    responses.
     """
     headers = _auth_headers()
     params = {
@@ -219,6 +293,11 @@ def _fetch_quanthub_records(
     logger.debug("Fetching QuantHub %s interval=%s count=%d", instruments, native_interval, count)
 
     response = requests.get(config.QUANTHUB_BASE_URL, headers=headers, params=params, timeout=30)
+    if response.status_code == 429:
+        raise QuantHubRateLimitError(
+            f"QuantHub rate-limited this request (HTTP 429) for {instruments} "
+            f"interval={native_interval} count={count}."
+        )
     response.raise_for_status()
 
     payload = response.json()

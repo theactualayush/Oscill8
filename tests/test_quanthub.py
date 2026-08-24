@@ -264,6 +264,54 @@ def test_fetch_records_http_500_propagates_as_plain_http_error_not_market_data_u
     # Confirm this is NOT (and never becomes) the narrow LSEG classification.
 
 
+# ---------------------------------------------------------------------
+# HTTP 429: distinct exception, NOT retried; 5xx/network errors still are.
+# ---------------------------------------------------------------------
+
+def test_http_429_raises_quanthub_rate_limit_error_not_generic_http_error(mocker):
+    _mock_response(mocker, status_code=429)
+    with pytest.raises(quanthub.QuantHubRateLimitError):
+        quanthub._fetch_quanthub_records(["YBAH28"], "1H", 4416)
+
+
+def test_http_429_is_not_retried(mocker):
+    # exactly one call, not the usual up-to-3 tenacity attempts.
+    mock_get = _mock_response(mocker, status_code=429)
+    with pytest.raises(quanthub.QuantHubRateLimitError):
+        quanthub._fetch_quanthub_records(["YBAH28"], "1H", 4416)
+    assert mock_get.call_count == 1
+
+
+def test_quanthub_rate_limit_error_is_not_credentials_or_market_data_unavailable_error():
+    assert not issubclass(quanthub.QuantHubRateLimitError, quanthub.QuantHubCredentialsMissingError)
+    assert not issubclass(quanthub.QuantHubRateLimitError, MarketDataUnavailableError)
+
+
+def test_http_500_still_retries_up_to_three_attempts(mocker):
+    # Transient/5xx errors keep the existing generic retry behaviour --
+    # only 429 is excluded.
+    mock_get = _mock_response(mocker, status_code=500, raise_exc=requests.exceptions.HTTPError("500 Server Error"))
+    with pytest.raises(requests.exceptions.HTTPError):
+        quanthub._fetch_quanthub_records(["SONH26"], "1D", 5)
+    assert mock_get.call_count == 3
+
+
+def test_network_failure_still_retries_up_to_three_attempts(mocker):
+    mock_get = mocker.patch(
+        "core.quanthub.requests.get", side_effect=requests.exceptions.ConnectionError("boom")
+    )
+    with pytest.raises(requests.exceptions.ConnectionError):
+        quanthub._fetch_quanthub_records(["SONH26"], "1D", 5)
+    assert mock_get.call_count == 3
+
+
+def test_download_history_propagates_rate_limit_error_without_retry_or_fallback(mocker):
+    mock_get = _mock_response(mocker, status_code=429)
+    with pytest.raises(quanthub.QuantHubRateLimitError):
+        quanthub.download_history("YBAH28", "HOURLY", "2026-01-01", "2026-06-30")
+    assert mock_get.call_count == 1
+
+
 def test_missing_credentials_raises_before_any_http_call(mocker, monkeypatch):
     monkeypatch.setattr(config, "QUANTHUB_TOKEN", "")
     mock_get = mocker.patch("core.quanthub.requests.get")
@@ -387,3 +435,70 @@ def test_estimate_count_hourly_generously_covers_span():
 def test_estimate_count_unknown_interval_raises():
     with pytest.raises(ValueError, match="No count-estimation rule"):
         quanthub._estimate_count("5M", datetime(2026, 1, 1), datetime(2026, 1, 2))
+
+
+# ---------------------------------------------------------------------
+# QUANTHUB_MAX_REQUEST_COUNT: conservative cap, live-tested at 3000
+# ---------------------------------------------------------------------
+
+def test_max_request_count_is_3000():
+    # Locks the constant itself to the live-tested value -- not a
+    # universal QuantHub limit, just the largest value this integration
+    # has evidence is safe (see the constant's own docstring).
+    assert quanthub.QUANTHUB_MAX_REQUEST_COUNT == 3000
+
+
+def test_estimate_count_below_cap_is_unchanged():
+    # A small window's natural estimate is well under 3000 -- the cap
+    # must not alter it.
+    start = datetime(2026, 1, 1)
+    end = datetime(2026, 1, 10)
+    uncapped = 10 * quanthub._HOURLY_BARS_PER_DAY + quanthub._HOURLY_BARS_PER_DAY
+    assert uncapped < quanthub.QUANTHUB_MAX_REQUEST_COUNT
+    assert quanthub._estimate_count("1H", start, end) == uncapped
+
+
+def test_estimate_count_above_cap_is_capped_at_3000():
+    # Reproduces the exact live scenario: a ~183-day 1H window naturally
+    # estimates to 4416 (the count that produced the live HTTP 429) --
+    # must now be capped at 3000, never left uncapped.
+    start = datetime(2026, 1, 1)
+    end = datetime(2026, 7, 3)  # 184 calendar days -> (184)*24+24 = 4440 uncapped
+    count = quanthub._estimate_count("1H", start, end)
+    assert count == quanthub.QUANTHUB_MAX_REQUEST_COUNT
+
+
+def test_estimate_count_daily_above_cap_is_also_capped():
+    start = datetime(2000, 1, 1)
+    end = datetime(2026, 1, 1)  # ~26 years of calendar days, far above 3000
+    count = quanthub._estimate_count("1D", start, end)
+    assert count == quanthub.QUANTHUB_MAX_REQUEST_COUNT
+
+
+def test_estimate_count_never_makes_multiple_requests_to_compensate(mocker):
+    # A window whose true required count would exceed the cap must
+    # still result in exactly ONE HTTP call, never pagination/multiple
+    # requests to try to compensate for the cap.
+    records = _records_for_dates("YBAH28", ["2026-06-25", "2026-06-26"])
+    mock_get = _mock_response(mocker, json_body=records)
+
+    quanthub.download_history("YBAH28", "HOURLY", "2026-01-01", "2026-07-03")
+
+    assert mock_get.call_count == 1
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["count"] == quanthub.QUANTHUB_MAX_REQUEST_COUNT
+
+
+def test_fewer_records_than_requested_is_accepted_not_an_error(mocker):
+    # Direct reproduction of the live YBAH28 finding: count=3000/4000
+    # requested, only 2995 returned, HTTP 200 -- must be accepted as a
+    # normal, instrument-specific result, never raised as an exception
+    # or padded/fabricated up to the requested count.
+    records = _records_for_dates("YBAH28", [f"2026-01-{d:02d}" for d in range(1, 11)])  # 10 records
+    _mock_response(mocker, json_body=records)
+
+    df = quanthub.download_history("YBAH28", "DAILY", "2026-01-01", "2026-03-01")
+
+    # No exception raised (the call above completing is itself the
+    # assertion); the shorter-than-requested history is returned as-is.
+    assert len(df) == 10
