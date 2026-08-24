@@ -11,11 +11,14 @@ involved.
 
 from __future__ import annotations
 
+import pytest
+
 from core.config import BarInterval
 
 from strategy_engine.definitions import StrategyDefinition
 
 from strategy_import.commit import ImportSummary
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_import.preview import ImportCandidate
 from strategy_import.validation import DEFAULT_IMPORT_INTERVAL, InvalidRow, ReadyRow, UnavailableRow
 
@@ -30,6 +33,24 @@ from ui.strategy_import_formatting import (
 )
 
 from strategy_import.preview import ImportPreview
+
+
+@pytest.fixture
+def synthetic_unavailable_markets(monkeypatch):
+    """market_breakdown_lines() looks up each unavailable code's reason
+    text via UNAVAILABLE_MARKET_CODES (see that function's own
+    docstring/investigation) -- ER/YBA/FSR are now genuinely SUPPORTED,
+    so tests exercising this code path use clearly-synthetic codes
+    registered ONLY here, never in the real, committed dict.
+    """
+    codes = {
+        "ZZZ": "ZZZ is not currently configured in Oscill8.",
+        "ZZY": "ZZY market data is not currently configured in Oscill8.",
+        "ZZX": "ZZX market data is not currently configured in Oscill8.",
+    }
+    for code, reason in codes.items():
+        monkeypatch.setitem(UNAVAILABLE_MARKET_CODES, code, reason)
+    return codes
 
 
 def _ready(market_key: str, label: str, row_number: int = 2) -> ReadyRow:
@@ -64,57 +85,57 @@ def test_breakdown_shows_ready_markets_with_checkmark():
     assert "SON ✓" in lines
 
 
-def test_breakdown_shows_er_as_unavailable_with_reason():
-    unavailable = UnavailableRow(row_number=4, label="Euribor Trade", market_code="ER", reason="Euribor is not currently configured in Oscill8.")
+def test_breakdown_shows_synthetic_unavailable_market_with_reason(synthetic_unavailable_markets):
+    unavailable = UnavailableRow(row_number=4, label="Synthetic Trade", market_code="ZZZ", reason=synthetic_unavailable_markets["ZZZ"])
     candidate = _candidate("Set", unavailable=[unavailable])
     preview = ImportPreview(candidates=(candidate,))
 
     lines = market_breakdown_lines(preview)
 
-    assert lines == ["ER ⚠ Euribor is not currently configured in Oscill8."]
+    assert lines == [f"ZZZ ⚠ {synthetic_unavailable_markets['ZZZ']}"]
 
 
-def test_breakdown_matches_the_product_brief_worked_example():
+def test_breakdown_matches_the_product_brief_worked_example(synthetic_unavailable_markets):
     candidate = _candidate(
         "Set",
         ready=[_ready("SOFR", "A"), _ready("SONIA", "B"), _ready("CORRA", "C")],
-        unavailable=[UnavailableRow(5, "D", "ER", "Euribor is not currently configured in Oscill8.")],
+        unavailable=[UnavailableRow(5, "D", "ZZZ", synthetic_unavailable_markets["ZZZ"])],
     )
     preview = ImportPreview(candidates=(candidate,))
 
     lines = market_breakdown_lines(preview)
 
-    assert lines == ["CRA ✓", "SON ✓", "SRA ✓", "ER ⚠ Euribor is not currently configured in Oscill8."]
+    assert lines == ["CRA ✓", "SON ✓", "SRA ✓", f"ZZZ ⚠ {synthetic_unavailable_markets['ZZZ']}"]
 
 
 def test_breakdown_empty_preview_is_empty():
     assert market_breakdown_lines(ImportPreview(candidates=())) == []
 
 
-def test_breakdown_shows_yba_and_fsr_as_unavailable_with_distinct_reasons():
+def test_breakdown_shows_two_unavailable_markets_with_distinct_reasons(synthetic_unavailable_markets):
     candidate = _candidate(
         "Set",
         unavailable=[
-            UnavailableRow(38, "3M Spread", "YBA", "Australian exchange market data is not currently configured in Oscill8."),
-            UnavailableRow(43, "3M Spread", "FSR", "SARON 3M futures data is not currently configured in Oscill8."),
+            UnavailableRow(38, "3M Spread", "ZZY", synthetic_unavailable_markets["ZZY"]),
+            UnavailableRow(43, "3M Spread", "ZZX", synthetic_unavailable_markets["ZZX"]),
         ],
     )
     preview = ImportPreview(candidates=(candidate,))
 
     lines = market_breakdown_lines(preview)
 
-    assert "FSR ⚠ SARON 3M futures data is not currently configured in Oscill8." in lines
-    assert "YBA ⚠ Australian exchange market data is not currently configured in Oscill8." in lines
+    assert f"ZZX ⚠ {synthetic_unavailable_markets['ZZX']}" in lines
+    assert f"ZZY ⚠ {synthetic_unavailable_markets['ZZY']}" in lines
 
 
-def test_breakdown_with_er_yba_fsr_all_present_shows_each_distinctly():
+def test_breakdown_with_three_unavailable_markets_all_present_shows_each_distinctly(synthetic_unavailable_markets):
     candidate = _candidate(
         "Set",
         ready=[_ready("SOFR", "A"), _ready("SONIA", "B"), _ready("CORRA", "C")],
         unavailable=[
-            UnavailableRow(5, "D", "ER", "Euribor is not currently configured in Oscill8."),
-            UnavailableRow(38, "E", "YBA", "Australian exchange market data is not currently configured in Oscill8."),
-            UnavailableRow(43, "F", "FSR", "SARON 3M futures data is not currently configured in Oscill8."),
+            UnavailableRow(5, "D", "ZZZ", synthetic_unavailable_markets["ZZZ"]),
+            UnavailableRow(38, "E", "ZZY", synthetic_unavailable_markets["ZZY"]),
+            UnavailableRow(43, "F", "ZZX", synthetic_unavailable_markets["ZZX"]),
         ],
     )
     preview = ImportPreview(candidates=(candidate,))
@@ -123,9 +144,9 @@ def test_breakdown_with_er_yba_fsr_all_present_shows_each_distinctly():
 
     assert lines == [
         "CRA ✓", "SON ✓", "SRA ✓",
-        "ER ⚠ Euribor is not currently configured in Oscill8.",
-        "FSR ⚠ SARON 3M futures data is not currently configured in Oscill8.",
-        "YBA ⚠ Australian exchange market data is not currently configured in Oscill8.",
+        f"ZZX ⚠ {synthetic_unavailable_markets['ZZX']}",
+        f"ZZY ⚠ {synthetic_unavailable_markets['ZZY']}",
+        f"ZZZ ⚠ {synthetic_unavailable_markets['ZZZ']}",
     ]
 
 

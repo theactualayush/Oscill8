@@ -130,7 +130,54 @@ def test_build_then_parse_round_trip(market_key, month, year):
         ("ESTR", 12, 2026, "SREZ26"),
         ("ESTR", 3, 2027, "SREH27"),
         ("ESTR", 6, 2027, "SREM27"),
+        # EURIBOR: root "FEI", 1-digit year -- trader-confirmed against
+        # real contract codes FEIM6/FEIU7 (not yet live-LSEG-verified in
+        # this environment).
+        ("EURIBOR", 6, 2026, "FEIM6"),
+        ("EURIBOR", 9, 2027, "FEIU7"),
+        # SARON: root "SARO3", 1-digit year -- trader-confirmed against
+        # real contract codes SARO3U6/SARO3M7.
+        ("SARON", 9, 2026, "SARO3U6"),
+        ("SARON", 6, 2027, "SARO3M7"),
+        # YBA (Australia 90 Day Bank Bill): root "YBA", 1-digit year --
+        # trader-confirmed against real contract codes YBAU6/YBAZ7.
+        ("YBA", 9, 2026, "YBAU6"),
+        ("YBA", 12, 2027, "YBAZ7"),
+        # ESTR_ICE (ICE Europe €STR -- DISTINCT market key from "ESTR",
+        # which is the CME product): root "EON3", 1-digit year --
+        # trader-confirmed against real contract codes EON3U6/EON3Z7.
+        ("ESTR_ICE", 9, 2026, "EON3U6"),
+        ("ESTR_ICE", 12, 2027, "EON3Z7"),
     ],
 )
 def test_build_ric_market_specific_conventions(market_key, month, year, expected):
     assert ric.build_ric(market_key, month, year) == expected
+
+
+@pytest.mark.parametrize(
+    "ric_str,expected_market_key,expected_month,expected_year",
+    [
+        ("FEIM6", "EURIBOR", 6, 2026),
+        ("FEIU7", "EURIBOR", 9, 2027),
+        ("SARO3U6", "SARON", 9, 2026),
+        ("SARO3M7", "SARON", 6, 2027),
+        ("YBAU6", "YBA", 9, 2026),
+        ("YBAZ7", "YBA", 12, 2027),
+        ("EON3U6", "ESTR_ICE", 9, 2026),
+        ("EON3Z7", "ESTR_ICE", 12, 2027),
+    ],
+)
+def test_parse_ric_new_market_round_trip(ric_str, expected_market_key, expected_month, expected_year):
+    parsed = ric.parse_ric(ric_str, reference_date=date(2026, 1, 1))
+    assert parsed.market_key == expected_market_key
+    assert parsed.month == expected_month
+    assert parsed.year == expected_year
+
+
+def test_estr_and_estr_ice_are_never_confused_by_parse_ric():
+    # "ESTR" (CME, root "SRE") and "ESTR_ICE" (ICE Europe, root "EON3")
+    # must resolve to their own distinct market keys, never each other's.
+    cme = ric.parse_ric("SREU26")
+    ice = ric.parse_ric("EON3U6", reference_date=date(2026, 1, 1))
+    assert cme.market_key == "ESTR"
+    assert ice.market_key == "ESTR_ICE"

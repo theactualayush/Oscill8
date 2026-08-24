@@ -3,8 +3,10 @@ tests/test_strategy_import_market_mapping.py
 
 strategy_import.market_mapping.resolve_market_code()'s three-way
 classification: supported (translates to a real core.config.MARKETS
-key), unavailable (recognized by name, not configured -- ER, YBA,
-FSR), and unrecognized (not a known code at all).
+key -- includes ER/FSR/YBA as of EURIBOR/SARON/YBA gaining
+MarketDefinition entries), unavailable (recognized by name, not
+configured -- currently no codes in this state), and unrecognized (not
+a known code at all).
 """
 
 from __future__ import annotations
@@ -34,58 +36,39 @@ def test_sra_son_cra_map_exactly_as_specified():
     assert resolve_market_code("CRA").market_key == "CORRA"
 
 
-def test_er_is_recognized_but_unavailable():
+def test_er_is_now_supported_and_maps_to_euribor():
+    # EURIBOR gained a real core.config.MARKETS entry (trader-confirmed
+    # ric_root/ric_year_digits/bp_per_point) and QuantHub routing --
+    # the workbook code "ER" now resolves as supported, not unavailable.
     resolution = resolve_market_code("ER")
-    assert resolution.status == "unavailable"
-    assert resolution.market_key is None
-    assert resolution.reason == UNAVAILABLE_MARKET_CODES["ER"]
-    assert "Euribor" in resolution.reason
+    assert resolution.status == "supported"
+    assert resolution.market_key == "EURIBOR"
+    assert resolution.reason is None
+    assert "EURIBOR" in config.MARKETS
 
 
-def test_er_is_not_a_configured_market():
-    # Locks in the CLAUDE.md-documented gap this whole distinction
-    # exists to report accurately: EURIBOR must not silently appear in
-    # the real registry as a side effect of the importer's own mapping.
-    assert "EURIBOR" not in config.MARKETS
-
-
-def test_yba_is_recognized_but_unavailable():
-    # Real-workbook finding: "Australian exchange market", RIC root
-    # YBA -- confirmed by the trader, but no MarketDefinition exists
-    # (and none is added here -- see the module's own "must not be
-    # invented" note).
+def test_yba_is_now_supported_and_maps_to_yba():
     resolution = resolve_market_code("YBA")
-    assert resolution.status == "unavailable"
-    assert resolution.market_key is None
-    assert resolution.reason == UNAVAILABLE_MARKET_CODES["YBA"]
-    assert "Australian" in resolution.reason
+    assert resolution.status == "supported"
+    assert resolution.market_key == "YBA"
+    assert resolution.reason is None
+    assert "YBA" in config.MARKETS
 
 
-def test_fsr_is_recognized_but_unavailable():
-    # Real-workbook finding: "SARON 3M futures", RIC root SARO3 --
-    # confirmed by the trader, same treatment as ER/YBA.
+def test_fsr_is_now_supported_and_maps_to_saron():
     resolution = resolve_market_code("FSR")
-    assert resolution.status == "unavailable"
-    assert resolution.market_key is None
-    assert resolution.reason == UNAVAILABLE_MARKET_CODES["FSR"]
-    assert "SARON" in resolution.reason
+    assert resolution.status == "supported"
+    assert resolution.market_key == "SARON"
+    assert resolution.reason is None
+    assert "SARON" in config.MARKETS
 
 
-def test_yba_and_fsr_are_not_configured_markets():
-    # No MarketDefinition was added for either -- per the explicit
-    # "do not add full configuration yet" instruction, only the
-    # recognized-but-unavailable mapping exists.
-    assert "AUSTRALIA" not in config.MARKETS
-    assert "SARON" not in config.MARKETS
-    assert all(m.ric_root not in ("YBA", "SARO3") for m in config.MARKETS.values())
-
-
-def test_unavailable_reasons_are_distinct_per_market():
-    # Each recognized-but-unavailable code gets its OWN accurate
-    # reason, never a generic shared message -- a user reading the
-    # preview must be able to tell ER/YBA/FSR apart.
-    reasons = {UNAVAILABLE_MARKET_CODES[code] for code in ("ER", "YBA", "FSR")}
-    assert len(reasons) == 3
+def test_unavailable_market_codes_is_currently_empty():
+    # ER/YBA/FSR were the only entries; both moved to
+    # SUPPORTED_MARKET_CODES once their markets were configured. The
+    # dict itself stays a first-class, non-removed status for the next
+    # recognized-but-not-yet-configured market (e.g. BAX/Sterling).
+    assert UNAVAILABLE_MARKET_CODES == {}
 
 
 def test_unknown_code_is_unrecognized_not_unavailable():
@@ -97,8 +80,8 @@ def test_unknown_code_is_unrecognized_not_unavailable():
 
 def test_genuinely_unknown_typo_like_codes_remain_unrecognized():
     # A code that merely resembles a known one (typo, near-miss) must
-    # never be silently coerced into "unavailable" -- only the exact,
-    # confirmed codes in UNAVAILABLE_MARKET_CODES qualify.
+    # never be silently coerced into "supported" -- only the exact
+    # codes in SUPPORTED_MARKET_CODES qualify.
     for typo in ("YB", "YBAA", "FSRR", "FS", "EURIBOR", "ERR", "AUD", "SARON"):
         resolution = resolve_market_code(typo)
         assert resolution.status == "unrecognized", f"{typo!r} should be unrecognized"
@@ -107,7 +90,7 @@ def test_genuinely_unknown_typo_like_codes_remain_unrecognized():
 def test_resolution_is_case_insensitive_and_trims_whitespace():
     assert resolve_market_code("sra").status == "supported"
     assert resolve_market_code("  SRA  ").status == "supported"
-    assert resolve_market_code(" er ").status == "unavailable"
+    assert resolve_market_code(" er ").status == "supported"
 
 
 def test_resolution_preserves_normalized_code():

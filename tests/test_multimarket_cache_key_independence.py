@@ -11,11 +11,18 @@ dict in strategy_engine.pricing.
 This file changes nothing about the cache: every assertion below
 exercises database.service.get_history/database.cache exactly as they
 exist today, against an isolated tmp_path-backed SQLite engine (the
-same fixture convention as tests/test_service.py), with core.
-downloader.download_history mocked out so no real LSEG call is ever
-attempted. If any assertion here ever fails, it means a real
+same fixture convention as tests/test_service.py), with the relevant
+provider-facing download function mocked out so no real network call
+is ever attempted. If any assertion here ever fails, it means a real
 regression was introduced into the cache layer -- these tests exist to
 catch that, not to change today's (already-correct) behavior.
+
+CORRA (core.providers.PROVIDER_ROUTING) now routes to QuantHub rather
+than LSEG -- CORRA-RIC calls below mock
+database.service.download_history_quanthub instead of
+database.service.download_history accordingly. This is a routing-target
+change only; the cache-key-independence behavior under test is itself
+provider-agnostic and unaffected.
 """
 
 from __future__ import annotations
@@ -120,9 +127,9 @@ def test_downloading_one_interval_does_not_mark_another_interval_as_synced(mocke
 # ---------------------------------------------------------------------
 
 def test_different_rics_same_interval_do_not_share_sync_ranges_or_bars(mocker, db_session):
+    mocker.patch("database.service.download_history", return_value=_df(["2020-01-01"], 100.0))
     mocker.patch(
-        "database.service.download_history",
-        side_effect=[_df(["2020-01-01"], 100.0), _df(["2020-01-01"], 200.0)],
+        "database.service.download_history_quanthub", return_value=_df(["2020-01-01"], 200.0)
     )
 
     sofr = service.get_history("SRAU26", "DAILY", "2020-01-01", "2020-01-01")
@@ -146,7 +153,9 @@ def test_caching_corra_does_not_satisfy_a_later_sofr_request(mocker, db_session)
     """Direct regression for the audit's exact concern: caching CORRA
     history must never be mistaken for cached SOFR coverage, or vice
     versa -- each RIC always triggers its own download."""
-    mock_download = mocker.patch("database.service.download_history", return_value=_df(["2020-01-01"], 200.0))
+    mock_download = mocker.patch(
+        "database.service.download_history_quanthub", return_value=_df(["2020-01-01"], 200.0)
+    )
     service.get_history("CRAU6", "DAILY", "2020-01-01", "2020-01-01")
     assert mock_download.call_count == 1
 
@@ -171,7 +180,11 @@ def test_ric_interval_matrix_is_fully_independent(mocker, db_session):
     }
     mocker.patch(
         "database.service.download_history",
-        side_effect=[_df(["2020-01-01"], level) for level in matrix.values()],
+        side_effect=[_df(["2020-01-01"], matrix[("SRAU26", "DAILY")]), _df(["2020-01-01"], matrix[("SRAU26", "HOURLY")])],
+    )
+    mocker.patch(
+        "database.service.download_history_quanthub",
+        side_effect=[_df(["2020-01-01"], matrix[("CRAU6", "DAILY")]), _df(["2020-01-01"], matrix[("CRAU6", "HOURLY")])],
     )
 
     results = {

@@ -31,6 +31,7 @@ from tenacity import (
 from core import config
 from core.config import BarInterval
 from core.utils import get_logger, to_date, DateLike
+from core.utils import resample_to_4h as _shared_resample_to_4h
 
 logger = get_logger(__name__)
 
@@ -385,28 +386,12 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
 def _resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate hourly OHLCV bars into 4-hour bars.
 
-    Standard OHLCV resampling rules:
-        Open   = first
-        High   = max
-        Low    = min
-        Close  = last
-        Volume = sum
+    Thin LSEG-side wrapper around the shared core.utils.resample_to_4h --
+    see that function for the actual aggregation rules. Kept as a
+    private, no-argument-beyond-df wrapper here so every existing call
+    site/behavior in this module is unchanged.
     """
-    if df.empty:
-        return df
-
-    indexed = df.set_index("Date")
-    agg = indexed.resample(config.RESAMPLE_RULE[BarInterval.FOUR_HOUR]).agg(
-        {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }
-    )
-    agg = agg.dropna(subset=["Open", "High", "Low", "Close"], how="all")
-    return agg.reset_index()[_CANONICAL_COLUMNS]
+    return _shared_resample_to_4h(df, config.RESAMPLE_RULE[BarInterval.FOUR_HOUR])
 
 
 # --------------------------------------------------------------------------

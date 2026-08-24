@@ -27,6 +27,25 @@ def test_generate_contracts_monthly_full_year():
     assert contracts[-1] == "FFZ26"
 
 
+@pytest.mark.parametrize(
+    "market_key, expected",
+    [
+        ("EURIBOR", ["FEIH6", "FEIM6", "FEIU6", "FEIZ6"]),
+        ("SARON", ["SARO3H6", "SARO3M6", "SARO3U6", "SARO3Z6"]),
+        ("YBA", ["YBAH6", "YBAM6", "YBAU6", "YBAZ6"]),
+        ("ESTR_ICE", ["EON3H6", "EON3M6", "EON3U6", "EON3Z6"]),
+    ],
+)
+def test_generate_contracts_new_quarterly_markets_full_year(market_key, expected):
+    # These four all default to QUARTERLY (the same cycle SOFR already
+    # exercises above) -- no new listing-cycle logic, just confirming
+    # each market's own trader-confirmed root/year-digits combination
+    # produces the right rolling contract list via the existing,
+    # unmodified generic calendar machinery.
+    contracts = fc.generate_contracts(market_key, "2026-01-01", "2026-12-31")
+    assert contracts == expected
+
+
 def test_generate_contracts_partial_range():
     contracts = fc.generate_contracts("FED_FUNDS", "2026-01-15", "2026-03-10")
     # Jan, Feb, Mar all "belong" to the range even though start/end land

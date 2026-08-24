@@ -3,17 +3,32 @@ tests/test_strategy_import_preview.py
 
 strategy_import.preview.build_preview(): grouping validated rows into
 per-sheet ImportCandidates and a whole-upload ImportPreview -- totals,
-the ER-style unavailable-by-market breakdown, de-duplicated import
-names, strategy-identity deduplication (StrategyDefinition, never the
-Label), and sheet-level blocking errors (bad header, invalid sheet
-name) that never silently swallow a sheet's individually-classified
-rows.
+the unavailable-by-market breakdown, de-duplicated import names,
+strategy-identity deduplication (StrategyDefinition, never the Label),
+and sheet-level blocking errors (bad header, invalid sheet name) that
+never silently swallow a sheet's individually-classified rows.
+
+Unavailable-market examples use a clearly-synthetic "ZZZ" code
+(registered only via the synthetic_unavailable_market fixture, never in
+the real, committed strategy_import.market_mapping.UNAVAILABLE_MARKET_
+CODES) -- ER/YBA/FSR are now genuinely SUPPORTED (EURIBOR/YBA/SARON
+gained core.config.MARKETS entries), so they can no longer illustrate
+the unavailable-row code path.
 """
 
 from __future__ import annotations
 
+import pytest
+
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_import.parsing import SheetFrame
 from strategy_import.preview import build_preview
+
+
+@pytest.fixture
+def synthetic_unavailable_market(monkeypatch):
+    monkeypatch.setitem(UNAVAILABLE_MARKET_CODES, "ZZZ", "ZZZ is not currently configured in Oscill8.")
+    return "ZZZ"
 
 
 def _sheet(name, rows, position_columns=("1", "2", "3")) -> SheetFrame:
@@ -32,17 +47,17 @@ def _never_exists(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Matches the product brief's worked example:
-#   Total strategies: 200 / Ready: 180 / Unavailable: 20 / ER breakdown
+# Matches the product brief's worked example shape:
+#   Total strategies: N / Ready: N-k / Unavailable: k / breakdown by market
 # ---------------------------------------------------------------------
 
-def test_totals_match_ready_plus_unavailable_plus_invalid():
+def test_totals_match_ready_plus_unavailable_plus_invalid(synthetic_unavailable_market):
     sheet = _sheet(
         "EZ8 GENERAL MEDIUM VOL",
         [
             _row("SRA", "A", 1, -1, 0),
             _row("SON", "B", 1, -2, 1),
-            _row("ER", "C", 1, -1, 0),
+            _row("ZZZ", "C", 1, -1, 0),
             _row("XYZ", "D", 1, -1, 0),
         ],
     )
@@ -53,22 +68,30 @@ def test_totals_match_ready_plus_unavailable_plus_invalid():
     assert preview.invalid_count == 1
 
 
-def test_unavailable_by_market_breakdown():
+def test_unavailable_by_market_breakdown(synthetic_unavailable_market):
     sheet = _sheet(
         "6mo Spreads",
-        [_row("ER", "A", 1, -1, 0), _row("ER", "B", 1, -2, 1), _row("SRA", "C", 1, -1, 0)],
+        [_row("ZZZ", "A", 1, -1, 0), _row("ZZZ", "B", 1, -2, 1), _row("SRA", "C", 1, -1, 0)],
     )
     preview = build_preview([sheet], _never_exists)
-    assert preview.unavailable_by_market == {"ER": 2}
+    assert preview.unavailable_by_market == {"ZZZ": 2}
 
 
-def test_er_rows_are_never_silently_dropped_from_the_candidate():
-    sheet = _sheet("Set", [_row("ER", "Euribor Strategy", 1, -1, 0)])
+def test_unavailable_rows_are_never_silently_dropped_from_the_candidate(synthetic_unavailable_market):
+    sheet = _sheet("Set", [_row("ZZZ", "Synthetic Strategy", 1, -1, 0)])
     preview = build_preview([sheet], _never_exists)
     candidate = preview.candidates[0]
     assert len(candidate.unavailable) == 1
-    assert candidate.unavailable[0].label == "Euribor Strategy"
-    assert candidate.unavailable[0].market_code == "ER"
+    assert candidate.unavailable[0].label == "Synthetic Strategy"
+    assert candidate.unavailable[0].market_code == "ZZZ"
+
+
+def test_er_yba_fsr_now_produce_ready_rows_not_unavailable():
+    # Direct regression lock for the production mapping change.
+    sheet = _sheet("Set", [_row("ER", "A", 1, -1, 0), _row("YBA", "B", 1, -1, 0), _row("FSR", "C", 1, -1, 0)])
+    preview = build_preview([sheet], _never_exists)
+    assert preview.ready_count == 3
+    assert preview.unavailable_count == 0
 
 
 # ---------------------------------------------------------------------
@@ -196,8 +219,8 @@ def test_different_weight_at_same_offset_is_not_deduplicated():
     assert len(candidate.ready) == 2
 
 
-def test_sheet_with_zero_ready_rows_is_not_importable_without_being_an_error():
-    sheet = _sheet("All Unavailable", [_row("ER", "A", 1, -1, 0)])
+def test_sheet_with_zero_ready_rows_is_not_importable_without_being_an_error(synthetic_unavailable_market):
+    sheet = _sheet("All Unavailable", [_row("ZZZ", "A", 1, -1, 0)])
     preview = build_preview([sheet], _never_exists)
     candidate = preview.candidates[0]
     assert candidate.importable is False

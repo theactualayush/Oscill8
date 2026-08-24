@@ -21,10 +21,12 @@ a workbook can be
     1. supported      -- translates to a real, configured MarketDefinition
     2. unavailable     -- a real market Oscill8 recognizes by name, but
                            has no configured MarketDefinition for yet
-                           (today: "ER" / Euribor -- see core/config.py's
-                           Deferred list; bp_per_point/exchange must
-                           never be guessed, so this is NOT solved by
-                           adding a placeholder entry here)
+                           (currently empty -- ER/YBA/FSR moved to
+                           SUPPORTED_MARKET_CODES once EURIBOR/YBA/SARON
+                           gained core.config.MARKETS entries; kept as a
+                           first-class status, not removed, for the next
+                           market that's recognized-by-name but not yet
+                           configured, e.g. BAX/Sterling)
     3. unrecognized    -- not a market code this importer knows about
                            at all (e.g. a typo)
 
@@ -49,27 +51,28 @@ SUPPORTED_MARKET_CODES: dict[str, str] = {
     "SRA": "SOFR",
     "SON": "SONIA",
     "CRA": "CORRA",
+    # ER/YBA/FSR moved here from UNAVAILABLE_MARKET_CODES now that
+    # EURIBOR/YBA/SARON have real core.config.MARKETS entries
+    # (trader-confirmed ric_root/ric_year_digits/bp_per_point -- see
+    # core/config.py) and QuantHub provider routing (core/providers.py).
+    # These are the trader-workbook codes (matching each market's
+    # QuantHub root, per the mapping this table was originally built
+    # from), not the LSEG RIC roots -- see the module docstring.
+    "ER": "EURIBOR",
+    "FSR": "SARON",
+    "YBA": "YBA",
 }
 
 # Trader-workbook codes for markets Oscill8 recognizes by name but has
 # no configured core.config.MARKETS entry for. Each value is the exact
-# reason shown to the user -- never a guessed RIC root or bp_per_point,
-# per core/config.py's explicit "must not be invented" note for
-# EURIBOR. Adding a market here does NOT make it importable; it only
-# changes how clearly its absence is reported (recognized-but-
-# unavailable, not an unrecognized/invalid code).
-#
-# ER/YBA/FSR RIC roots are confirmed (FEI / YBA / SARO3 respectively --
-# see the trader-confirmed mapping this table was built from), but
-# their exchange/bp_per_point/contract-rule metadata is deliberately
-# NOT supplied here or in core.config.MARKETS: adding a real
-# MarketDefinition (and the data-provider support it would need) is a
-# separate, not-yet-approved feature, out of scope for the importer.
-UNAVAILABLE_MARKET_CODES: dict[str, str] = {
-    "ER": "Euribor is not currently configured in Oscill8.",
-    "YBA": "Australian exchange market data is not currently configured in Oscill8.",
-    "FSR": "SARON 3M futures data is not currently configured in Oscill8.",
-}
+# reason shown to the user -- never a guessed RIC root or bp_per_point.
+# Adding a market here does NOT make it importable; it only changes how
+# clearly its absence is reported (recognized-but-unavailable, not an
+# unrecognized/invalid code). Empty today -- ER/YBA/FSR were the only
+# entries, now moved to SUPPORTED_MARKET_CODES above. Kept as a
+# first-class dict (not removed) for the next recognized-but-not-yet-
+# configured market (e.g. BAX/Sterling).
+UNAVAILABLE_MARKET_CODES: dict[str, str] = {}
 
 
 @dataclass(frozen=True)

@@ -15,11 +15,23 @@ same StrategySetRepository.load() a hand-built set would use.
 
 from __future__ import annotations
 
+import pytest
+
 from strategy_sets.repository import StrategySetRepository
 
 from strategy_import.commit import commit_import
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_import.parsing import SheetFrame
 from strategy_import.preview import build_preview
+
+
+@pytest.fixture
+def synthetic_unavailable_market(monkeypatch):
+    # Clearly-synthetic, non-real code -- ER is now genuinely SUPPORTED
+    # (EURIBOR gained a core.config.MARKETS entry), so it can no longer
+    # illustrate the unavailable-row code path.
+    monkeypatch.setitem(UNAVAILABLE_MARKET_CODES, "ZZZ", "ZZZ is not currently configured in Oscill8.")
+    return "ZZZ"
 
 
 def _sheet(name, rows, position_columns=("1", "2", "3")) -> SheetFrame:
@@ -65,13 +77,13 @@ def test_commit_never_saves_a_sheet_with_a_blocking_error(tmp_path):
     assert summary.strategies_imported == 0
 
 
-def test_commit_never_persists_unavailable_or_invalid_rows(tmp_path):
+def test_commit_never_persists_unavailable_or_invalid_rows(tmp_path, synthetic_unavailable_market):
     repo = StrategySetRepository(base_dir=str(tmp_path))
     sheet = _sheet(
         "Mixed Set",
         [
             _row("SRA", "Ready", 1, -1, 0),
-            _row("ER", "Unavailable", 1, -1, 0),
+            _row("ZZZ", "Unavailable", 1, -1, 0),
             _row("XYZ", "Invalid", 1, -1, 0),
         ],
     )
@@ -117,10 +129,10 @@ def test_imported_set_is_ordinary_afterward(tmp_path):
     assert repo.delete("Copy") is True
 
 
-def test_summary_totals_reflect_whole_preview_not_just_saved_sheets(tmp_path):
+def test_summary_totals_reflect_whole_preview_not_just_saved_sheets(tmp_path, synthetic_unavailable_market):
     repo = StrategySetRepository(base_dir=str(tmp_path))
     good = _sheet("Good", [_row("SRA", "A", 1, -1, 0)])
-    unimportable = _sheet("All Bad", [_row("ER", "B", 1, -1, 0), _row("XYZ", "C", 1, -1, 0)])
+    unimportable = _sheet("All Bad", [_row("ZZZ", "B", 1, -1, 0), _row("XYZ", "C", 1, -1, 0)])
     preview = build_preview([good, unimportable], repo.exists)
     summary = commit_import(preview, repo)
 

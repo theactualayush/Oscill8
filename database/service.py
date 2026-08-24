@@ -2,9 +2,11 @@
 service.py
 
 Cache-first market-data access: the single public entry point for
-Module 2. This is the only module in database/ that imports
-core.downloader -- everything else operates purely on SQLAlchemy models
-and Pandas DataFrames.
+Module 2. This is the only module in database/ that imports the
+provider layer (core.downloader for LSEG, core.quanthub for QuantHub,
+core.providers for the market->provider routing decision) -- everything
+else in database/ operates purely on SQLAlchemy models and Pandas
+DataFrames.
 
     get_history(ric, interval, start, end) -> pd.DataFrame
 
@@ -19,14 +21,25 @@ Is requested history fully covered?
         |
    Determine missing sub-range(s)
         |
-   Download ONLY missing history from LSEG
+   core.ric.parse_ric(ric) -> market_key
         |
-   Store in SQLite
+   core.providers.resolve_provider(market_key)
+        |-- LSEG -----> core.downloader.download_history(ric, ...)      (unchanged)
+        \-- QUANTHUB -> core.providers.qh_root_for_market(market_key)
+                         + core.quanthub.build_instrument(root, month, year)
+                         -> core.quanthub.download_history(instrument, ...)
+        |
+   Store in SQLite (same canonical DataFrame shape either way)
         |
    Return complete DataFrame
 
-Callers cannot tell whether any given bar came from the cache or a
-fresh LSEG call.
+Callers cannot tell whether any given bar came from the cache, a fresh
+LSEG call, or a fresh QuantHub call -- get_history's own signature is
+unchanged; provider selection is entirely internal, keyed off the RIC's
+own market (via core.ric.parse_ric), never a new parameter callers must
+supply. The cache itself is provider-agnostic: it's keyed on the RIC
+string exactly as before, since a market's RIC identity doesn't change
+depending on which provider happens to serve it.
 """
 
 from __future__ import annotations
@@ -37,12 +50,41 @@ import pandas as pd
 
 from core.config import BarInterval
 from core.downloader import download_history
+from core.providers import Provider, qh_root_for_market, resolve_provider
+from core.quanthub import download_history as download_history_quanthub
+from core.quanthub import build_instrument
+from core.ric import parse_ric
 from core.utils import DateLike, get_logger, to_date
 
 from database import cache
 from database.connection import get_session
 
 logger = get_logger(__name__)
+
+
+def _download_from_provider(
+    ric: str, interval: BarInterval, start: datetime, end: datetime
+) -> pd.DataFrame:
+    """Resolve which provider owns `ric`'s market and download from it.
+
+    market_key/month/year are recovered from the RIC via core.ric.
+    parse_ric() -- semantic decoding of the (market, contract) identity
+    the RIC already encodes, not string manipulation of the RIC itself.
+    A QuantHub instrument is then built from scratch from an
+    independently-looked-up QH root (core.providers.qh_root_for_market)
+    plus that same month/year -- the LSEG RIC string itself is never
+    touched or reused as part of the QuantHub identifier.
+    """
+    parsed = parse_ric(ric)
+    provider = resolve_provider(parsed.market_key)
+
+    if provider is Provider.LSEG:
+        return download_history(ric, interval.value, start, end)
+
+    qh_root = qh_root_for_market(parsed.market_key)
+    instrument = build_instrument(qh_root, parsed.month, parsed.year)
+    return download_history_quanthub(instrument, interval.value, start, end)
+
 
 _EPSILON = timedelta(microseconds=1)
 
@@ -124,9 +166,12 @@ def get_history(
 
     Checks the local SQLite cache first. If the requested range isn't
     fully covered, downloads and persists only the missing sub-range(s)
-    from LSEG via core.downloader.download_history, then returns the
-    complete requested range. Columns/dtypes match download_history's
-    own contract: [Date, Open, High, Low, Close, Volume].
+    from whichever provider `ric`'s market is routed to (see
+    core.providers.resolve_provider -- LSEG via core.downloader, or
+    QuantHub via core.quanthub, chosen internally by _download_from_
+    provider), then returns the complete requested range. Columns/
+    dtypes match both providers' shared canonical contract:
+    [Date, Open, High, Low, Close, Volume].
 
     The most recent, still-forming bar for an interval currently in
     progress (e.g. today's DAILY bar before day-end, or the current
@@ -160,7 +205,7 @@ def get_history(
                 "Cache miss for %s [%s]: downloading %s -> %s",
                 ric, interval.value, sub_start, sub_end,
             )
-            downloaded = download_history(ric, interval.value, sub_start, sub_end)
+            downloaded = _download_from_provider(ric, interval, sub_start, sub_end)
 
             if not downloaded.empty:
                 completed_df = downloaded[downloaded["Date"] < boundary]

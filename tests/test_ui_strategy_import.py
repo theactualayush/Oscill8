@@ -9,10 +9,18 @@ StrategySetRepository so nothing ever touches the real data/
 strategy_sets/ directory.
 
 Covers the product requirements this stage must prove: uploading never
-writes; Cancel never writes; Import All writes only READY rows; ER
-stays visible as unavailable, never silently dropped; invalid rows
-stay visible; duplicate names never overwrite; both CSV and XLSX work;
-and an imported set is immediately selectable for Strategy Set Scan.
+writes; Cancel never writes; Import All writes only READY rows; an
+unavailable row stays visible in the preview, never silently dropped;
+invalid rows stay visible; duplicate names never overwrite; both CSV
+and XLSX work; and an imported set is immediately selectable for
+Strategy Set Scan.
+
+The "unavailable" example row uses a clearly-synthetic "ZZZ" market
+code (registered only via the synthetic_unavailable_market fixture
+below, never in the real, committed strategy_import.market_mapping.
+UNAVAILABLE_MARKET_CODES) -- ER is now genuinely SUPPORTED (EURIBOR
+gained a core.config.MARKETS entry), so it can no longer illustrate
+the unavailable-row code path.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from streamlit.testing.v1 import AppTest
 
 from core import config
 
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_sets.repository import StrategySetRepository
 
 _APP_PATH = str(Path(__file__).resolve().parent.parent / "ui" / "app.py")
@@ -34,7 +43,7 @@ _CSV_MIXED = (
     b"Market,Label,1,2,3\n"
     b"SRA,3M Spread,1,-1,\n"
     b"SON,SONIA Fly,1,-2,1\n"
-    b"ER,Euribor Trade,1,-1,\n"
+    b"ZZZ,Synthetic Trade,1,-1,\n"
     b"XYZ,Bad Market,1,-1,\n"
 )
 
@@ -52,6 +61,15 @@ def repo(tmp_path, monkeypatch) -> StrategySetRepository:
     directory = tmp_path / "strategy_sets"
     monkeypatch.setattr(config, "STRATEGY_SETS_DIR", str(directory))
     return StrategySetRepository(base_dir=str(directory))
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_unavailable_market(monkeypatch):
+    # Registers "ZZZ" (used by _CSV_MIXED above) as recognized-but-
+    # unavailable for every test in this file, reverted automatically.
+    monkeypatch.setitem(
+        UNAVAILABLE_MARKET_CODES, "ZZZ", "ZZZ is not currently configured in Oscill8."
+    )
 
 
 def _app() -> AppTest:
@@ -123,7 +141,7 @@ def test_import_writes_only_ready_rows(repo):
 
     assert repo.list_names() == ["strategies"]
     saved = repo.load("strategies")
-    assert [e.name for e in saved.entries] == ["3M Spread", "SONIA Fly"]  # ER/XYZ rows excluded
+    assert [e.name for e in saved.entries] == ["3M Spread", "SONIA Fly"]  # ZZZ/XYZ rows excluded
 
     successes = [s.value for s in at.success]
     assert any("Strategies imported: 2" in s for s in successes)
@@ -131,15 +149,15 @@ def test_import_writes_only_ready_rows(repo):
     assert any("Invalid: 1" in s for s in successes)
 
 
-def test_er_remains_visible_as_unavailable_in_the_preview(repo):
+def test_unavailable_market_remains_visible_in_the_preview(repo):
     at = _app()
     at.run()
     at = _open_import_panel(at)
     at.file_uploader[0].upload("strategies.csv", _CSV_MIXED, "text/csv").run()
 
     captions = [c.value for c in at.caption]
-    assert any("ER ⚠" in c and "Euribor" in c for c in captions)
-    assert any("Euribor Trade" in c for c in captions)  # the row itself, not just the market code
+    assert any("ZZZ ⚠" in c and "not currently configured" in c for c in captions)
+    assert any("Synthetic Trade" in c for c in captions)  # the row itself, not just the market code
 
 
 def test_invalid_rows_remain_visible_in_the_preview(repo):

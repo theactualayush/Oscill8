@@ -16,13 +16,35 @@ from __future__ import annotations
 from io import BytesIO
 
 import pandas as pd
+import pytest
 
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_import.preview import build_preview
 from strategy_import.parsing import parse_csv, parse_workbook
 
 
 def _never_exists(name: str) -> bool:
     return False
+
+
+@pytest.fixture
+def synthetic_unavailable_markets(monkeypatch):
+    """Clearly-synthetic, non-real codes registered as unavailable ONLY
+    for the duration of a test that requests this fixture -- ER/YBA/FSR
+    are now genuinely SUPPORTED (EURIBOR/YBA/SARON gained core.config.
+    MARKETS entries), so this file's "recognized but unavailable"
+    examples use these instead. Deliberately distinct from the plain
+    "ZZZ" string, which some tests below still use as a genuinely
+    UNKNOWN/invalid code -- these must never collide.
+    """
+    codes = {
+        "ZZQ": "ZZQ is not currently configured in Oscill8.",
+        "ZZW": "ZZW market data is not currently configured in Oscill8.",
+        "ZZE": "ZZE market data is not currently configured in Oscill8.",
+    }
+    for code, reason in codes.items():
+        monkeypatch.setitem(UNAVAILABLE_MARKET_CODES, code, reason)
+    return codes
 
 
 def _preview_for(csv_text: str, filename: str = "strategies.csv"):
@@ -41,21 +63,22 @@ def _xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
 # same label + different markets -> both accepted
 # ---------------------------------------------------------------------
 
-def test_same_label_across_markets_both_accepted():
+def test_same_label_across_markets_both_accepted(synthetic_unavailable_markets):
     csv = (
         "Market,Label,1,2,3\n"
-        "ER,1Yr Fly,1,-2,1\n"
+        "ZZQ,1Yr Fly,1,-2,1\n"
         "SRA,1Yr Fly,1,-2,1\n"
     )
     preview = _preview_for(csv)
     candidate = preview.candidates[0]
 
-    # ER is unavailable (recognized, not configured) -- SRA is ready.
+    # ZZQ is unavailable (synthetic, recognized-but-not-configured) --
+    # SRA is ready.
     assert len(candidate.ready) == 1
     assert len(candidate.unavailable) == 1
     assert candidate.ready[0].entry.definition.market_key == "SOFR"
     assert candidate.ready[0].entry.name == "1Yr Fly"
-    assert candidate.unavailable[0].market_code == "ER"
+    assert candidate.unavailable[0].market_code == "ZZQ"
 
 
 def test_same_label_two_ready_markets_both_accepted_and_disambiguated():
@@ -149,24 +172,25 @@ def test_blank_vs_zero_is_not_a_two_strategy_result_even_with_other_rows_present
 
 # ---------------------------------------------------------------------
 # A workbook shaped like the real RBS Template (repeated labels across
-# markets, including ER rows) must no longer produce zero strategies.
+# markets, including an unavailable-market row) must not produce zero
+# strategies.
 # ---------------------------------------------------------------------
 
-def test_rbs_template_shaped_sheet_no_longer_produces_zero_strategies():
+def test_rbs_template_shaped_sheet_no_longer_produces_zero_strategies(synthetic_unavailable_markets):
     # Mirrors the real-world pattern that surfaced this bug: the same
     # trader-facing Labels ("1Yr Fly", "Churn", "6M Spread") repeated
-    # across SRA/SON/CRA/ER rows. Before this fix, ANY repeated Label
-    # within one sheet made the whole sheet's ready set unimportable
-    # (StrategySet's own duplicate-entry-name validation firing on the
-    # Label) -- so a realistically-shaped multi-market template
-    # produced a sheet_error and 0 ready strategies, even though every
-    # individual row was perfectly valid.
+    # across SRA/SON/CRA/(synthetic unavailable) rows. Before this fix,
+    # ANY repeated Label within one sheet made the whole sheet's ready
+    # set unimportable (StrategySet's own duplicate-entry-name
+    # validation firing on the Label) -- so a realistically-shaped
+    # multi-market template produced a sheet_error and 0 ready
+    # strategies, even though every individual row was perfectly valid.
     csv = (
         "Market,Label,1,2,3\n"
         "SRA,1Yr Fly,1,-2,1\n"
         "SON,1Yr Fly,1,-2,1\n"
         "CRA,1Yr Fly,1,-2,1\n"
-        "ER,1Yr Fly,1,-2,1\n"
+        "ZZQ,1Yr Fly,1,-2,1\n"
         "SRA,Churn,1,-1,\n"
         "SON,Churn,1,-1,\n"
         "CRA,Churn,1,-1,\n"
@@ -179,7 +203,7 @@ def test_rbs_template_shaped_sheet_no_longer_produces_zero_strategies():
     assert candidate.sheet_error is None
     assert candidate.importable is True
     assert len(candidate.ready) > 0
-    # 9 rows total; the ER row is unavailable (not ready), leaving 8
+    # 9 rows total; the ZZQ row is unavailable (not ready), leaving 8
     # ready rows, each a distinct (market, structure) pair.
     assert len(candidate.ready) == 8
     assert len(candidate.unavailable) == 1
@@ -189,17 +213,19 @@ def test_rbs_template_shaped_sheet_no_longer_produces_zero_strategies():
     assert len(names) == len(set(names))
 
 
-def test_er_yba_fsr_are_all_unavailable_never_invalid_side_by_side():
-    # Real-workbook finding: ER, YBA, and FSR are all recognized-but-
-    # unavailable markets that appear together in the actual
-    # RBS_Template.xlsx. A genuinely unknown code (typo/near-miss) must
-    # still be invalid, never swept into "unavailable" alongside them.
+def test_multiple_unavailable_markets_never_invalid_side_by_side(synthetic_unavailable_markets):
+    # Real-workbook finding this test originally locked down: several
+    # recognized-but-unavailable markets can appear together in one
+    # sheet (historically ER/YBA/FSR; now genuinely SUPPORTED, so this
+    # uses the synthetic ZZQ/ZZW/ZZE codes instead). A genuinely unknown
+    # code (typo/near-miss) must still be invalid, never swept into
+    # "unavailable" alongside them.
     csv = (
         "Market,Label,1,2,3\n"
         "SRA,3M Spread,1,-1,\n"
-        "ER,3M Spread,1,-1,\n"
-        "YBA,3M Spread,1,-1,\n"
-        "FSR,3M Spread,1,-1,\n"
+        "ZZQ,3M Spread,1,-1,\n"
+        "ZZW,3M Spread,1,-1,\n"
+        "ZZE,3M Spread,1,-1,\n"
         "ZZZ,3M Spread,1,-1,\n"
     )
     preview = _preview_for(csv, filename="strategies.csv")
@@ -209,12 +235,32 @@ def test_er_yba_fsr_are_all_unavailable_never_invalid_side_by_side():
     assert candidate.ready[0].entry.definition.market_key == "SOFR"
 
     assert len(candidate.unavailable) == 3
-    assert {row.market_code for row in candidate.unavailable} == {"ER", "YBA", "FSR"}
+    assert {row.market_code for row in candidate.unavailable} == {"ZZQ", "ZZW", "ZZE"}
 
     assert len(candidate.invalid) == 1
     assert candidate.invalid[0].message == "Unknown market 'ZZZ'"
 
-    assert preview.unavailable_by_market == {"ER": 1, "YBA": 1, "FSR": 1}
+    assert preview.unavailable_by_market == {"ZZQ": 1, "ZZW": 1, "ZZE": 1}
+
+
+def test_er_yba_fsr_now_produce_ready_rows_side_by_side_with_other_markets():
+    # Direct regression lock for the production mapping change: ER/YBA/
+    # FSR now resolve as SUPPORTED (EURIBOR/YBA/SARON), sitting
+    # alongside SOFR as ordinary ready rows, not unavailable ones.
+    csv = (
+        "Market,Label,1,2,3\n"
+        "SRA,3M Spread,1,-1,\n"
+        "ER,3M Spread,1,-1,\n"
+        "YBA,3M Spread,1,-1,\n"
+        "FSR,3M Spread,1,-1,\n"
+    )
+    preview = _preview_for(csv, filename="strategies.csv")
+    candidate = preview.candidates[0]
+
+    assert len(candidate.unavailable) == 0
+    assert len(candidate.ready) == 4
+    ready_markets = {row.entry.definition.market_key for row in candidate.ready}
+    assert ready_markets == {"SOFR", "EURIBOR", "YBA", "SARON"}
 
 
 # ---------------------------------------------------------------------
@@ -229,10 +275,10 @@ def test_er_yba_fsr_are_all_unavailable_never_invalid_side_by_side():
 # detected · 0 strategies detected".
 # ---------------------------------------------------------------------
 
-def test_real_workbook_shaped_xlsx_with_integer_headers_produces_strategies():
+def test_real_workbook_shaped_xlsx_with_integer_headers_produces_strategies(synthetic_unavailable_markets):
     sheet = pd.DataFrame(
         {
-            "Market": ["SRA", "SON", "CRA", "ER"],
+            "Market": ["SRA", "SON", "CRA", "ZZQ"],
             "Label": ["3M Spread", "3M Spread", "3M Spread", "3M Spread"],
             1: [1, 1, 1, 1],
             2: [-1, -1, -1, -1],
@@ -245,7 +291,7 @@ def test_real_workbook_shaped_xlsx_with_integer_headers_produces_strategies():
 
     assert candidate.sheet_error is None
     assert len(candidate.ready) == 3  # SRA/SON/CRA
-    assert len(candidate.unavailable) == 1  # ER
+    assert len(candidate.unavailable) == 1  # ZZQ (synthetic)
     assert {r.entry.definition.market_key for r in candidate.ready} == {"SOFR", "SONIA", "CORRA"}
 
 

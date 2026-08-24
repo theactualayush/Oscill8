@@ -76,6 +76,22 @@ LSEG_APP_KEY = os.environ.get("RBS_LSEG_APP_KEY", "")
 
 
 # --------------------------------------------------------------------------
+# QuantHub session settings
+# --------------------------------------------------------------------------
+
+# In-house secondary market-data provider (core.quanthub). Never hardcoded --
+# read from the environment only, consistent with LSEG_APP_KEY above. The
+# app must remain usable with no QuantHub credentials configured for any
+# market still routed to LSEG (core.providers.PROVIDER_ROUTING) -- these
+# settings are only consulted when core.quanthub.download_history() is
+# actually called.
+QUANTHUB_BASE_URL = os.environ.get(
+    "RBS_QUANTHUB_BASE_URL", "https://qh-api.corp.hertshtengroup.com/api/v2/ohlc/"
+)
+QUANTHUB_TOKEN = os.environ.get("RBS_QUANTHUB_TOKEN", "")
+
+
+# --------------------------------------------------------------------------
 # Interval definitions
 # --------------------------------------------------------------------------
 
@@ -105,6 +121,17 @@ LSEG_NATIVE_INTERVAL = {
 # Pandas resample rule used when synthesizing bars from native ones.
 RESAMPLE_RULE = {
     BarInterval.FOUR_HOUR: "4h",
+}
+
+# Maps our BarInterval -> the native QuantHub /api/v2/ohlc/ `interval`
+# value. QuantHub natively supports 1M/5M/1H/1D only (confirmed) -- there
+# is no native 4H, so FOUR_HOUR is fetched as 1H and resampled, exactly
+# mirroring LSEG_NATIVE_INTERVAL's FOUR_HOUR -> hourly treatment above
+# (same core.utils.resample_to_4h, not a second implementation).
+QUANTHUB_NATIVE_INTERVAL = {
+    BarInterval.DAILY: "1D",
+    BarInterval.HOURLY: "1H",
+    BarInterval.FOUR_HOUR: "1H",
 }
 
 # Maximum practical lookback the API will comfortably serve per interval
@@ -280,6 +307,78 @@ MARKETS: dict[str, MarketDefinition] = {
                      "confirmed via live LSEG pull -- SREU26 returned full "
                      "daily OHLC/SETTLE/BID/ASK; not yet re-verified via a "
                      "live chain/search)",
+    ),
+    # --- Trader-confirmed (not yet live-LSEG-tested in this environment) ---
+    # RIC root/year-digit convention confirmed directly by the trader
+    # against real LSEG-style contract codes (see each description below).
+    # `verified=False` because no live LSEG Workspace chain/search or data
+    # pull has been performed in this development environment (no
+    # `lseg.data` package/session available here) -- ready for live
+    # verification on a machine with LSEG Workspace, per the trader's own
+    # instruction not to fabricate a successful live test.
+    "EURIBOR": MarketDefinition(
+        name="Euribor (3M)",
+        ric_root="FEI",
+        exchange="ICE_EUROPE",
+        bp_per_point=100.0,
+        ric_year_digits=1,
+        verified=False,
+        currency="EUR",
+        description="ICE 3-Month Euribor futures (RIC root 'FEI', 1-digit "
+                     "year -- trader-confirmed against real contract codes "
+                     "FEIM6/FEIU7; not yet live-LSEG-verified in this "
+                     "environment). Routed to QuantHub for historical data "
+                     "(core.providers) -- QH root 'ER', independent of this "
+                     "LSEG root.",
+    ),
+    "SARON": MarketDefinition(
+        name="SARON (3M)",
+        ric_root="SARO3",
+        exchange="ICE_EUROPE",
+        bp_per_point=100.0,
+        ric_year_digits=1,
+        verified=False,
+        currency="CHF",
+        description="ICE 3-Month SARON futures (RIC root 'SARO3', 1-digit "
+                     "year -- trader-confirmed against real contract codes "
+                     "SARO3U6/SARO3M7; not yet live-LSEG-verified in this "
+                     "environment). Routed to QuantHub for historical data "
+                     "(core.providers) -- QH root 'FSR', independent of "
+                     "this LSEG root.",
+    ),
+    "YBA": MarketDefinition(
+        name="Australia 90 Day Bank Bill",
+        ric_root="YBA",
+        exchange="ASX",
+        bp_per_point=100.0,
+        ric_year_digits=1,
+        verified=False,
+        currency="AUD",
+        description="ASX 90-Day Bank Accepted Bill futures (RIC root "
+                     "'YBA', 1-digit year -- trader-confirmed against real "
+                     "contract codes YBAU6/YBAZ7; not yet live-LSEG-"
+                     "verified in this environment). Routed to QuantHub "
+                     "for historical data (core.providers) -- QH root "
+                     "'YBA', independent of this LSEG root even though "
+                     "both happen to be the same string.",
+    ),
+    "ESTR_ICE": MarketDefinition(
+        name="ICE Europe Euro Short-Term Rate (€STR)",
+        ric_root="EON3",
+        exchange="ICE_EUROPE",
+        bp_per_point=100.0,
+        ric_year_digits=1,
+        verified=False,
+        currency="EUR",
+        description="ICE Europe 3-Month €STR futures (RIC root 'EON3', "
+                     "1-digit year -- trader-confirmed against real "
+                     "contract codes EON3U6/EON3Z7; not yet live-LSEG-"
+                     "verified in this environment). Deliberately a "
+                     "SEPARATE market key from the existing 'ESTR' entry "
+                     "above, which is the distinct CME product (RIC root "
+                     "'SRE') -- never collapse the two. Routed to "
+                     "QuantHub for historical data (core.providers) -- QH "
+                     "root 'FER', independent of this LSEG root.",
     ),
 }
 

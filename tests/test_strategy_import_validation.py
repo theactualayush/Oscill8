@@ -11,8 +11,11 @@ reimplemented.
 
 from __future__ import annotations
 
+import pytest
+
 from core.config import BarInterval
 
+from strategy_import.market_mapping import UNAVAILABLE_MARKET_CODES
 from strategy_import.validation import (
     DEFAULT_IMPORT_INTERVAL,
     InvalidRow,
@@ -20,6 +23,27 @@ from strategy_import.validation import (
     UnavailableRow,
     validate_row,
 )
+
+
+@pytest.fixture
+def synthetic_unavailable_markets(monkeypatch):
+    """Registers clearly-synthetic, non-real market codes as
+    recognized-but-unavailable, ONLY for the duration of a test that
+    requests this fixture -- exercises the unavailable-row code path
+    without asserting anything about a real market (ER/YBA/FSR are now
+    genuinely SUPPORTED, per EURIBOR/SARON/YBA gaining core.config.
+    MARKETS entries -- see strategy_import/market_mapping.py). Reverted
+    automatically by monkeypatch; the real, committed
+    UNAVAILABLE_MARKET_CODES (currently {}) is never actually modified.
+    """
+    codes = {
+        "ZZZ": "ZZZ is not currently configured in Oscill8.",
+        "ZZY": "ZZY market data is not currently configured in Oscill8.",
+        "ZZX": "ZZX market data is not currently configured in Oscill8.",
+    }
+    for code, reason in codes.items():
+        monkeypatch.setitem(UNAVAILABLE_MARKET_CODES, code, reason)
+    return codes
 
 
 def _row(market, label, *weights) -> dict:
@@ -109,42 +133,53 @@ def test_nan_position_cell_is_also_treated_as_zero():
 
 
 # ---------------------------------------------------------------------
-# Unavailable rows (ER)
+# Unavailable rows (synthetic "ZZZ"-family codes -- ER/YBA/FSR are now
+# genuinely SUPPORTED, see the module docstring / synthetic_unavailable_
+# markets fixture above)
 # ---------------------------------------------------------------------
 
-def test_er_market_is_unavailable_not_invalid_and_not_ready():
-    outcome = validate_row(_row("ER", "3M Euribor Spread", 1, -1, 0), 5, _COLUMNS)
+def test_synthetic_market_is_unavailable_not_invalid_and_not_ready(synthetic_unavailable_markets):
+    outcome = validate_row(_row("ZZZ", "3M Synthetic Spread", 1, -1, 0), 5, _COLUMNS)
     assert isinstance(outcome, UnavailableRow)
     assert outcome.row_number == 5
-    assert outcome.label == "3M Euribor Spread"
-    assert outcome.market_code == "ER"
-    assert "Euribor" in outcome.reason
+    assert outcome.label == "3M Synthetic Spread"
+    assert outcome.market_code == "ZZZ"
+    assert outcome.reason == synthetic_unavailable_markets["ZZZ"]
 
 
-def test_unavailable_row_is_reported_even_with_a_perfectly_valid_shape():
+def test_unavailable_row_is_reported_even_with_a_perfectly_valid_shape(synthetic_unavailable_markets):
     # Confirms shape correctness never rescues an unavailable market --
     # the row is reported purely because of the market, before shape is
     # even considered.
-    outcome = validate_row(_row("ER", "Valid Fly", 1, -2, 1), 2, _COLUMNS)
+    outcome = validate_row(_row("ZZZ", "Valid Fly", 1, -2, 1), 2, _COLUMNS)
     assert isinstance(outcome, UnavailableRow)
 
 
-def test_yba_market_is_unavailable_not_invalid_and_not_ready():
-    outcome = validate_row(_row("YBA", "3M Spread", 1, -1, 0), 38, _COLUMNS)
+def test_second_synthetic_market_is_unavailable_not_invalid_and_not_ready(synthetic_unavailable_markets):
+    outcome = validate_row(_row("ZZY", "3M Spread", 1, -1, 0), 38, _COLUMNS)
     assert isinstance(outcome, UnavailableRow)
     assert outcome.row_number == 38
     assert outcome.label == "3M Spread"
-    assert outcome.market_code == "YBA"
-    assert "Australian" in outcome.reason
+    assert outcome.market_code == "ZZY"
+    assert outcome.reason == synthetic_unavailable_markets["ZZY"]
 
 
-def test_fsr_market_is_unavailable_not_invalid_and_not_ready():
-    outcome = validate_row(_row("FSR", "3M Spread", 1, -1, 0), 43, _COLUMNS)
+def test_third_synthetic_market_is_unavailable_not_invalid_and_not_ready(synthetic_unavailable_markets):
+    outcome = validate_row(_row("ZZX", "3M Spread", 1, -1, 0), 43, _COLUMNS)
     assert isinstance(outcome, UnavailableRow)
     assert outcome.row_number == 43
     assert outcome.label == "3M Spread"
-    assert outcome.market_code == "FSR"
-    assert "SARON" in outcome.reason
+    assert outcome.market_code == "ZZX"
+    assert outcome.reason == synthetic_unavailable_markets["ZZX"]
+
+
+def test_er_yba_fsr_now_resolve_as_ready_not_unavailable():
+    # Direct regression lock for the production mapping change: these
+    # three codes are now SUPPORTED (EURIBOR/YBA/SARON), not unavailable.
+    for code, market_key in (("ER", "EURIBOR"), ("YBA", "YBA"), ("FSR", "SARON")):
+        outcome = validate_row(_row(code, "X", 1, -1, 0), 2, _COLUMNS)
+        assert isinstance(outcome, ReadyRow), f"{code!r} should now be ready, not unavailable"
+        assert outcome.entry.definition.market_key == market_key
 
 
 # ---------------------------------------------------------------------
@@ -159,10 +194,12 @@ def test_unknown_market_code_is_invalid():
     assert "XYZ" in outcome.message
 
 
-def test_typo_like_near_miss_of_a_known_unavailable_code_stays_invalid():
-    # "YBAA"/"FSRR" merely resemble YBA/FSR -- they must never be
-    # silently treated as the same market. Only an exact match counts.
-    for typo in ("YBAA", "FSRR"):
+def test_typo_like_near_miss_of_a_known_code_stays_invalid(synthetic_unavailable_markets):
+    # "YBAA"/"FSRR" merely resemble the now-supported YBA/FSR codes, and
+    # "ZZZZ" merely resembles the synthetic unavailable "ZZZ" code --
+    # none must ever be silently treated as the same market. Only an
+    # exact match counts.
+    for typo in ("YBAA", "FSRR", "ZZZZ"):
         outcome = validate_row(_row(typo, "X", 1, -1, 0), 2, _COLUMNS)
         assert isinstance(outcome, InvalidRow), f"{typo!r} should be invalid, not unavailable"
         assert typo in outcome.message
