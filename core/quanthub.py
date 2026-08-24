@@ -242,21 +242,31 @@ def _estimate_count(native_interval: str, start: datetime, end: datetime) -> int
     apply min(this estimate, _max_count_for_batch(batch_size)) once the
     actual batch is known.
 
-    KNOWN LIMITATION (see CLAUDE.md / the original QuantHub-integration
-    task notes): whether `count` truly means "newest N observations" is
-    unverified beyond the live tests this module's row-limit constant is
-    based on, and no pagination/start/end/offset/cursor mechanism is
-    known to exist (confirmed absent from both this client and any
-    documentation available to this repo) -- so a request whose true
-    required count would exceed the effective per-batch cap simply
-    retrieves a shorter history than the requested [start, end] window,
-    never multiple requests, never fabricated bars. This heuristic is
-    deliberately over-generous under any given cap and cannot be proven
-    correct for a very old/wide date range without further live testing.
-    _fetch_quanthub_records() logs a warning whenever the returned data
-    does not reach back to `start` despite the full (possibly capped)
-    count being consumed, so a too-small effective count fails loudly (a
-    gap in cached history, visible in logs) rather than silently.
+    CONFIRMED LIMITATION (live-tested against the real API, a controlled
+    parameter-by-parameter investigation -- no longer an open question):
+    `instruments=`, `interval=`, and `count=` are the only request
+    parameters that have any effect. `start=`/`end=` returns HTTP 500.
+    `from=`/`to=` returns HTTP 200 but is silently ignored -- the
+    response is byte-identical to the same request without it.
+    `offset=`, `page=`, `cursor=`, and `before=` were each tested in
+    isolation against a fixed baseline and every one returned HTTP 200
+    with the exact same window as the baseline -- silently ignored, not
+    applied. No pagination, cursor, offset, or timestamp/date-range
+    mechanism is available through /api/v2/ohlc/ at all. `count=` means
+    "the most recent N observations as of when the request is made" --
+    there is no way to anchor a request to an earlier reference point,
+    so a request whose true required count would exceed the effective
+    per-batch cap simply retrieves a shorter history than the requested
+    [start, end] window, never multiple requests, never fabricated bars,
+    and this cannot be worked around client-side: older history is
+    genuinely unreachable in a single request beyond that cap (see
+    download_history_batch()'s own docstring for what this means for a
+    cold-started instrument). This heuristic is deliberately over-
+    generous under whatever cap ends up applying. _fetch_quanthub_
+    records() logs a warning whenever the returned data does not reach
+    back to `start` despite the full (possibly capped) count being
+    consumed, so a too-small effective count fails loudly (a gap in
+    cached history, visible in logs) rather than silently.
     """
     calendar_days = max((end.date() - start.date()).days + 1, 1)
     if native_interval == "1D":
@@ -450,6 +460,39 @@ def download_history_batch(
         cap independent of batch size, so a smaller trailing chunk (e.g.
         the 1-instrument remainder of a 21-instrument batch) legitimately
         gets a HIGHER count than a full QUANTHUB_BATCH_SIZE-sized chunk.
+
+    CONFIRMED PERMANENT API CONSTRAINT (live-tested, a controlled
+    parameter-by-parameter investigation -- see _estimate_count()'s own
+    docstring for the full evidence): /api/v2/ohlc/ has no pagination,
+    cursor, offset, or date-range mechanism of any kind, and the total
+    row cap is a HARD, exactly-enforced 10,000 rows per HTTP request
+    (10,000 succeeds, 10,001 returns HTTP 400 "Max row limit exceeded
+    (10000)", live-confirmed at both a 1-instrument and an 8-instrument
+    batch size). Because that cap is shared across every instrument in
+    one request, the effective per-instrument count this function can
+    ever request is QUANTHUB_MAX_ROWS_PER_REQUEST // len(chunk) --
+    batching more instruments into one request (see QUANTHUB_BATCH_SIZE)
+    directly shrinks how far back each individual instrument can reach.
+    This is a genuine, permanent tradeoff between fewer HTTP requests
+    (larger batches) and deeper reach for an instrument queried for the
+    first time (smaller batches) -- there is no client-side workaround,
+    since no parameter exists to request a window anchored anywhere
+    other than "now".
+
+    A COLD-STARTED instrument (never previously cached) can therefore
+    only ever receive, on its very first fetch, the most recent history
+    reachable within that request's effective count cap -- nothing
+    older is retrievable through this endpoint, ever, no matter how the
+    request is shaped. This does NOT mean deep history is permanently
+    unreachable for an actively-scanned instrument, though: database.
+    service's SQLite cache (Module 2) persists every completed bar this
+    function returns and never re-fetches what it already has, so an
+    instrument that gets scanned repeatedly over time accumulates
+    history day by day as "now" (and therefore QuantHub's own reachable
+    window) advances -- this is the existing, unmodified caching
+    behavior already doing the only thing that can compensate for this
+    API-side ceiling; it does not change the ceiling itself for a
+    genuinely new instrument's first request.
     """
     if isinstance(interval, str):
         interval = BarInterval(interval)
