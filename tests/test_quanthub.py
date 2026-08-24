@@ -502,3 +502,171 @@ def test_fewer_records_than_requested_is_accepted_not_an_error(mocker):
     # No exception raised (the call above completing is itself the
     # assertion); the shorter-than-requested history is returned as-is.
     assert len(df) == 10
+
+
+# ---------------------------------------------------------------------
+# download_history_batch: chunking into QUANTHUB_BATCH_SIZE-sized HTTP
+# requests (live-verified: 10 instruments in one request returns 200;
+# QUANTHUB_BATCH_SIZE=10 unless a larger batch is separately verified).
+# ---------------------------------------------------------------------
+
+def _resp(json_body, status_code=200):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_body
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+def test_quanthub_batch_size_is_10():
+    assert quanthub.QUANTHUB_BATCH_SIZE == 10
+
+
+def test_download_history_batch_ten_instruments_issues_one_request(mocker):
+    instruments = [f"INST{i}" for i in range(10)]
+    records = [
+        {"product": instr, "time": _ms("2026-01-05"), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+        for instr in instruments
+    ]
+    mock_get = _mock_response(mocker, json_body=records)
+
+    result = quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    assert mock_get.call_count == 1
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["instruments"] == ",".join(instruments)
+    assert set(result) == set(instruments)
+
+
+def test_download_history_batch_twenty_one_instruments_issues_three_requests(mocker):
+    # 21 instruments -> chunks of 10, 10, 1 -> exactly 3 HTTP requests.
+    instruments = [f"INST{i}" for i in range(21)]
+    chunks = [instruments[0:10], instruments[10:20], instruments[20:21]]
+    responses = [
+        _resp(
+            [
+                {
+                    "product": instr, "time": _ms("2026-01-05"),
+                    "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+                }
+                for instr in chunk
+            ]
+        )
+        for chunk in chunks
+    ]
+    mock_get = mocker.patch("core.quanthub.requests.get", side_effect=responses)
+
+    result = quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    assert mock_get.call_count == 3
+    call_instrument_params = [c.kwargs["params"]["instruments"] for c in mock_get.call_args_list]
+    assert call_instrument_params == [",".join(chunk) for chunk in chunks]
+    assert set(result) == set(instruments)
+
+
+def test_download_history_batch_deduplicates_repeated_instruments(mocker):
+    records = [
+        {"product": "SONH26", "time": _ms("2026-01-05"), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+    ]
+    mock_get = _mock_response(mocker, json_body=records)
+
+    result = quanthub.download_history_batch(
+        ["SONH26", "ERH26", "SONH26"], "DAILY", "2026-01-01", "2026-01-10"
+    )
+
+    assert mock_get.call_count == 1
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["instruments"] == "SONH26,ERH26"
+    assert set(result) == {"SONH26", "ERH26"}
+
+
+def test_download_history_batch_splits_response_by_product(mocker):
+    records = [
+        {"product": "SONH26", "time": _ms("2026-01-05"), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+        {"product": "ERH26", "time": _ms("2026-01-05"), "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+    ]
+    _mock_response(mocker, json_body=records)
+
+    result = quanthub.download_history_batch(["SONH26", "ERH26"], "DAILY", "2026-01-01", "2026-01-10")
+
+    assert result["SONH26"].iloc[0]["Close"] == 1.0
+    assert result["ERH26"].iloc[0]["Close"] == 2.0
+
+
+def test_download_history_batch_four_hour_resamples_each_instrument_independently(mocker):
+    hourly_dates = pd.date_range("2026-01-05 00:00", periods=8, freq="1h")
+    records = []
+    for instr, base in [("SONH26", 100.0), ("ERH26", 200.0)]:
+        for i, ts in enumerate(hourly_dates):
+            records.append(
+                {
+                    "product": instr, "time": int(ts.value // 10**6),
+                    "open": base + i, "high": base + i + 0.5, "low": base + i - 0.5,
+                    "close": base + i + 0.25, "volume": 10,
+                }
+            )
+    mock_get = _mock_response(mocker, json_body=records)
+
+    result = quanthub.download_history_batch(["SONH26", "ERH26"], "4H", "2026-01-05", "2026-01-05")
+
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["interval"] == "1H"
+    assert len(result["SONH26"]) == 2
+    assert len(result["ERH26"]) == 2
+    assert result["SONH26"].iloc[0]["Open"] == 100.0
+    assert result["ERH26"].iloc[0]["Open"] == 200.0
+
+
+def test_download_history_batch_count_estimated_once_and_shared_across_chunks(mocker):
+    # Same count= parameter on every chunked request, capped exactly as
+    # a single-instrument download_history() call would be -- batching
+    # must never inflate or vary the count per chunk.
+    instruments = [f"INST{i}" for i in range(21)]
+    mock_get = mocker.patch(
+        "core.quanthub.requests.get", side_effect=[_resp([]), _resp([]), _resp([])]
+    )
+
+    quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    counts = [c.kwargs["params"]["count"] for c in mock_get.call_args_list]
+    assert mock_get.call_count == 3
+    assert len(set(counts)) == 1
+    assert counts[0] <= quanthub.QUANTHUB_MAX_REQUEST_COUNT
+
+
+def test_download_history_batch_partial_history_per_instrument_accepted_without_pagination(mocker):
+    # SONH26 returns fewer records than ERH26 in the SAME batched
+    # response -- accepted as-is per instrument, no extra request
+    # triggered to try to "fill in" the shorter one.
+    records = [
+        {"product": "SONH26", "time": _ms("2026-01-05"), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+    ] + [
+        {
+            "product": "ERH26", "time": _ms(f"2026-01-{d:02d}"),
+            "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+        }
+        for d in range(1, 6)
+    ]
+    mock_get = _mock_response(mocker, json_body=records)
+
+    result = quanthub.download_history_batch(["SONH26", "ERH26"], "DAILY", "2026-01-01", "2026-01-10")
+
+    assert mock_get.call_count == 1
+    assert len(result["SONH26"]) == 1
+    assert len(result["ERH26"]) == 5
+
+
+def test_download_history_delegates_to_download_history_batch(mocker):
+    # download_history() is now a thin single-instrument wrapper around
+    # download_history_batch() -- locks in that the refactor didn't
+    # change its own public contract.
+    mock_batch = mocker.patch(
+        "core.quanthub.download_history_batch",
+        return_value={
+            "SONH26": pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+        },
+    )
+
+    quanthub.download_history("SONH26", "DAILY", "2026-01-01", "2026-01-10")
+
+    mock_batch.assert_called_once_with(["SONH26"], "DAILY", "2026-01-01", "2026-01-10")

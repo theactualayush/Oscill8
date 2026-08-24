@@ -40,7 +40,7 @@ import pandas as pd
 
 from core.config import BarInterval
 from core.utils import DateLike, get_logger
-from database import get_history
+from database import get_history, get_history_batch
 
 from strategy_engine.combinations import StrategyInstance
 
@@ -122,6 +122,47 @@ def build_history(
     return StrategyHistory(instance=instance, price_field=price_field, history=aligned)
 
 
+def prewarm_leg_cache(
+    instances: list[StrategyInstance],
+    price_start: DateLike,
+    price_end: DateLike,
+) -> LegCache:
+    """Batch-prefetch every distinct leg RIC required by `instances` (for
+    the SAME price_start/price_end window) into a fresh LegCache, grouped
+    by interval since one Strategy Set can legitimately mix intervals
+    across entries (e.g. a SOFR DAILY entry alongside a SONIA HOURLY
+    entry) and QuantHub's batching happens per-interval (see
+    database.get_history_batch).
+
+    Calls only database.get_history_batch -- this module still never
+    imports core.downloader/core.quanthub/lseg.data directly (see the
+    module docstring's own provider-agnostic rule); all provider
+    routing/batching decisions live entirely inside database.service.
+
+    Returns a LegCache pre-populated with every leg's history, keyed
+    exactly as _fetch_leg expects: (ric, interval.value, str(price_start),
+    str(price_end)). build_history()/_fetch_leg() are completely
+    unmodified -- they transparently skip re-fetching any key already
+    present here, and transparently fall back to an ordinary
+    database.get_history() call for any leg NOT present here (e.g. an
+    LSEG RIC get_history_batch chose to omit because
+    core.downloader.MarketDataUnavailableError was raised for it -- see
+    that function's docstring), preserving run_scan_on_instances()'s
+    existing per-candidate skip-and-continue behavior unchanged.
+    """
+    rics_by_interval: dict[BarInterval, set[str]] = {}
+    for instance in instances:
+        interval = instance.definition.interval
+        rics_by_interval.setdefault(interval, set()).update(instance.rics)
+
+    leg_cache: LegCache = {}
+    for interval, rics in rics_by_interval.items():
+        batch = get_history_batch(list(rics), interval, price_start, price_end)
+        for ric, frame in batch.items():
+            leg_cache[(ric, interval.value, str(price_start), str(price_end))] = frame
+    return leg_cache
+
+
 def generate_histories(
     instances: list[StrategyInstance],
     price_start: DateLike,
@@ -132,9 +173,11 @@ def generate_histories(
     Shares one leg_cache across all instances so overlapping legs (e.g.
     adjacent rolling flies sharing two of three contracts) are only
     retrieved from database.get_history once each, regardless of how
-    many instances reference them.
+    many instances reference them. The leg_cache is pre-warmed via
+    prewarm_leg_cache() (batches QuantHub-routed legs into as few HTTP
+    requests as possible) before any per-instance build_history() call.
     """
-    leg_cache: LegCache = {}
+    leg_cache = prewarm_leg_cache(instances, price_start, price_end)
     return [
         build_history(instance, price_start, price_end, leg_cache=leg_cache)
         for instance in instances

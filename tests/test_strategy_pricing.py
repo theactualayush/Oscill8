@@ -251,16 +251,83 @@ def test_generate_histories_fetches_each_distinct_leg_once(mocker):
     )
     instance_a = StrategyInstance(definition=definition, rics=("SRAH26", "SRAM26"))
     instance_b = StrategyInstance(definition=definition, rics=("SRAM26", "SRAU26"))
-    mock_get_history = mocker.patch(
-        "strategy_engine.pricing.get_history",
-        return_value=_leg_df(["2026-01-02"], [96.80]),
+    leg = _leg_df(["2026-01-02"], [96.80])
+    mock_get_history_batch = mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        return_value={"SRAH26": leg, "SRAM26": leg, "SRAU26": leg},
     )
 
     pricing.generate_histories([instance_a, instance_b], "2026-01-01", "2026-01-31")
 
-    # 3 distinct RICs across the two instances (SRAH26, SRAM26, SRAU26),
-    # not 4 (2 instances x 2 legs each) -- SRAM26 is shared and fetched once.
-    assert mock_get_history.call_count == 3
+    # prewarm_leg_cache batches the whole scan's distinct RICs into ONE
+    # get_history_batch call (not one get_history call per leg) -- 3
+    # distinct RICs across the two instances (SRAH26, SRAM26, SRAU26),
+    # not 4 (2 instances x 2 legs each): SRAM26 is shared and requested
+    # once within that one batch call.
+    assert mock_get_history_batch.call_count == 1
+    requested_rics = mock_get_history_batch.call_args[0][0]
+    assert set(requested_rics) == {"SRAH26", "SRAM26", "SRAU26"}
+
+
+def test_prewarm_leg_cache_groups_rics_by_interval(mocker):
+    """One StrategySet-style call can legitimately mix intervals across
+    entries (e.g. a SOFR DAILY entry alongside a SONIA HOURLY entry) --
+    prewarm_leg_cache must issue one get_history_batch call PER DISTINCT
+    interval, never merging rics across intervals into a single call
+    (which would corrupt QuantHub's per-interval batching) and never
+    issuing more than one call for the same interval."""
+    daily_def = StrategyDefinition(
+        market_key="SOFR", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
+    )
+    hourly_def = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1,), interval=BarInterval.HOURLY,
+    )
+    daily_instance = StrategyInstance(definition=daily_def, rics=("SRAH26", "SRAM26"))
+    hourly_instance = StrategyInstance(definition=hourly_def, rics=("SRAU26",))
+    leg = _leg_df(["2026-01-02"], [96.80])
+
+    mock_batch = mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=lambda rics, interval, start, end: {ric: leg for ric in rics},
+    )
+
+    leg_cache = pricing.prewarm_leg_cache(
+        [daily_instance, hourly_instance], "2026-01-01", "2026-01-31"
+    )
+
+    assert mock_batch.call_count == 2
+    calls_by_interval = {call.args[1]: set(call.args[0]) for call in mock_batch.call_args_list}
+    assert calls_by_interval == {
+        BarInterval.DAILY: {"SRAH26", "SRAM26"},
+        BarInterval.HOURLY: {"SRAU26"},
+    }
+    assert leg_cache[("SRAH26", "DAILY", "2026-01-01", "2026-01-31")] is leg
+    assert leg_cache[("SRAU26", "HOURLY", "2026-01-01", "2026-01-31")] is leg
+
+
+def test_prewarm_leg_cache_populated_keys_are_reused_by_build_history(mocker):
+    """A key prewarm_leg_cache populates must be consumed by
+    build_history/_fetch_leg without triggering any further
+    get_history()/get_history_batch() call -- proves the cache-key
+    convention between the two functions actually matches, not just
+    that each independently uses the same-looking tuple shape."""
+    instance = StrategyInstance(
+        definition=StrategyDefinition(
+            market_key="SOFR", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
+        ),
+        rics=("SRAH26", "SRAM26"),
+    )
+    leg = _leg_df(["2026-01-02"], [96.80])
+    mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        return_value={"SRAH26": leg, "SRAM26": leg},
+    )
+    mock_get_history = mocker.patch("strategy_engine.pricing.get_history")
+
+    leg_cache = pricing.prewarm_leg_cache([instance], "2026-01-01", "2026-01-31")
+    pricing.build_history(instance, "2026-01-01", "2026-01-31", leg_cache=leg_cache)
+
+    mock_get_history.assert_not_called()
 
 
 def test_build_history_propagates_market_data_unavailable_error_unchanged(mocker):

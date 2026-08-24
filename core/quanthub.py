@@ -57,6 +57,15 @@ instrument whose own real history is shorter than the requested count
 never padded/fabricated). HTTP 429 itself is raised as a distinct,
 non-retried QuantHubRateLimitError -- see that class and
 _fetch_quanthub_records for the retry-policy detail.
+
+Live testing also confirmed QuantHub accepts multiple instruments in
+ONE request (10 instruments x count=48 -> 480 records, all HTTP 200) --
+see QUANTHUB_BATCH_SIZE / download_history_batch(). Batching many
+instruments into one HTTP request (instead of one request per
+instrument) is the primary tool for staying under QuantHub's rate
+limit during an intermarket scan that needs many contracts at once;
+database.service.get_history_batch() is the caller-facing entry point
+that uses this for QuantHub-routed RICs.
 """
 
 from __future__ import annotations
@@ -334,11 +343,10 @@ def _normalize_quanthub_records(records: list[dict]) -> pd.DataFrame:
 def fetch_batch(
     instruments: list[str], interval: str | BarInterval, count: int
 ) -> dict[str, pd.DataFrame]:
-    """Fetch many QuantHub instruments in one HTTP call, each normalized
-    to the canonical OHLCV schema. Exercises the same batching QuantHub
-    itself supports -- not currently wired into database.get_history()
-    (which is single-RIC), but available for a future multi-leg
-    optimization without needing a second implementation later.
+    """Fetch many QuantHub instruments in ONE HTTP call (no chunking --
+    callers that may exceed QUANTHUB_BATCH_SIZE must chunk before calling
+    this; see download_history_batch below, which does), each normalized
+    to the canonical OHLCV schema.
     """
     if isinstance(interval, str):
         interval = BarInterval(interval)
@@ -351,35 +359,62 @@ def fetch_batch(
     }
 
 
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
 
-def download_history(
-    instrument: str,
+# Maximum instruments per QuantHub HTTP request. Live-verified: a single
+# request for 10 distinct instruments (interval=1H, count=48) returned
+# HTTP 200 with all 480 expected records (48 per instrument); a separate
+# 6-instrument request behaved identically. NOT tested above 10 -- never
+# assume a larger batch is safe without separately establishing it.
+QUANTHUB_BATCH_SIZE = 10
+
+
+def download_history_batch(
+    instruments: list[str],
     interval: str | BarInterval,
     start: DateLike,
     end: DateLike,
-) -> pd.DataFrame:
-    """Download historical OHLCV bars for a single QuantHub instrument.
+) -> dict[str, pd.DataFrame]:
+    """Download historical OHLCV bars for MANY QuantHub instruments,
+    batching up to QUANTHUB_BATCH_SIZE instruments into each HTTP request
+    (live-verified request shape -- see QUANTHUB_BATCH_SIZE) instead of
+    one request per instrument. This is the one place QuantHub HTTP
+    fetches happen; download_history() below is now a thin single-
+    instrument wrapper around this function, so there is only one
+    implementation of the count-estimation/resample/date-filter/
+    truncation-warning logic, not two.
+
+    Duplicate entries in `instruments` are fetched once; the returned
+    dict has one entry per unique instrument (never per input-list
+    position), regardless of how many times it appeared in `instruments`.
 
     Args:
-        instrument: QuantHub instrument identifier, e.g. "ERH26" -- must
-            already be built via build_instrument(); this function does
-            no RIC/root resolution of its own.
+        instruments: QuantHub instrument identifiers, e.g. ["ERH26",
+            "FSRH26"] -- each must already be built via build_instrument();
+            this function does no RIC/root resolution of its own.
         interval: "DAILY", "HOURLY", or "4H" (see core.config.BarInterval).
         start: Start date (inclusive), str "YYYY-MM-DD", date, or datetime.
         end: End date (inclusive), str "YYYY-MM-DD", date, or datetime.
 
     Returns:
-        DataFrame with columns: Date, Open, High, Low, Close, Volume.
-        Empty DataFrame (correct columns) if QuantHub returned no data
-        for the requested instrument.
+        dict mapping each unique instrument to a DataFrame with columns
+        Date, Open, High, Low, Close, Volume -- empty (correct columns)
+        for an instrument QuantHub returned no data for.
 
     Note:
         FOUR_HOUR is fetched as native 1H and resampled via
         core.utils.resample_to_4h -- the same function core.downloader
-        uses for LSEG, not a second implementation.
+        uses for LSEG, not a second implementation. `count` is estimated
+        ONCE from [start, end] (capped at QUANTHUB_MAX_REQUEST_COUNT)
+        and shared across every instrument in every chunk of this batch
+        -- matching the live-verified request shape, where all
+        instruments in one call shared one count= value.
     """
     if isinstance(interval, str):
         interval = BarInterval(interval)
@@ -395,25 +430,65 @@ def download_history(
     native_interval = config.QUANTHUB_NATIVE_INTERVAL[interval]
     count = _estimate_count(native_interval, start_dt, end_dt)
 
-    grouped = _fetch_quanthub_records([instrument], native_interval, count)
-    raw_records = grouped.get(instrument, [])
-    df = _normalize_quanthub_records(raw_records)
+    unique_instruments = list(dict.fromkeys(instruments))  # de-dupe, preserve order
+    grouped: dict[str, list[dict]] = {}
+    for chunk in _chunked(unique_instruments, QUANTHUB_BATCH_SIZE):
+        grouped.update(_fetch_quanthub_records(chunk, native_interval, count))
 
-    if not df.empty and len(df) >= count and df["Date"].min() > pd.Timestamp(start_d):
-        logger.warning(
-            "QuantHub %s: fetched count=%d bars but earliest returned Date (%s) "
-            "is after the requested start (%s) -- history before that point may "
-            "be missing because count was insufficient, not because it doesn't "
-            "exist. See core.quanthub._estimate_count's documented limitation.",
-            instrument, count, df["Date"].min(), start_d,
-        )
+    results: dict[str, pd.DataFrame] = {}
+    for instrument in unique_instruments:
+        raw_records = grouped.get(instrument, [])
+        df = _normalize_quanthub_records(raw_records)
 
-    if interval == BarInterval.FOUR_HOUR:
-        df = resample_to_4h(df, config.RESAMPLE_RULE[BarInterval.FOUR_HOUR])
+        if not df.empty and len(df) >= count and df["Date"].min() > pd.Timestamp(start_d):
+            logger.warning(
+                "QuantHub %s: fetched count=%d bars but earliest returned Date (%s) "
+                "is after the requested start (%s) -- history before that point may "
+                "be missing because count was insufficient, not because it doesn't "
+                "exist. See core.quanthub._estimate_count's documented limitation.",
+                instrument, count, df["Date"].min(), start_d,
+            )
 
-    if not df.empty:
-        df = df[(df["Date"] >= pd.Timestamp(start_d)) & (df["Date"] < pd.Timestamp(end_d) + pd.Timedelta(days=1))]
-        df = df.reset_index(drop=True)
+        if interval == BarInterval.FOUR_HOUR:
+            df = resample_to_4h(df, config.RESAMPLE_RULE[BarInterval.FOUR_HOUR])
 
+        if not df.empty:
+            df = df[(df["Date"] >= pd.Timestamp(start_d)) & (df["Date"] < pd.Timestamp(end_d) + pd.Timedelta(days=1))]
+            df = df.reset_index(drop=True)
+
+        results[instrument] = df
+
+    logger.info(
+        "Downloaded QuantHub batch: %d unique instrument(s) in %d request(s)",
+        len(unique_instruments), len(_chunked(unique_instruments, QUANTHUB_BATCH_SIZE)),
+    )
+    return results
+
+
+def download_history(
+    instrument: str,
+    interval: str | BarInterval,
+    start: DateLike,
+    end: DateLike,
+) -> pd.DataFrame:
+    """Download historical OHLCV bars for a single QuantHub instrument.
+    Thin wrapper around download_history_batch([instrument], ...) -- see
+    that function for the actual fetch/resample/filter logic.
+
+    Args:
+        instrument: QuantHub instrument identifier, e.g. "ERH26" -- must
+            already be built via build_instrument(); this function does
+            no RIC/root resolution of its own.
+        interval: "DAILY", "HOURLY", or "4H" (see core.config.BarInterval).
+        start: Start date (inclusive), str "YYYY-MM-DD", date, or datetime.
+        end: End date (inclusive), str "YYYY-MM-DD", date, or datetime.
+
+    Returns:
+        DataFrame with columns: Date, Open, High, Low, Close, Volume.
+        Empty DataFrame (correct columns) if QuantHub returned no data
+        for the requested instrument.
+    """
+    results = download_history_batch([instrument], interval, start, end)
+    df = results[instrument]
     logger.info("Downloaded %d bars for QuantHub instrument %s", len(df), instrument)
     return df

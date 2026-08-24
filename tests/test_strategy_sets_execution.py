@@ -212,18 +212,32 @@ def _fake_series(ric: str, interval: BarInterval) -> pd.DataFrame:
 
 @pytest.fixture
 def fake_provider(mocker):
-    """Patches strategy_engine.pricing.get_history -- run_scan_on_
-    instances()/build_history() run completely for real; only the
-    LSEG-facing fetch is faked. Records every (ric, interval, start,
-    end) call it received."""
+    """Patches strategy_engine.pricing.get_history AND get_history_batch --
+    run_scan_on_instances()/build_history() run completely for real; only
+    the LSEG/QuantHub-facing fetch is faked. run_scan_on_instances() now
+    pre-warms its leg_cache via prewarm_leg_cache() -> get_history_batch()
+    BEFORE the per-instance loop (see the QuantHub-batching phase), so
+    get_history_batch must be mocked too, or the real (unmocked) function
+    would try to reach a real database/provider. Both mocks share the
+    same call-recording _get_history so fake_provider.calls stays a
+    complete, chronologically accurate record of every (ric, interval,
+    start, end) fetched, regardless of which of the two entry points
+    actually resolved it."""
     calls: list[tuple] = []
 
     def _get_history(ric, interval, start, end):
         calls.append((ric, interval, str(start), str(end)))
         return _fake_series(ric, interval)
 
+    def _get_history_batch(rics, interval, start, end):
+        return {ric: _get_history(ric, interval, start, end) for ric in rics}
+
     mock = mocker.patch("strategy_engine.pricing.get_history", side_effect=_get_history)
+    mock_batch = mocker.patch(
+        "strategy_engine.pricing.get_history_batch", side_effect=_get_history_batch
+    )
     mock.calls = calls
+    mock_batch.calls = calls
     return mock
 
 

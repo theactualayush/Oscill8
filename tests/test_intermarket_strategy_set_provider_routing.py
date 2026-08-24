@@ -141,6 +141,17 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     other six) candidates in the SAME scan, neither provider's mock ever
     seeing the other's RIC/instrument, and every market contributes
     results to the same ScanReport.
+
+    run_scan_on_instances() now pre-warms its leg_cache via
+    strategy_engine.pricing.prewarm_leg_cache() -> database.
+    get_history_batch() BEFORE the per-instance pricing loop (see the
+    QuantHub-batching phase). LSEG-routed RICs are still fetched one at
+    a time through the completely unmodified database.service.
+    download_history (via get_history()); QuantHub-routed instruments
+    are now fetched through database.service.download_history_quanthub_batch
+    (core.quanthub.download_history_batch) -- ONE call carrying every
+    QuantHub instrument needing a fetch for this scan's single DAILY
+    interval group, not one call per instrument.
     """
     instances = expand_strategy_set(_seven_market_set(), "2026-01-01", "2026-03-31")
     assert {i.definition.market_key for i in instances} == set(ALL_SEVEN_MARKETS)
@@ -161,8 +172,10 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
         "database.service.download_history", return_value=_bars(["2026-01-05", "2026-01-06"])
     )
     mock_qh = mocker.patch(
-        "database.service.download_history_quanthub",
-        return_value=_bars(["2026-01-05", "2026-01-06"]),
+        "database.service.download_history_quanthub_batch",
+        side_effect=lambda instruments, interval, start, end: {
+            instr: _bars(["2026-01-05", "2026-01-06"]) for instr in instruments
+        },
     )
 
     report = run_scan_on_instances(instances, "2026-01-01", "2026-01-31")
@@ -175,15 +188,23 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     quanthub_instance_count = sum(1 for i in instances if i.definition.market_key != "SOFR")
 
     assert mock_lseg.call_count == lseg_instance_count
-    assert mock_qh.call_count == quanthub_instance_count
+    # All six QuantHub markets share one DAILY interval group, so
+    # prewarm_leg_cache() -> get_history_batch() issues exactly ONE
+    # download_history_quanthub_batch() call carrying every distinct
+    # QuantHub instrument needing a fetch (chunking into
+    # QUANTHUB_BATCH_SIZE-sized HTTP requests happens inside the real,
+    # unmocked core.quanthub.download_history_batch -- out of scope for
+    # this mock boundary, covered separately in tests/test_quanthub.py).
+    assert mock_qh.call_count == 1
+    quanthub_instruments_seen = set(mock_qh.call_args_list[0].args[0])
+    assert len(quanthub_instruments_seen) == quanthub_instance_count
 
     # Every call the LSEG mock actually received was a SOFR-style RIC
-    # (root "SRA"); every call the QuantHub mock received was one of
-    # the six markets' own QuantHub instruments -- never a raw LSEG RIC.
+    # (root "SRA"); every instrument the QuantHub mock received was one
+    # of the six markets' own QuantHub instruments -- never a raw LSEG RIC.
     lseg_instruments_seen = {call.args[0] for call in mock_lseg.call_args_list}
     assert all(instr.startswith("SRA") for instr in lseg_instruments_seen)
 
-    quanthub_instruments_seen = {call.args[0] for call in mock_qh.call_args_list}
     quanthub_roots_expected = {qh_root_for_market(mk) for mk in ALL_SEVEN_MARKETS if mk != "SOFR"}
     assert all(
         any(instr.startswith(root) for root in quanthub_roots_expected)

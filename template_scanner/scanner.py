@@ -41,7 +41,7 @@ from range_analytics.multi_lookback import analyze_multi_lookback
 
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
-from strategy_engine.pricing import StrategyHistory, build_history
+from strategy_engine.pricing import StrategyHistory, build_history, prewarm_leg_cache
 
 from template_scanner.scan_results import ScanCandidateResult
 from template_scanner.universe import dedupe_candidates, generate_candidate_universe
@@ -182,8 +182,19 @@ def run_scan_on_instances(
     it built its candidate list. run_scan() itself is refactored below
     to call this function too, so there is only one implementation of
     the loop, not two.
+
+    leg_cache is pre-warmed via strategy_engine.pricing.prewarm_leg_cache()
+    -- batches every distinct QuantHub-routed leg required by `instances`
+    into as few HTTP requests as possible (see database.get_history_batch)
+    before the per-instance loop below begins, instead of each instance
+    triggering its own lazy, one-RIC-at-a-time fetch. This is purely a
+    request-volume optimization: the per-candidate MarketDataUnavailableError
+    skip-and-continue policy below is completely unaffected, since any leg
+    prewarm_leg_cache() couldn't resolve simply falls back to the existing
+    lazy build_history()/get_history() path and is caught here exactly as
+    before (see prewarm_leg_cache's own docstring).
     """
-    leg_cache: dict = {}
+    leg_cache = prewarm_leg_cache(instances, price_start, price_end)
     unavailable_rics: set[str] = set()
     histories: list[StrategyHistory] = []
     skipped: list[SkippedCandidate] = []

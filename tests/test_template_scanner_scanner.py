@@ -51,6 +51,16 @@ def _leg_df() -> pd.DataFrame:
     )
 
 
+def _batch_leg_df(rics, interval, start, end):
+    """Default get_history_batch side_effect: every requested RIC
+    succeeds with the same leg data -- mirrors the old blanket
+    `return_value=_leg_df()` get_history mock, now at the batched
+    prewarm_leg_cache() boundary (strategy_engine.pricing.
+    get_history_batch), which is what run_scan()/run_scan_on_instances()
+    now call FIRST, before any per-instance build_history()."""
+    return {ric: _leg_df() for ric in rics}
+
+
 def _spread():
     return template_from_dense_weights("SOFR", (1, -1), BarInterval.DAILY)
 
@@ -141,7 +151,7 @@ def test_scan_report_skipped_defaults_to_empty():
 # ---------------------------------------------------------------------
 
 def test_run_scan_builds_one_result_per_deduped_candidate(mocker):
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(_spread(),),
@@ -159,7 +169,7 @@ def test_run_scan_builds_one_result_per_deduped_candidate(mocker):
 
 
 def test_run_scan_preserves_exact_weights_for_scaled_and_unscaled_templates(mocker):
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     fly = _fly()
     fly_2x = template_from_dense_weights("SOFR", (2, -4, 2), BarInterval.DAILY)
@@ -176,7 +186,7 @@ def test_run_scan_preserves_exact_weights_for_scaled_and_unscaled_templates(mock
 
 
 def test_run_scan_dedupes_before_pricing(mocker):
-    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mock_batch = mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(_fly(), _fly()),  # identical template twice
@@ -187,13 +197,16 @@ def test_run_scan_dedupes_before_pricing(mocker):
     report = run_scan(request)
 
     # 2 unique fly instances (SRAH26-M26-U26, SRAM26-U26-Z26), each 3 legs,
-    # 2 legs shared between the two instances -> 4 distinct RICs total.
+    # 2 legs shared between the two instances -> 4 distinct RICs total,
+    # batched into ONE prewarm_leg_cache -> get_history_batch call (not
+    # one get_history call per leg).
     assert len(report.results) == 2
-    assert mock_get_history.call_count == 4
+    assert mock_batch.call_count == 1
+    assert set(mock_batch.call_args[0][0]) == {"SRAH26", "SRAM26", "SRAU26", "SRAZ26"}
 
 
 def test_run_scan_shares_leg_cache_across_the_entire_scan(mocker):
-    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mock_batch = mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(_spread(),),
@@ -204,15 +217,17 @@ def test_run_scan_shares_leg_cache_across_the_entire_scan(mocker):
     run_scan(request)
 
     # 3 spread instances over 4 quarterly contracts (H26,M26,U26,Z26) share
-    # M26/U26 across adjacent instances -> 4 distinct RICs fetched, not 6
-    # (3 instances x 2 legs) -- proves the leg_cache is shared, not
-    # per-instance.
-    assert mock_get_history.call_count == 4
+    # M26/U26 across adjacent instances -> 4 distinct RICs, all requested
+    # in ONE batched prewarm call (not 6 individual get_history calls,
+    # 3 instances x 2 legs) -- proves the leg_cache is shared and
+    # batch-prefetched, not fetched per-instance.
+    assert mock_batch.call_count == 1
+    assert set(mock_batch.call_args[0][0]) == {"SRAH26", "SRAM26", "SRAU26", "SRAZ26"}
 
 
 @pytest.mark.parametrize("interval", [BarInterval.DAILY, BarInterval.HOURLY, BarInterval.FOUR_HOUR])
 def test_run_scan_covers_all_supported_intervals(mocker, interval):
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(template_from_dense_weights("SOFR", (1, -1), interval),),
@@ -227,9 +242,12 @@ def test_run_scan_covers_all_supported_intervals(mocker, interval):
 
 
 def test_run_scan_propagates_build_history_exceptions_uncaught(mocker):
+    # An unrelated failure during the (now batched) prefetch propagates
+    # uncaught, exactly like an unrelated per-leg get_history() failure
+    # did before batching -- run_scan()'s exception policy is unchanged.
     mocker.patch(
-        "strategy_engine.pricing.get_history",
-        side_effect=[_leg_df(), RuntimeError("simulated LSEG failure")],
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=RuntimeError("simulated LSEG failure"),
     )
 
     request = ScanRequest(
@@ -244,7 +262,10 @@ def test_run_scan_propagates_build_history_exceptions_uncaught(mocker):
 
 def test_run_scan_no_data_candidate_is_a_result_not_an_exception(mocker):
     empty = pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-    mocker.patch("strategy_engine.pricing.get_history", return_value=empty)
+    mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=lambda rics, interval, start, end: {ric: empty for ric in rics},
+    )
 
     request = ScanRequest(
         definitions=(_spread(),),
@@ -262,15 +283,28 @@ def test_run_scan_no_data_candidate_is_a_result_not_an_exception(mocker):
 # Module 5B.1: MarketDataUnavailableError skip-and-continue behaviour
 # ---------------------------------------------------------------------
 
+def _batch_omitting(*omit_rics):
+    """get_history_batch side_effect simulating the real batched
+    prewarm's own behavior for an LSEG RIC confirmed unavailable: that
+    RIC is silently omitted from the returned dict (see database.
+    service.get_history_batch's docstring), never raised from the batch
+    call itself. build_history()/_fetch_leg() then transparently fall
+    back to an individual get_history() call for that missing leg --
+    which is the mock that must actually raise MarketDataUnavailableError,
+    exactly where run_scan_on_instances()'s existing per-candidate
+    skip-and-continue try/except already catches it, unchanged by
+    batching.
+    """
+    def _batch(rics, interval, start, end):
+        return {ric: _leg_df() for ric in rics if ric not in omit_rics}
+    return _batch
+
+
 def test_run_scan_skips_candidate_with_unavailable_leg_and_continues(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("SRAH26"))
     mocker.patch(
         "strategy_engine.pricing.get_history",
-        side_effect=[
-            MarketDataUnavailableError("SRAH26", "The universe is not found"),
-            _leg_df(),  # SRAM26
-            _leg_df(),  # SRAU26
-            _leg_df(),  # SRAZ26
-        ],
+        side_effect=MarketDataUnavailableError("SRAH26", "The universe is not found"),
     )
 
     request = ScanRequest(
@@ -294,14 +328,10 @@ def test_run_scan_skips_candidate_with_unavailable_leg_and_continues(mocker):
 
 
 def test_run_scan_shared_unavailable_ric_skips_every_affected_candidate_without_reattempt(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("SRAM26"))
     mock_get_history = mocker.patch(
         "strategy_engine.pricing.get_history",
-        side_effect=[
-            _leg_df(),  # SRAH26 (candidate 1 leg 1)
-            MarketDataUnavailableError("SRAM26", "The universe is not found"),  # candidate 1 leg 2
-            _leg_df(),  # SRAU26 (candidate 3 leg 1)
-            _leg_df(),  # SRAZ26 (candidate 3 leg 2)
-        ],
+        side_effect=MarketDataUnavailableError("SRAM26", "The universe is not found"),
     )
 
     request = ScanRequest(
@@ -322,15 +352,24 @@ def test_run_scan_shared_unavailable_ric_skips_every_affected_candidate_without_
     assert {s.instance.rics for s in report.skipped} == {("SRAH26", "SRAM26"), ("SRAM26", "SRAU26")}
     assert all(s.unavailable_ric == "SRAM26" for s in report.skipped)
 
-    # Exactly 4 get_history calls total (H26, M26-fails, U26, Z26): the
-    # second candidate's own attempt to fetch M26 again never happens --
-    # it's pre-emptively skipped via unavailable_rics, proving the
-    # shared unavailable RIC is never re-attempted against LSEG.
-    assert mock_get_history.call_count == 4
+    # H26, U26, Z26 are all served from the batch-prewarmed leg_cache
+    # (the batch omitted only M26) -- the individual get_history()
+    # fallback is only ever needed ONCE, for M26's first (candidate 1)
+    # attempt. The second candidate's own reference to M26 never
+    # reaches get_history() at all -- it's pre-emptively skipped via
+    # unavailable_rics, proving the shared unavailable RIC is never
+    # re-attempted against LSEG.
+    assert mock_get_history.call_count == 1
 
 
 def test_run_scan_all_unavailable_candidates_returns_empty_results_no_exception(mocker):
     outright = template_from_dense_weights("SOFR", (1,), BarInterval.DAILY)
+    # Both single-leg candidates' RICs are omitted from the batch-prewarmed
+    # leg_cache, so each falls back to its own individual get_history() call.
+    mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=_batch_omitting("SRAH26", "SRAM26"),
+    )
     mocker.patch(
         "strategy_engine.pricing.get_history",
         side_effect=[
@@ -353,11 +392,18 @@ def test_run_scan_all_unavailable_candidates_returns_empty_results_no_exception(
 
 
 def test_run_scan_unrelated_exception_after_a_skip_still_aborts(mocker):
+    # SRAM26 is served from the batch-prewarmed leg_cache (present/succeeds);
+    # SRAH26 and SRAU26 are omitted, so each falls back to an individual
+    # get_history() call -- H26 first (candidate 1 leg 1, raises and is
+    # caught/skipped), then U26 (candidate 2 leg 2, raises and propagates).
+    mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=_batch_omitting("SRAH26", "SRAU26"),
+    )
     mocker.patch(
         "strategy_engine.pricing.get_history",
         side_effect=[
             MarketDataUnavailableError("SRAH26", "The universe is not found"),
-            _leg_df(),  # SRAM26 (candidate 2 leg 1)
             RuntimeError("simulated unrelated failure"),  # SRAU26 (candidate 2 leg 2)
         ],
     )
@@ -397,12 +443,14 @@ def test_mixed_scan_skips_unavailable_corra_candidate_and_still_returns_sofr_res
     # 70112 entitlement error into MarketDataUnavailableError -- proves
     # run_scan_on_instances()'s EXISTING skip machinery (no changes of
     # its own) correctly keeps the available SOFR candidate.
-    def _get_history(ric, interval, start, end):
-        if ric == "CRAH6":
-            raise MarketDataUnavailableError(ric, "User does not have permission for this universe")
-        return _leg_df()
-
-    mocker.patch("strategy_engine.pricing.get_history", side_effect=_get_history)
+    # SRAH26 is served from the batch-prewarmed leg_cache; CRAH6 is
+    # omitted, so it falls back to an individual get_history() call that
+    # raises the confirmed-unavailable error.
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("CRAH6"))
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=MarketDataUnavailableError("CRAH6", "User does not have permission for this universe"),
+    )
 
     instances = [_sofr_outright_instance(), _corra_outright_instance()]
     report = run_scan_on_instances(
@@ -425,12 +473,15 @@ def test_mixed_scan_unrelated_corra_exception_still_aborts_and_loses_sofr_result
     # otherwise have priced successfully. Order matters: SOFR is fetched
     # first and succeeds, CORRA fails second, proving the already-
     # computed SOFR result is discarded when the function raises.
-    def _get_history(ric, interval, start, end):
-        if ric == "CRAH6":
-            raise RuntimeError("simulated unrelated failure")
-        return _leg_df()
-
-    mocker.patch("strategy_engine.pricing.get_history", side_effect=_get_history)
+    # SRAH26 is served from the batch-prewarmed leg_cache (succeeds first,
+    # added to histories); CRAH6 is omitted, so it falls back to an
+    # individual get_history() call that raises the unrelated exception,
+    # aborting the scan and discarding the already-computed SOFR result.
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("CRAH6"))
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=RuntimeError("simulated unrelated failure"),
+    )
 
     instances = [_sofr_outright_instance(), _corra_outright_instance()]
     with pytest.raises(RuntimeError, match="simulated unrelated failure"):
@@ -440,7 +491,7 @@ def test_mixed_scan_unrelated_corra_exception_still_aborts_and_loses_sofr_result
 
 
 def test_run_scan_carries_configured_percentiles_through_to_results(mocker):
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(_spread(),),
@@ -507,7 +558,7 @@ def test_analyze_histories_matches_direct_analyze_multi_lookback_call():
 # ---------------------------------------------------------------------
 
 def test_run_scan_on_instances_prices_and_analyzes_a_prebuilt_candidate_list(mocker):
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
     report = run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
@@ -520,25 +571,23 @@ def test_run_scan_on_instances_prices_and_analyzes_a_prebuilt_candidate_list(moc
 
 
 def test_run_scan_on_instances_shares_leg_cache_across_the_whole_call(mocker):
-    mock_get_history = mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mock_batch = mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
     run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
 
-    # Same sharing guarantee as run_scan(): 4 distinct RICs fetched, not
-    # 6 (3 instances x 2 legs).
-    assert mock_get_history.call_count == 4
+    # Same sharing guarantee as run_scan(): 4 distinct RICs requested in
+    # ONE batched prewarm call, not 6 individual get_history calls
+    # (3 instances x 2 legs).
+    assert mock_batch.call_count == 1
+    assert set(mock_batch.call_args[0][0]) == {"SRAH26", "SRAM26", "SRAU26", "SRAZ26"}
 
 
 def test_run_scan_on_instances_skips_unavailable_leg_and_continues(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("SRAH26"))
     mocker.patch(
         "strategy_engine.pricing.get_history",
-        side_effect=[
-            MarketDataUnavailableError("SRAH26", "The universe is not found"),
-            _leg_df(),  # SRAM26
-            _leg_df(),  # SRAU26
-            _leg_df(),  # SRAZ26
-        ],
+        side_effect=MarketDataUnavailableError("SRAH26", "The universe is not found"),
     )
 
     instances = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
@@ -576,7 +625,7 @@ def test_run_scan_delegates_to_run_scan_on_instances_with_deduped_candidates(moc
     generate_candidate_universe+dedupe_candidates and then
     run_scan_on_instances() by hand -- locking in that the refactor
     left run_scan()'s own behavior unchanged."""
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 
     request = ScanRequest(
         definitions=(_fly(), _fly()),  # identical twice -> dedup exercised
@@ -586,7 +635,7 @@ def test_run_scan_delegates_to_run_scan_on_instances_with_deduped_candidates(moc
     )
     via_run_scan = run_scan(request)
 
-    mocker.patch("strategy_engine.pricing.get_history", return_value=_leg_df())
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
     from template_scanner.universe import dedupe_candidates, generate_candidate_universe
 
     candidates = dedupe_candidates(
