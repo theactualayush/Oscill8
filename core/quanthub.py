@@ -45,18 +45,30 @@ count= works). This module therefore estimates a `count` generous
 enough to cover [start, end] and filters client-side -- see
 _estimate_count()'s docstring for the known limitation this carries.
 
-Live testing (see QUANTHUB_MAX_REQUEST_COUNT) also confirmed count=3000
-is safe for at least 4 different instruments across 2 exchanges, while
-count=4416 for one of them (YBAH28) returned HTTP 429 -- so this module
-caps every single-request count at 3000 and NEVER makes multiple
-requests or paginates to compensate (no such mechanism is known to
-exist for this API): a request whose true required history exceeds the
-cap simply retrieves a shorter window than asked for, exactly like an
-instrument whose own real history is shorter than the requested count
-(both are normal, expected outcomes here, never treated as errors and
-never padded/fabricated). HTTP 429 itself is raised as a distinct,
+Live testing (see QUANTHUB_MAX_ROWS_PER_REQUEST) established QuantHub's
+actual limit is on TOTAL ROWS returned per request, not on `count`
+directly: 8 EURIBOR instruments x count=500 (4000 total rows) returned
+HTTP 200; the same 8 instruments x count=1000 (8000 total rows) also
+returned HTTP 200; x count=2000 (16000 total rows) returned HTTP 400
+with body {"error": "Max row limit exceeded (10000)"}. This supersedes
+an earlier, incorrect assumption (a flat count=3000 per-request cap,
+based on a smaller single/few-instrument live test) that did not hold
+once batched multi-instrument requests were tested -- 8 instruments x
+3000 = 24,000 rows would itself now exceed the limit. The module caps
+every request's `count` so that instruments_in_request x count never
+exceeds QUANTHUB_MAX_ROWS_PER_REQUEST, computed freshly per request
+since a batch's instrument count can vary (see download_history_batch's
+per-chunk count calculation), and NEVER makes multiple requests or
+paginates to compensate (no such mechanism is known to exist for this
+API): a request whose true required history exceeds the cap simply
+retrieves a shorter window than asked for, exactly like an instrument
+whose own real history is shorter than the requested count (both are
+normal, expected outcomes here, never treated as errors and never
+padded/fabricated). HTTP 429 itself is raised as a distinct,
 non-retried QuantHubRateLimitError -- see that class and
-_fetch_quanthub_records for the retry-policy detail.
+_fetch_quanthub_records for the retry-policy detail; the 429 finding is
+independent of the 400 row-limit finding above and its handling is
+unchanged by this row-limit model.
 
 Live testing also confirmed QuantHub accepts multiple instruments in
 ONE request (10 instruments x count=48 -> 480 records, all HTTP 200) --
@@ -189,50 +201,70 @@ _DAILY_COUNT_BUFFER = 5
 # since QuantHub returns the most recent N bars, not a specific range.
 _HOURLY_BARS_PER_DAY = 24
 
-# Conservative maximum single-request `count`, based on live testing
-# (see the QuantHub history investigation): count=3000 returned HTTP 200
-# with real data for FOUR different instruments across two exchanges
-# (YBAH28, ERH26, FSRH26, SONH26); count=4416 for YBAH28 returned HTTP
-# 429. This is NOT a claim that 3000 is QuantHub's actual limit, nor
-# that every instrument has 3000 bars of real history (YBAH28 itself
-# only ever returned 2995 regardless of whether 3000 or 4000 was
-# requested -- available history is instrument-specific, never padded
-# or fabricated here) -- it is simply the largest count value this
-# integration has live evidence is safe to request in one call. Whether
-# HTTP 429 is triggered by request size specifically, by a request-rate
-# limit, or something else, is NOT established -- this cap addresses
-# the one confirmed-safe data point without guessing at the cause.
-QUANTHUB_MAX_REQUEST_COUNT = 3000
+# QuantHub's actual per-request limit, live-verified as a TOTAL-ROW cap,
+# not a per-instrument `count` cap: 8 EURIBOR instruments (ERZ26, ERU27,
+# ERH27, ERU26, ERM27, ERM28, ERH28, ERZ27) x count=500 = 4000 rows ->
+# HTTP 200; the same 8 x count=1000 = 8000 rows -> HTTP 200; the same 8
+# x count=2000 = 16000 rows -> HTTP 400 {"error": "Max row limit
+# exceeded (10000)"}. So total_rows = instruments_in_request x count
+# must stay <= 10,000. This replaces an earlier, now-disproven
+# assumption that `count` alone had a flat single-request cap (3000)
+# independent of how many instruments were in that request -- seeing
+# the actual limiting quantity is instruments x count, a flat per-
+# instrument count cap would let a batched request silently exceed it
+# (e.g. 8 instruments x 3000 = 24,000 rows -> HTTP 400). See
+# _max_count_for_batch()/download_history_batch() for where this is
+# actually applied -- always computed fresh per request, since the
+# permissible `count` depends on how many instruments that specific
+# request covers.
+QUANTHUB_MAX_ROWS_PER_REQUEST = 10_000
+
+
+def _max_count_for_batch(batch_size: int) -> int:
+    """Maximum permitted `count` for a single QuantHub request covering
+    `batch_size` instruments, so that instruments_in_request x count
+    never exceeds the live-verified QUANTHUB_MAX_ROWS_PER_REQUEST total-
+    row limit (see that constant's own docstring). Integer floor
+    division is intentional -- rounding up would risk exceeding the
+    limit; a `count` slightly below what free row budget allows is
+    always safe, never an error.
+    """
+    return QUANTHUB_MAX_ROWS_PER_REQUEST // batch_size
 
 
 def _estimate_count(native_interval: str, start: datetime, end: datetime) -> int:
-    """Estimate a QuantHub `count` generous enough to cover [start, end],
-    capped at QUANTHUB_MAX_REQUEST_COUNT.
+    """Estimate a QuantHub `count` generous enough to cover [start, end].
+
+    Deliberately NOT capped here -- the permissible per-request `count`
+    depends on how many instruments share that specific request (see
+    QUANTHUB_MAX_ROWS_PER_REQUEST / _max_count_for_batch()), which this
+    function has no visibility into; callers (download_history_batch)
+    apply min(this estimate, _max_count_for_batch(batch_size)) once the
+    actual batch is known.
 
     KNOWN LIMITATION (see CLAUDE.md / the original QuantHub-integration
     task notes): whether `count` truly means "newest N observations" is
-    unverified beyond the live tests QUANTHUB_MAX_REQUEST_COUNT is based
-    on, and no pagination/start/end/offset/cursor mechanism is known to
-    exist (confirmed absent from both this client and any documentation
-    available to this repo) -- so a request whose true required count
-    would exceed the cap simply retrieves a shorter history than the
-    requested [start, end] window, never multiple requests, never
-    fabricated bars. This heuristic is deliberately over-generous UNDER
-    the cap and cannot be proven correct for a very old/wide date range
-    without further live testing. _fetch_quanthub_records() logs a
-    warning whenever the returned data does not reach back to `start`
-    despite the full (possibly capped) count being consumed, so a
-    too-small effective count fails loudly (a gap in cached history,
-    visible in logs) rather than silently.
+    unverified beyond the live tests this module's row-limit constant is
+    based on, and no pagination/start/end/offset/cursor mechanism is
+    known to exist (confirmed absent from both this client and any
+    documentation available to this repo) -- so a request whose true
+    required count would exceed the effective per-batch cap simply
+    retrieves a shorter history than the requested [start, end] window,
+    never multiple requests, never fabricated bars. This heuristic is
+    deliberately over-generous under any given cap and cannot be proven
+    correct for a very old/wide date range without further live testing.
+    _fetch_quanthub_records() logs a warning whenever the returned data
+    does not reach back to `start` despite the full (possibly capped)
+    count being consumed, so a too-small effective count fails loudly (a
+    gap in cached history, visible in logs) rather than silently.
     """
     calendar_days = max((end.date() - start.date()).days + 1, 1)
     if native_interval == "1D":
-        estimated = calendar_days + _DAILY_COUNT_BUFFER
+        return calendar_days + _DAILY_COUNT_BUFFER
     elif native_interval == "1H":
-        estimated = calendar_days * _HOURLY_BARS_PER_DAY + _HOURLY_BARS_PER_DAY
+        return calendar_days * _HOURLY_BARS_PER_DAY + _HOURLY_BARS_PER_DAY
     else:
         raise ValueError(f"No count-estimation rule for QuantHub native_interval={native_interval!r}")
-    return min(estimated, QUANTHUB_MAX_REQUEST_COUNT)
 
 
 # --------------------------------------------------------------------------
@@ -411,10 +443,13 @@ def download_history_batch(
         FOUR_HOUR is fetched as native 1H and resampled via
         core.utils.resample_to_4h -- the same function core.downloader
         uses for LSEG, not a second implementation. `count` is estimated
-        ONCE from [start, end] (capped at QUANTHUB_MAX_REQUEST_COUNT)
-        and shared across every instrument in every chunk of this batch
-        -- matching the live-verified request shape, where all
-        instruments in one call shared one count= value.
+        ONCE from [start, end] (see _estimate_count), then capped PER
+        CHUNK via _max_count_for_batch(len(chunk)) -- QuantHub's limit is
+        on TOTAL ROWS per request (instruments_in_request x count <=
+        QUANTHUB_MAX_ROWS_PER_REQUEST, live-verified), not a flat count
+        cap independent of batch size, so a smaller trailing chunk (e.g.
+        the 1-instrument remainder of a 21-instrument batch) legitimately
+        gets a HIGHER count than a full QUANTHUB_BATCH_SIZE-sized chunk.
     """
     if isinstance(interval, str):
         interval = BarInterval(interval)
@@ -428,17 +463,22 @@ def download_history_batch(
     end_dt = datetime.combine(end_d, datetime.min.time())
 
     native_interval = config.QUANTHUB_NATIVE_INTERVAL[interval]
-    count = _estimate_count(native_interval, start_dt, end_dt)
+    estimated_count = _estimate_count(native_interval, start_dt, end_dt)
 
     unique_instruments = list(dict.fromkeys(instruments))  # de-dupe, preserve order
     grouped: dict[str, list[dict]] = {}
+    count_by_instrument: dict[str, int] = {}
     for chunk in _chunked(unique_instruments, QUANTHUB_BATCH_SIZE):
+        count = min(estimated_count, _max_count_for_batch(len(chunk)))
         grouped.update(_fetch_quanthub_records(chunk, native_interval, count))
+        for instrument in chunk:
+            count_by_instrument[instrument] = count
 
     results: dict[str, pd.DataFrame] = {}
     for instrument in unique_instruments:
         raw_records = grouped.get(instrument, [])
         df = _normalize_quanthub_records(raw_records)
+        count = count_by_instrument[instrument]
 
         if not df.empty and len(df) >= count and df["Date"].min() > pd.Timestamp(start_d):
             logger.warning(

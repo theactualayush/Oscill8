@@ -437,56 +437,61 @@ def test_estimate_count_unknown_interval_raises():
         quanthub._estimate_count("5M", datetime(2026, 1, 1), datetime(2026, 1, 2))
 
 
+def test_estimate_count_is_not_capped_by_itself():
+    # _estimate_count no longer applies any cap of its own -- capping is
+    # batch-size-dependent (see QUANTHUB_MAX_ROWS_PER_REQUEST /
+    # _max_count_for_batch) and only ever applied by download_history_
+    # batch() once the actual per-request instrument count is known.
+    start = datetime(1970, 1, 1)
+    end = datetime(2026, 1, 1)  # ~56 years of calendar days
+    uncapped_daily = (end.date() - start.date()).days + 1 + quanthub._DAILY_COUNT_BUFFER
+    assert quanthub._estimate_count("1D", start, end) == uncapped_daily
+    assert uncapped_daily > 10_000  # far above even the single-instrument row cap
+
+
 # ---------------------------------------------------------------------
-# QUANTHUB_MAX_REQUEST_COUNT: conservative cap, live-tested at 3000
+# QUANTHUB_MAX_ROWS_PER_REQUEST: live-verified TOTAL-ROW cap (not a flat
+# per-request `count` cap) -- 8 EURIBOR instruments x count=1000 (8000
+# rows) -> HTTP 200; the same 8 x count=2000 (16000 rows) -> HTTP 400
+# "Max row limit exceeded (10000)". See _max_count_for_batch(), applied
+# fresh per request in download_history_batch() since the permissible
+# count depends on how many instruments share that specific request.
 # ---------------------------------------------------------------------
 
-def test_max_request_count_is_3000():
-    # Locks the constant itself to the live-tested value -- not a
-    # universal QuantHub limit, just the largest value this integration
-    # has evidence is safe (see the constant's own docstring).
-    assert quanthub.QUANTHUB_MAX_REQUEST_COUNT == 3000
+def test_max_rows_per_request_is_10000():
+    # Locks the constant itself to the live-tested value.
+    assert quanthub.QUANTHUB_MAX_ROWS_PER_REQUEST == 10_000
 
 
-def test_estimate_count_below_cap_is_unchanged():
-    # A small window's natural estimate is well under 3000 -- the cap
-    # must not alter it.
-    start = datetime(2026, 1, 1)
-    end = datetime(2026, 1, 10)
-    uncapped = 10 * quanthub._HOURLY_BARS_PER_DAY + quanthub._HOURLY_BARS_PER_DAY
-    assert uncapped < quanthub.QUANTHUB_MAX_REQUEST_COUNT
-    assert quanthub._estimate_count("1H", start, end) == uncapped
-
-
-def test_estimate_count_above_cap_is_capped_at_3000():
-    # Reproduces the exact live scenario: a ~183-day 1H window naturally
-    # estimates to 4416 (the count that produced the live HTTP 429) --
-    # must now be capped at 3000, never left uncapped.
-    start = datetime(2026, 1, 1)
-    end = datetime(2026, 7, 3)  # 184 calendar days -> (184)*24+24 = 4440 uncapped
-    count = quanthub._estimate_count("1H", start, end)
-    assert count == quanthub.QUANTHUB_MAX_REQUEST_COUNT
-
-
-def test_estimate_count_daily_above_cap_is_also_capped():
-    start = datetime(2000, 1, 1)
-    end = datetime(2026, 1, 1)  # ~26 years of calendar days, far above 3000
-    count = quanthub._estimate_count("1D", start, end)
-    assert count == quanthub.QUANTHUB_MAX_REQUEST_COUNT
+@pytest.mark.parametrize(
+    "batch_size, expected_max_count",
+    [
+        (10, 1000),
+        (8, 1250),
+        (6, 1666),
+        (4, 2500),
+        (1, 10_000),
+    ],
+)
+def test_max_count_for_batch_matches_live_verified_examples(batch_size, expected_max_count):
+    assert quanthub._max_count_for_batch(batch_size) == expected_max_count
 
 
 def test_estimate_count_never_makes_multiple_requests_to_compensate(mocker):
-    # A window whose true required count would exceed the cap must
-    # still result in exactly ONE HTTP call, never pagination/multiple
-    # requests to try to compensate for the cap.
+    # A window whose true required count would exceed the (single-
+    # instrument) per-batch cap must still result in exactly ONE HTTP
+    # call, never pagination/multiple requests to try to compensate.
+    # A ~2-year HOURLY span naturally estimates well above 10,000 bars
+    # (731 days x 24 + 24 > 10,000) -- single instrument, so the cap
+    # applied is _max_count_for_batch(1) == QUANTHUB_MAX_ROWS_PER_REQUEST.
     records = _records_for_dates("YBAH28", ["2026-06-25", "2026-06-26"])
     mock_get = _mock_response(mocker, json_body=records)
 
-    quanthub.download_history("YBAH28", "HOURLY", "2026-01-01", "2026-07-03")
+    quanthub.download_history("YBAH28", "HOURLY", "2026-01-01", "2028-01-01")
 
     assert mock_get.call_count == 1
     _, kwargs = mock_get.call_args
-    assert kwargs["params"]["count"] == quanthub.QUANTHUB_MAX_REQUEST_COUNT
+    assert kwargs["params"]["count"] == quanthub.QUANTHUB_MAX_ROWS_PER_REQUEST
 
 
 def test_fewer_records_than_requested_is_accepted_not_an_error(mocker):
@@ -617,11 +622,16 @@ def test_download_history_batch_four_hour_resamples_each_instrument_independentl
     assert result["ERH26"].iloc[0]["Open"] == 200.0
 
 
-def test_download_history_batch_count_estimated_once_and_shared_across_chunks(mocker):
-    # Same count= parameter on every chunked request, capped exactly as
-    # a single-instrument download_history() call would be -- batching
-    # must never inflate or vary the count per chunk.
+def test_download_history_batch_count_computed_per_chunk_not_shared_across_chunks(mocker):
+    # 21 instruments -> chunks of 10, 10, 1. QuantHub's limit is on TOTAL
+    # ROWS per request (instruments_in_request x count <=
+    # QUANTHUB_MAX_ROWS_PER_REQUEST), so a smaller trailing chunk (1
+    # instrument) legitimately gets a HIGHER count than a full
+    # QUANTHUB_BATCH_SIZE-sized chunk (10 instruments) -- the count must
+    # never be computed once and shared verbatim across differently-
+    # sized chunks.
     instruments = [f"INST{i}" for i in range(21)]
+    mocker.patch("core.quanthub._estimate_count", return_value=3000)
     mock_get = mocker.patch(
         "core.quanthub.requests.get", side_effect=[_resp([]), _resp([]), _resp([])]
     )
@@ -630,8 +640,51 @@ def test_download_history_batch_count_estimated_once_and_shared_across_chunks(mo
 
     counts = [c.kwargs["params"]["count"] for c in mock_get.call_args_list]
     assert mock_get.call_count == 3
-    assert len(set(counts)) == 1
-    assert counts[0] <= quanthub.QUANTHUB_MAX_REQUEST_COUNT
+    # First two chunks: 10 instruments each -> max_count_for_batch(10) ==
+    # 1000, which is below the 3000 estimate, so count is capped to 1000.
+    assert counts[0] == 1000
+    assert counts[1] == 1000
+    # Third chunk: 1 instrument -> max_count_for_batch(1) == 10000, well
+    # above the 3000 estimate, so the estimate itself is unchanged.
+    assert counts[2] == 3000
+
+
+@pytest.mark.parametrize(
+    "num_instruments, estimated_count, expected_count",
+    [
+        (8, 3000, 1250),   # live example: 8 instruments, estimate 3000 -> capped to 1250
+        (10, 3000, 1000),  # live example: 10 instruments, estimate 3000 -> capped to 1000
+        (6, 3000, 1666),   # live example: 6 instruments, estimate 3000 -> capped to 1666
+        (2, 200, 200),     # estimate already below the per-batch cap -> unchanged
+    ],
+)
+def test_download_history_batch_row_limit_examples(
+    mocker, num_instruments, estimated_count, expected_count
+):
+    instruments = [f"INST{i}" for i in range(num_instruments)]
+    mocker.patch("core.quanthub._estimate_count", return_value=estimated_count)
+    mock_get = mocker.patch("core.quanthub.requests.get", return_value=_resp([]))
+
+    quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    assert mock_get.call_count == 1
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["count"] == expected_count
+
+
+@pytest.mark.parametrize("num_instruments", [1, 2, 4, 6, 8, 10])
+def test_download_history_batch_never_exceeds_total_row_limit(mocker, num_instruments):
+    # However large the raw estimate, instruments_in_request x count must
+    # never exceed QUANTHUB_MAX_ROWS_PER_REQUEST for any batch size.
+    instruments = [f"INST{i}" for i in range(num_instruments)]
+    mocker.patch("core.quanthub._estimate_count", return_value=50_000)
+    mock_get = mocker.patch("core.quanthub.requests.get", return_value=_resp([]))
+
+    quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    _, kwargs = mock_get.call_args
+    total_rows = num_instruments * kwargs["params"]["count"]
+    assert total_rows <= quanthub.QUANTHUB_MAX_ROWS_PER_REQUEST
 
 
 def test_download_history_batch_partial_history_per_instrument_accepted_without_pagination(mocker):
