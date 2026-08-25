@@ -275,11 +275,14 @@ def test_get_history_accepts_str_or_barinterval_and_datelike_inputs(mocker):
 
 
 # ---------------------------------------------------------------------
-# get_history: in-progress bar is never cached, but is returned; the
-# still-open period is re-fetched on the next call.
+# get_history: only fully closed bars are ever fetched, cached, or
+# returned -- the still-forming period is excluded from the request
+# entirely, and a second identical call during the same still-forming
+# period makes zero further provider requests (see
+# database.service._effective_request_end).
 # ---------------------------------------------------------------------
 
-def test_get_history_in_progress_bar_not_cached_but_still_returned(mocker, db_session):
+def test_get_history_in_progress_bar_never_requested_cached_or_returned(mocker, db_session):
     frozen_now = datetime(2026, 6, 15, 10, 30)
 
     class _FrozenDateTime(datetime):
@@ -289,6 +292,17 @@ def test_get_history_in_progress_bar_not_cached_but_still_returned(mocker, db_se
 
     mocker.patch.object(service, "datetime", _FrozenDateTime)
 
+    # A plain date request (matching the real-world scan pattern that
+    # produced the live-observed bug) -- _coerce_end -> day-end
+    # 23:59:59.999999, uncapped until _effective_request_end narrows it.
+    #
+    # The provider mock deliberately still hands back an in-progress bar
+    # (Date=10:00, boundary is 10:00) EVEN THOUGH the request itself
+    # should be capped below it -- this proves both halves of the fix:
+    # the outbound request is narrower, AND anything that sneaks past
+    # that (e.g. QuantHub, which cannot be asked to exclude a same-day
+    # in-progress bar at all) is still filtered out before caching/
+    # returning.
     hourly_bars = pd.DataFrame(
         {
             "Date": [
@@ -307,26 +321,90 @@ def test_get_history_in_progress_bar_not_cached_but_still_returned(mocker, db_se
         "database.service.download_history", return_value=hourly_bars
     )
 
-    result = service.get_history(
-        "SRAZ26", "HOURLY", datetime(2026, 6, 15, 8, 0), datetime(2026, 6, 15, 10, 59)
-    )
+    result = service.get_history("SRAZ26", "HOURLY", "2026-06-15", "2026-06-15")
 
-    # All 3 bars (including the in-progress one) are returned to the caller.
-    assert len(result) == 3
+    # The request itself is capped BELOW the boundary -- never all the
+    # way to day-end, always 00:00:00->09:59:59.999999.
+    assert mock_download.call_count == 1
+    called_start, called_end = mock_download.call_args[0][2], mock_download.call_args[0][3]
+    assert called_start == datetime(2026, 6, 15, 0, 0)
+    assert called_end == datetime(2026, 6, 15, 9, 59, 59, 999999)
 
-    # But only the 2 completed bars were actually persisted.
+    # The in-progress bar is NOT returned to the caller -- only the 2
+    # completed bars.
+    assert len(result) == 2
+    assert result["Date"].max() == datetime(2026, 6, 15, 9, 0)
+
+    # And only the 2 completed bars were actually persisted.
     persisted = cache.read_bars(
-        db_session, "SRAZ26", "HOURLY", datetime(2026, 6, 15, 8, 0), datetime(2026, 6, 15, 10, 59)
+        db_session, "SRAZ26", "HOURLY", datetime(2026, 6, 15, 0, 0), datetime(2026, 6, 15, 23, 59, 59)
     )
     assert len(persisted) == 2
 
-    # And coverage was only marked synced up through the boundary.
+    # Coverage was only marked synced up through the boundary.
     ranges = cache.get_sync_ranges(db_session, "SRAZ26", "HOURLY")
     assert len(ranges) == 1
     assert ranges[0][1] <= datetime(2026, 6, 15, 10, 0)
 
-    # A second call for the same window must re-fetch the still-open tail.
-    service.get_history(
-        "SRAZ26", "HOURLY", datetime(2026, 6, 15, 8, 0), datetime(2026, 6, 15, 10, 59)
+    # THE CORE OF THE FIX: a second identical call during the SAME
+    # still-forming period makes ZERO further provider requests -- the
+    # already-synced [00:00, 09:59:59.999999] fully covers the capped
+    # effective window, so there is nothing left to fetch.
+    service.get_history("SRAZ26", "HOURLY", "2026-06-15", "2026-06-15")
+    assert mock_download.call_count == 1
+
+
+def test_get_history_newly_closed_bar_fetched_exactly_once_after_period_closes(mocker, db_session):
+    """Once the previously-forming period closes, the NEXT call fetches
+    exactly that newly-completed bar -- and only that bar. Uses a plain
+    date (not a specific datetime) for `end`, matching the real-world
+    scan pattern that produced the live-observed bug (_coerce_end ->
+    day-end 23:59:59.999999), so the boundary cap is always the binding
+    constraint regardless of what hour "now" happens to be."""
+    hourly_bars_before_close = pd.DataFrame(
+        {
+            "Date": [datetime(2026, 6, 15, 8, 0), datetime(2026, 6, 15, 9, 0)],
+            "Open": [100.0, 101.0], "High": [101.0, 102.0],
+            "Low": [99.0, 100.0], "Close": [100.5, 101.5], "Volume": [10, 11],
+        }
     )
-    assert mock_download.call_count == 2
+    mocker.patch("database.service.download_history", return_value=hourly_bars_before_close)
+
+    class _At1030(datetime):
+        @classmethod
+        def utcnow(cls):
+            return datetime(2026, 6, 15, 10, 30)
+
+    mocker.patch.object(service, "datetime", _At1030)
+    service.get_history("SRAZ26", "HOURLY", "2026-06-15", "2026-06-15")
+    # Cached through 09:59:59.999999 -- the 10:00 hour hasn't closed yet.
+    assert cache.get_sync_ranges(db_session, "SRAZ26", "HOURLY")[0][1] <= datetime(2026, 6, 15, 10, 0)
+
+    # Now the 10:00 hour has closed (it's 11:05); the provider returns
+    # just that one newly-closed bar.
+    newly_closed_bar = pd.DataFrame(
+        {
+            "Date": [datetime(2026, 6, 15, 10, 0)],
+            "Open": [102.0], "High": [103.0], "Low": [101.0], "Close": [102.5], "Volume": [12],
+        }
+    )
+    mock_download = mocker.patch(
+        "database.service.download_history", return_value=newly_closed_bar
+    )
+
+    class _At1105(datetime):
+        @classmethod
+        def utcnow(cls):
+            return datetime(2026, 6, 15, 11, 5)
+
+    mocker.patch.object(service, "datetime", _At1105)
+    result = service.get_history("SRAZ26", "HOURLY", "2026-06-15", "2026-06-15")
+
+    # Exactly one request, for exactly the newly-closed 10:00 bar.
+    assert mock_download.call_count == 1
+    called_start, called_end = mock_download.call_args[0][2], mock_download.call_args[0][3]
+    assert called_start == datetime(2026, 6, 15, 10, 0)
+    assert called_end == datetime(2026, 6, 15, 10, 59, 59, 999999)
+
+    assert len(result) == 3
+    assert result["Date"].max() == datetime(2026, 6, 15, 10, 0)

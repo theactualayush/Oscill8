@@ -11,6 +11,27 @@ DataFrames.
     get_history(ric, interval, start, end) -> pd.DataFrame
     get_history_batch(rics, interval, start, end) -> dict[str, pd.DataFrame]
 
+ONLY FULLY CLOSED BARS ARE EVER FETCHED, CACHED, OR RETURNED, for every
+interval (DAILY/HOURLY/4H) and both providers. Before anything else
+below runs, the caller's requested end is capped to the last bar that
+has actually closed as of "now" (_effective_request_end, applied in
+get_history()/_get_history_batch_with_provenance()/
+_get_history_batch_quanthub() -- each independently, from their own
+already-computed `boundary`/`now`, exactly like each already
+independently computed those before this existed). This is what fixes
+a real, live-observed issue: a plain-date request used to stay
+uncapped all the way to day-end, so a scan for a currently-forming
+interval (e.g. a 4H window not yet closed) kept re-requesting that same
+still-forming bar from the provider on every identical re-scan, since
+nothing in that wide, always-in-the-future tail could ever be marked
+synced. A second identical scan during the same still-forming period
+now makes zero further provider requests; the next request after the
+period actually closes fetches exactly that newly-closed bar. See
+_effective_request_end and _persist_downloaded's own docstrings for the
+full mechanism, including why the Date < boundary filter inside
+_persist_downloaded remains the actual enforcement point (QuantHub's
+own API cannot be asked to exclude a same-day in-progress bar at all).
+
 Request
    |
 Check SQLite (sync_ranges)
@@ -220,11 +241,52 @@ def _last_completed_boundary(interval: BarInterval, now: datetime) -> datetime:
     change. Historical sub-ranges (well before `now`) are unaffected;
     this boundary only ever trims the trailing, still-forming edge of a
     request.
+
+    Bar timestamps are OPEN-labeled (a bar's Date is the START of its
+    period, e.g. a 4H bar dated 12:00 spans [12:00, 16:00) and closes at
+    16:00) -- confirmed both by this function's own floor-division logic
+    and empirically by core.utils.resample_to_4h's pandas default
+    (label='left' for a fixed-frequency rule). "The latest completed
+    bar" therefore always means the bar immediately BEFORE this
+    boundary, not the one dated at/after it -- see
+    _effective_request_end, which is where that distinction actually
+    gets enforced against a caller's requested end.
     """
     delta = cache.bar_delta(interval.value)
     epoch = datetime(1970, 1, 1)
     periods_elapsed = (now - epoch) // delta
     return epoch + periods_elapsed * delta
+
+
+def _effective_request_end(end: datetime, boundary: datetime) -> datetime:
+    """Cap a requested/coverage end to the last FULLY CLOSED bar, per
+    (interval, now) -- never treat coverage as missing, or request/
+    persist anything, that reaches into the currently-forming period
+    (see _last_completed_boundary). Returns `end` unchanged if it
+    already falls before the current bar's open; otherwise returns the
+    instant just before that open (boundary - one microsecond), the
+    true upper bound of what could possibly be complete right now.
+
+    This is the central fix for a real, live-observed issue: a plain-
+    date request (_coerce_end() -> day-end 23:59:59.999999) previously
+    stayed uncapped all the way through _missing_ranges() and into the
+    provider request itself, so e.g. a 4H scan at 15:47 requested
+    "12:00:00.000001 -> 23:59:59.999999" from LSEG on every identical
+    re-scan -- the same still-forming 12:00 bar (spanning [12:00,16:00),
+    not yet closed), re-requested every time, since nothing in that wide
+    tail could ever be marked synced (see _persist_downloaded). Capping
+    the effective end HERE, before _missing_ranges() ever runs, means
+    the gap closes to nothing once the last closed bar is already
+    cached, so a second identical scan makes zero further provider
+    requests until the next bar actually closes.
+
+    Called independently by every function that computes its own
+    `boundary` from (interval, now) -- get_history(),
+    _get_history_batch_with_provenance(), _get_history_batch_quanthub()
+    -- exactly mirroring how each already independently computes `now`/
+    `boundary` today; this introduces no new cross-function coupling.
+    """
+    return min(end, boundary - _EPSILON)
 
 
 def _missing_ranges(
@@ -318,29 +380,45 @@ def _persist_downloaded(
     sub_end: datetime,
     boundary: datetime,
     provider: str | None = None,
-) -> pd.DataFrame | None:
+) -> None:
     """Persist one already-downloaded frame for (ric, interval) covering
     [sub_start, sub_end] -- shared by get_history() and get_history_batch()
-    so there is exactly one implementation of the completed/in-progress
-    split + sync-range recording, not two.
+    so there is exactly one implementation of the completed-only insert +
+    sync-range recording, not two.
 
-    Completed bars (Date < boundary) are inserted and [sub_start,
-    min(sub_end, boundary)] is recorded as synced (carrying `provider`,
-    see database.cache.record_sync_range/get_established_provider --
-    optional, defaults to None so a market with no QuantHub mapping is
-    unaffected); any still-in-progress bar (Date >= boundary) is
-    returned (NOT persisted) for the caller to merge into its own
-    result -- same contract get_history() has always had for today's
-    still-forming bar.
+    Only FULLY CLOSED bars (Date < boundary) are ever inserted, and only
+    [sub_start, min(sub_end, boundary)] is ever recorded as synced
+    (carrying `provider`, see database.cache.record_sync_range/
+    get_established_provider -- optional, defaults to None so a market
+    with no QuantHub mapping is unaffected). Any still-forming bar in
+    `downloaded` (Date >= boundary) is silently dropped: never cached,
+    never returned to any caller -- the scanner only ever considers
+    completed bars, for every interval (see the module docstring and
+    _effective_request_end).
+
+    This split is the ACTUAL, load-bearing enforcement point for both
+    providers, not a redundant safety net -- callers now cap their
+    OUTBOUND request end below `boundary` via _effective_request_end,
+    but QuantHub in particular has no way to be asked, server-side, to
+    exclude a same-day in-progress bar: its `count=`-only API always
+    means "the most recent N observations as of now" (core.quanthub's
+    own module docstring), and core.quanthub.download_history_batch's
+    local response filter truncates `end` to a bare date before
+    filtering, so it cannot exclude a same-day in-progress bar either.
+    This function's Date < boundary check is what actually keeps such a
+    bar out of the cache regardless of what either provider returns.
     """
-    pending = None
     if not downloaded.empty:
         completed_df = downloaded[downloaded["Date"] < boundary]
-        in_progress_df = downloaded[downloaded["Date"] >= boundary]
         if not completed_df.empty:
             cache.insert_bars(session, ric, interval.value, completed_df)
-        if not in_progress_df.empty:
-            pending = in_progress_df
+        dropped = len(downloaded) - len(completed_df)
+        if dropped:
+            logger.debug(
+                "%s [%s]: dropped %d still-forming bar(s) (Date >= %s) -- "
+                "never cached or returned",
+                ric, interval.value, dropped, boundary,
+            )
 
     synced_end = min(sub_end, boundary)
     if synced_end > sub_start:
@@ -351,7 +429,6 @@ def _persist_downloaded(
             "not marking as synced",
             ric, interval.value, sub_start, sub_end,
         )
-    return pending
 
 
 def _fetch_legacy_unknown_provider(
@@ -360,7 +437,7 @@ def _fetch_legacy_unknown_provider(
     interval: BarInterval,
     missing: list[tuple[datetime, datetime]],
     boundary: datetime,
-) -> list[pd.DataFrame]:
+) -> None:
     """Incremental LSEG-only fetch for a QuantHub-mapped (ric, interval)
     that has EXISTING sync_ranges coverage but NO recorded provider --
     a LEGACY row, most commonly one cached before database.models.
@@ -411,7 +488,6 @@ def _fetch_legacy_unknown_provider(
     continue contract they already rely on elsewhere (see
     template_scanner.scanner's own module docstring).
     """
-    pending_frames: list[pd.DataFrame] = []
     for sub_start, sub_end in missing:
         logger.info(
             "%s [%s]: legacy/unknown-provenance cache -- downloading missing "
@@ -419,12 +495,9 @@ def _fetch_legacy_unknown_provider(
             ric, interval.value, sub_start, sub_end,
         )
         downloaded = download_history(ric, interval.value, sub_start, sub_end)
-        pending = _persist_downloaded(
+        _persist_downloaded(
             session, ric, interval, downloaded, sub_start, sub_end, boundary, provider=None
         )
-        if pending is not None:
-            pending_frames.append(pending)
-    return pending_frames
 
 
 def _establish_provider_and_fetch(
@@ -434,7 +507,7 @@ def _establish_provider_and_fetch(
     start_dt: datetime,
     end_dt: datetime,
     boundary: datetime,
-) -> pd.DataFrame | None:
+) -> None:
     """ONE-TIME provider establishment for a QuantHub-mapped market's
     (ric, interval) that has no established provider yet (cache.
     get_established_provider returned None) -- the cache -> LSEG ->
@@ -445,7 +518,10 @@ def _establish_provider_and_fetch(
     this (ric, interval) either (a provider is always established in
     the SAME persist step as its first bars -- see below), so
     [start_dt, end_dt] IS the full missing range on this call; there is
-    no narrower sub-range to test against.
+    no narrower sub-range to test against. `end_dt` here is already the
+    CALLER's effective end (see _effective_request_end) -- capped below
+    the currently-forming bar's boundary -- so the completeness test
+    below never sees a partial/in-progress bar in the first place.
 
     LSEG is tried FIRST, for the full window. If its result is complete
     (_is_complete_history), LSEG is ESTABLISHED as the provider and its
@@ -482,10 +558,11 @@ def _establish_provider_and_fetch(
             "establishing LSEG as the provider",
             ric, interval.value, start_dt, end_dt,
         )
-        return _persist_downloaded(
+        _persist_downloaded(
             session, ric, interval, downloaded_lseg, start_dt, end_dt, boundary,
             provider=Provider.LSEG.value,
         )
+        return
 
     logger.info(
         "%s [%s]: LSEG could not provide complete history for %s -> %s -- "
@@ -493,7 +570,7 @@ def _establish_provider_and_fetch(
         ric, interval.value, start_dt, end_dt,
     )
     downloaded_qh = _download_quanthub_full_window(ric, interval, start_dt, end_dt)
-    return _persist_downloaded(
+    _persist_downloaded(
         session, ric, interval, downloaded_qh, start_dt, end_dt, boundary,
         provider=Provider.QUANTHUB.value,
     )
@@ -523,16 +600,17 @@ def _fetch_established_quanthub(
     start_dt: datetime,
     end_dt: datetime,
     boundary: datetime,
-) -> pd.DataFrame | None:
+) -> None:
     """Fetch from QuantHub for a (ric, interval) already ESTABLISHED as
     QuantHub's responsibility (cache.get_established_provider returned
     "QUANTHUB") -- LSEG is never consulted again once established. See
     _download_quanthub_full_window for why the full window is requested
     rather than just the missing portion (a QuantHub API limitation,
-    not a design choice).
+    not a design choice). `end_dt` here is already the caller's
+    effective end (see _effective_request_end).
     """
     downloaded_qh = _download_quanthub_full_window(ric, interval, start_dt, end_dt)
-    return _persist_downloaded(
+    _persist_downloaded(
         session, ric, interval, downloaded_qh, start_dt, end_dt, boundary,
         provider=Provider.QUANTHUB.value,
     )
@@ -588,16 +666,22 @@ def get_history(
     Columns/dtypes match both providers' shared canonical contract:
     [Date, Open, High, Low, Close, Volume].
 
-    The most recent, still-forming bar for an interval currently in
-    progress (e.g. today's DAILY bar before day-end, or the current
-    HOURLY bar) is never written to the cache or marked as synced -- it
-    is re-downloaded on every call until it closes, then cached
-    normally like any historical bar. This is deliberate: upserts skip
-    rows that already exist, so a cached partial bar could otherwise
-    never be refreshed with its final values once complete. Any such
-    in-progress bars are still included in the returned DataFrame for
-    this call (so the caller isn't denied today's partial data), just
-    not persisted.
+    ONLY FULLY CLOSED BARS ARE EVER FETCHED, CACHED, OR RETURNED. The
+    currently-forming bar for whatever interval is in progress at call
+    time (e.g. today's still-open DAILY bar, the current HOURLY bar, or
+    a 4H bar whose 4-hour window hasn't closed yet) is excluded from the
+    request entirely -- see _effective_request_end, applied centrally
+    here BEFORE any cache-coverage check or provider call, so it is
+    never requested, never marked as synced, and simply never appears
+    in the returned DataFrame until it actually closes. This replaces
+    an earlier design where such a bar WAS still returned (never cached,
+    but included in that one call's result) -- that meant a scan re-run
+    during the same still-forming period re-requested the same partial
+    bar from the provider every single time, for no benefit (see
+    _effective_request_end's own docstring for the live-observed issue
+    this fixes). A second identical call during the same still-forming
+    period now makes zero further provider requests; once the period
+    closes, the next call fetches exactly that newly-closed bar.
     """
     if isinstance(interval, str):
         interval = BarInterval(interval)
@@ -609,17 +693,22 @@ def get_history(
 
     now = datetime.utcnow()
     boundary = _last_completed_boundary(interval, now)
+    effective_end_dt = _effective_request_end(end_dt, boundary)
 
     parsed = parse_ric(ric)
     has_quanthub_fallback = resolve_provider(parsed.market_key) is Provider.QUANTHUB
 
-    pending_frames: list[pd.DataFrame] = []
     with get_session() as session:
         sync_ranges = cache.get_sync_ranges(session, ric, interval.value)
-        missing = _missing_ranges(sync_ranges, start_dt, end_dt)
+        missing = (
+            _missing_ranges(sync_ranges, start_dt, effective_end_dt)
+            if effective_end_dt >= start_dt
+            else []
+        )
 
         if not missing:
-            pass  # fully cached already -- no provider contacted at all
+            pass  # fully cached (through the last closed bar), or the
+            # entire requested window is still-forming -- no provider contacted
         elif not has_quanthub_fallback:
             # Unchanged, original incremental behavior.
             for sub_start, sub_end in missing:
@@ -628,9 +717,7 @@ def get_history(
                     ric, interval.value, sub_start, sub_end,
                 )
                 downloaded = _download_from_provider(ric, interval, sub_start, sub_end)
-                pending = _persist_downloaded(session, ric, interval, downloaded, sub_start, sub_end, boundary)
-                if pending is not None:
-                    pending_frames.append(pending)
+                _persist_downloaded(session, ric, interval, downloaded, sub_start, sub_end, boundary)
         else:
             established = cache.get_established_provider(session, ric, interval.value)
             if established == Provider.LSEG.value:
@@ -645,37 +732,23 @@ def get_history(
                         ric, interval.value, sub_start, sub_end,
                     )
                     downloaded = download_history(ric, interval.value, sub_start, sub_end)
-                    pending = _persist_downloaded(
+                    _persist_downloaded(
                         session, ric, interval, downloaded, sub_start, sub_end, boundary,
                         provider=Provider.LSEG.value,
                     )
-                    if pending is not None:
-                        pending_frames.append(pending)
             elif established == Provider.QUANTHUB.value:
-                pending = _fetch_established_quanthub(session, ric, interval, start_dt, end_dt, boundary)
-                if pending is not None:
-                    pending_frames.append(pending)
+                _fetch_established_quanthub(session, ric, interval, start_dt, effective_end_dt, boundary)
             elif sync_ranges:
                 # No recorded provider, but coverage already exists --
                 # a LEGACY row (see _fetch_legacy_unknown_provider).
                 # Never establish a provider here, never touch QuantHub.
-                pending_frames.extend(
-                    _fetch_legacy_unknown_provider(session, ric, interval, missing, boundary)
-                )
+                _fetch_legacy_unknown_provider(session, ric, interval, missing, boundary)
             else:
                 # No recorded provider AND no existing coverage at all
                 # -- a genuinely new (ric, interval).
-                pending = _establish_provider_and_fetch(session, ric, interval, start_dt, end_dt, boundary)
-                if pending is not None:
-                    pending_frames.append(pending)
+                _establish_provider_and_fetch(session, ric, interval, start_dt, effective_end_dt, boundary)
 
         result = cache.read_bars(session, ric, interval.value, start_dt, end_dt)
-
-    if pending_frames:
-        extra = pd.concat(pending_frames, ignore_index=True)
-        extra = extra[(extra["Date"] >= start_dt) & (extra["Date"] <= end_dt)]
-        result = pd.concat([result, extra], ignore_index=True)
-        result = result.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
 
     return result
 
@@ -714,16 +787,22 @@ def _get_history_batch_quanthub(
     """
     now = datetime.utcnow()
     boundary = _last_completed_boundary(interval, now)
+    effective_end_dt = _effective_request_end(end_dt, boundary)
 
     results: dict[str, pd.DataFrame] = {}
     with get_session() as session:
-        rics_needing_fetch = [
-            ric
-            for ric in rics
-            if _missing_ranges(cache.get_sync_ranges(session, ric, interval.value), start_dt, end_dt)
-        ]
+        rics_needing_fetch = (
+            [
+                ric
+                for ric in rics
+                if _missing_ranges(
+                    cache.get_sync_ranges(session, ric, interval.value), start_dt, effective_end_dt
+                )
+            ]
+            if effective_end_dt >= start_dt
+            else []
+        )
 
-        pending_by_ric: dict[str, pd.DataFrame] = {}
         if rics_needing_fetch:
             instrument_by_ric: dict[str, str] = {}
             for ric in rics_needing_fetch:
@@ -733,31 +812,22 @@ def _get_history_batch_quanthub(
 
             logger.info(
                 "QuantHub batch cache miss for %d/%d RIC(s) [%s]: downloading %s -> %s",
-                len(rics_needing_fetch), len(rics), interval.value, start_dt, end_dt,
+                len(rics_needing_fetch), len(rics), interval.value, start_dt, effective_end_dt,
             )
             batch_downloaded = download_history_quanthub_batch(
-                list(instrument_by_ric.values()), interval.value, start_dt, end_dt
+                list(instrument_by_ric.values()), interval.value, start_dt, effective_end_dt
             )
 
             for ric in rics_needing_fetch:
                 instrument = instrument_by_ric[ric]
                 downloaded = batch_downloaded[instrument]
-                pending = _persist_downloaded(
-                    session, ric, interval, downloaded, start_dt, end_dt, boundary,
+                _persist_downloaded(
+                    session, ric, interval, downloaded, start_dt, effective_end_dt, boundary,
                     provider=Provider.QUANTHUB.value,
                 )
-                if pending is not None:
-                    pending_by_ric[ric] = pending
 
         for ric in rics:
-            result = cache.read_bars(session, ric, interval.value, start_dt, end_dt)
-            pending = pending_by_ric.get(ric)
-            if pending is not None:
-                extra = pending[(pending["Date"] >= start_dt) & (pending["Date"] <= end_dt)]
-                if not extra.empty:
-                    result = pd.concat([result, extra], ignore_index=True)
-                    result = result.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
-            results[ric] = result
+            results[ric] = cache.read_bars(session, ric, interval.value, start_dt, end_dt)
 
     return results
 
@@ -805,16 +875,22 @@ def _get_history_batch_with_provenance(
     """
     now = datetime.utcnow()
     boundary = _last_completed_boundary(interval, now)
+    effective_end_dt = _effective_request_end(end_dt, boundary)
 
     results: dict[str, pd.DataFrame] = {}
     qh_batch_rics: list[str] = []
 
+    # If the whole requested window is still-forming (nothing could
+    # possibly be complete yet), skip every ric entirely -- no provider
+    # attempt for anyone.
+    rics_to_consider = rics if effective_end_dt >= start_dt else []
+
     with get_session() as session:
-        for ric in rics:
+        for ric in rics_to_consider:
             sync_ranges = cache.get_sync_ranges(session, ric, interval.value)
-            missing = _missing_ranges(sync_ranges, start_dt, end_dt)
+            missing = _missing_ranges(sync_ranges, start_dt, effective_end_dt)
             if not missing:
-                continue  # already fully cached -- no provider attempt at all
+                continue  # already fully cached (through the last closed bar) -- no provider attempt
 
             established = cache.get_established_provider(session, ric, interval.value)
 
@@ -852,12 +928,12 @@ def _get_history_batch_with_provenance(
             else:
                 # No recorded provider AND no existing coverage at all
                 # -- a genuinely new (ric, interval). One-time LSEG
-                # trial for the full window (missing == [(start_dt,
-                # end_dt)] here by construction, same invariant as
-                # get_history()).
+                # trial for the full (effective) window (missing ==
+                # [(start_dt, effective_end_dt)] here by construction,
+                # same invariant as get_history()).
                 downloaded_lseg = None
                 try:
-                    downloaded_lseg = download_history(ric, interval.value, start_dt, end_dt)
+                    downloaded_lseg = download_history(ric, interval.value, start_dt, effective_end_dt)
                 except MarketDataUnavailableError:
                     downloaded_lseg = None
 
@@ -865,17 +941,17 @@ def _get_history_batch_with_provenance(
                     logger.info(
                         "%s [%s]: LSEG provided complete history for %s -> %s in batch -- "
                         "establishing LSEG as the provider",
-                        ric, interval.value, start_dt, end_dt,
+                        ric, interval.value, start_dt, effective_end_dt,
                     )
                     _persist_downloaded(
-                        session, ric, interval, downloaded_lseg, start_dt, end_dt, boundary,
+                        session, ric, interval, downloaded_lseg, start_dt, effective_end_dt, boundary,
                         provider=Provider.LSEG.value,
                     )
                 else:
                     logger.info(
                         "%s [%s]: LSEG could not provide complete history for %s -> %s in "
                         "batch -- establishing QuantHub as the provider (queued)",
-                        ric, interval.value, start_dt, end_dt,
+                        ric, interval.value, start_dt, effective_end_dt,
                     )
                     qh_batch_rics.append(ric)
 
