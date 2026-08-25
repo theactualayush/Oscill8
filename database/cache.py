@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
 
 from core.config import BarInterval
@@ -22,6 +22,11 @@ from database.models import PriceBar, SyncRange
 logger = get_logger(__name__)
 
 _CANONICAL_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+# Smallest representable time step, used to build a non-overlapping
+# boundary when trimming a sync_ranges row around a deleted window --
+# same convention as database.service's own _EPSILON.
+_EPSILON = timedelta(microseconds=1)
 
 # Nominal spacing between consecutive bars for each interval. Used by
 # record_sync_range to decide whether two coverage windows are close
@@ -186,6 +191,7 @@ def record_sync_range(
     interval: str,
     start: datetime,
     end: datetime,
+    provider: str | None = None,
 ) -> None:
     """Record [start, end] as confirmed-downloaded coverage for (ric, interval).
 
@@ -195,6 +201,15 @@ def record_sync_range(
     provably no room for an un-fetched bar in the gap. A larger gap is
     left as two separate rows, since data there genuinely hasn't been
     confirmed as downloaded and must still be treated as missing.
+
+    provider: which provider (see core.providers.Provider) supplied this
+        coverage window -- optional, defaults to None so every existing
+        caller (any market with no QuantHub mapping) is unaffected. The
+        merged row always takes the INCOMING call's provider value, never
+        an absorbed row's -- correct because every row for one (ric,
+        interval) is guaranteed to already share the same provider (see
+        database.service's provider-provenance design), so there is
+        nothing to reconcile.
     """
     delta = bar_delta(interval)
     existing_rows = list(
@@ -225,10 +240,180 @@ def record_sync_range(
     for row in absorbed:
         session.delete(row)
     session.add(
-        SyncRange(ric=ric, interval=interval, start_datetime=merged_start, end_datetime=merged_end)
+        SyncRange(
+            ric=ric, interval=interval,
+            start_datetime=merged_start, end_datetime=merged_end,
+            provider=provider,
+        )
     )
     session.commit()
     logger.debug(
-        "Recorded sync range for %s [%s]: %s -> %s (absorbed %d existing range(s))",
-        ric, interval, merged_start, merged_end, len(absorbed),
+        "Recorded sync range for %s [%s]: %s -> %s (absorbed %d existing range(s), provider=%s)",
+        ric, interval, merged_start, merged_end, len(absorbed), provider,
     )
+
+
+def get_established_provider(session: Session, ric: str, interval: str) -> str | None:
+    """Return the established provider (see core.providers.Provider,
+    e.g. "LSEG" or "QUANTHUB") for (ric, interval), or None if no
+    provider has been established yet.
+
+    Every sync_ranges row for a given (ric, interval) is guaranteed to
+    carry the SAME provider value once one has been established (see
+    database.service's cache -> LSEG -> QuantHub provider-provenance
+    design) -- reads whichever row happens to exist first; there is no
+    reconciliation logic because there is nothing to reconcile.
+
+    Returns None in THREE distinct situations that this function alone
+    cannot tell apart -- callers that need to distinguish them (see
+    database.service.get_history/_get_history_batch_with_provenance)
+    additionally check whether get_sync_ranges() is non-empty:
+      1. No row exists at all -- genuinely never touched.
+      2. A row exists with a NULL provider for a market with NO
+         QuantHub mapping -- this column is simply never populated for
+         those (see SyncRange.provider's own docstring); "no
+         established-provider decision applies here" is correct and
+         final for this case.
+      3. A row exists with a NULL provider for a QuantHub-mapped
+         market -- a LEGACY row, most commonly written before the
+         provider column existed (migrated to NULL, never backfilled --
+         see database/connection.py's _ensure_sync_ranges_provider_
+         column). Unlike case 2, this is NOT "no decision applies" --
+         it is "a decision was never made, but data already exists".
+         Conflating this with case 1 was a real bug: treating a legacy
+         row as "nothing established yet" ran the full LSEG-first
+         establishment test against the entire historical span and let
+         database.service's record_sync_range() merge/relabel that
+         whole span under a freshly-decided provider it was never
+         actually verified against. See
+         database.service._fetch_legacy_unknown_provider for the fix.
+
+    Provider provenance is never inferred from whether bars happen to
+    exist -- this column IS the explicit record of that decision, read
+    directly, not derived. The ambiguity above is about what None
+    itself means, not about this function silently guessing.
+    """
+    return session.execute(
+        select(SyncRange.provider)
+        .where(SyncRange.ric == ric, SyncRange.interval == interval)
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def delete_bars_and_sync_ranges(
+    session: Session,
+    ric: str,
+    interval: str,
+    start: datetime,
+    end: datetime,
+) -> int:
+    """ADMINISTRATIVE/RESET utility -- NOT part of normal retrieval.
+
+    database.service's cache -> LSEG -> QuantHub provider-provenance
+    design (see database/models.py's SyncRange.provider docstring)
+    establishes a provider for a (ric, interval) exactly ONCE and never
+    revisits that decision, so under normal operation there is no
+    "switch providers and clean up stale data" moment for this function
+    to guard -- get_history()/get_history_batch() never call it.
+
+    Its purpose is to let an operator manually FORGET a (ric, interval)'s
+    established provider and any cached bars/coverage in [start, end],
+    so the NEXT request performs LSEG-first provider discovery again
+    from a clean slate (get_established_provider() returns None
+    immediately afterward, for whatever portion of [start, end] this
+    call actually covered). A typical reset call passes a [start, end]
+    wide enough to cover everything ever cached for that (ric, interval)
+    -- e.g. because a market's real LSEG availability changed and a
+    stale QuantHub assignment should be re-evaluated.
+
+    Permanently removes cached bars AND sync-range coverage (which is
+    also where provider provenance lives -- deleting/trimming a
+    sync_ranges row clears its provider along with it, no separate step
+    needed) for (ric, interval) within [start, end].
+
+    Scoped precisely: only this exact (ric, interval) pair, only bars/
+    coverage intersecting [start, end] -- another RIC, another interval,
+    or data outside this range is never touched. A sync_ranges row that
+    only PARTIALLY overlaps [start, end] is TRIMMED to its surviving
+    portion(s) (split into two rows if it fully contains [start, end]),
+    never deleted wholesale -- valid cache history outside the requested
+    window is preserved exactly, WITH its original provider value intact
+    on the surviving fragment(s) (a partial reset only forgets the
+    portion actually reset, not the provider identity of what remains).
+
+    Transactional: every delete/trim below is applied against the same
+    Session and committed together in one call, at the very end -- if
+    anything raises before that commit, nothing here is persisted (the
+    caller's session is left exactly as it was, matching this module's
+    existing insert_bars/record_sync_range convention of one commit per
+    logical operation).
+
+    PROVENANCE CAVEAT: price_bars has no per-bar provider column (see
+    database/models.py) -- provenance of an existing cached BAR (as
+    opposed to a sync_ranges coverage row, which does carry provider) is
+    not tracked and cannot be recovered. This function therefore cannot
+    selectively remove "only the bars a specific provider wrote"; it
+    clears EVERY bar in [start, end] for (ric, interval) regardless of
+    which provider originally wrote it. This is the deliberately
+    conservative, safe interpretation of a reset: once an operator asks
+    to forget this range, nothing in it is trusted to still belong.
+
+    Returns the number of PriceBar rows deleted.
+    """
+    delete_stmt = delete(PriceBar).where(
+        PriceBar.ric == ric,
+        PriceBar.interval == interval,
+        PriceBar.datetime >= start,
+        PriceBar.datetime <= end,
+    )
+    result = session.execute(delete_stmt)
+    deleted_bars = result.rowcount or 0
+
+    existing_ranges = list(
+        session.execute(
+            select(SyncRange).where(SyncRange.ric == ric, SyncRange.interval == interval)
+        ).scalars().all()
+    )
+    for row in existing_ranges:
+        if row.end_datetime < start or row.start_datetime > end:
+            continue  # no overlap with [start, end] -- untouched
+        if row.start_datetime >= start and row.end_datetime <= end:
+            session.delete(row)  # fully inside [start, end] -- remove entirely
+            continue
+        if row.start_datetime < start and row.end_datetime > end:
+            # [start, end] is a strict interior hole in this row -- split
+            # into the two surviving pieces on either side of it, each
+            # keeping the original row's provider (a partial reset must
+            # not erase provenance for the portion NOT being reset).
+            session.delete(row)
+            session.add(
+                SyncRange(
+                    ric=ric, interval=interval,
+                    start_datetime=row.start_datetime, end_datetime=start - _EPSILON,
+                    provider=row.provider,
+                )
+            )
+            session.add(
+                SyncRange(
+                    ric=ric, interval=interval,
+                    start_datetime=end + _EPSILON, end_datetime=row.end_datetime,
+                    provider=row.provider,
+                )
+            )
+            continue
+        if row.start_datetime < start:
+            # Overlaps only the left edge of [start, end] -- trim the
+            # row's own right boundary so it stops just before `start`.
+            row.end_datetime = start - _EPSILON
+            continue
+        # Overlaps only the right edge of [start, end] -- trim the row's
+        # own left boundary so it starts just after `end`.
+        row.start_datetime = end + _EPSILON
+
+    session.commit()
+    logger.info(
+        "Invalidated cache for %s [%s] in %s -> %s ahead of a provider switch: "
+        "deleted %d bar(s), adjusted sync-range coverage",
+        ric, interval, start, end, deleted_bars,
+    )
+    return deleted_bars

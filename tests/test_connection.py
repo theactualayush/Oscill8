@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import importlib
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from core import config
 from database import connection
@@ -39,6 +39,66 @@ def test_init_db_is_idempotent(tmp_path):
     engine = get_engine(str(tmp_path / "cache.db"))
     init_db(engine)
     init_db(engine)  # should not raise
+
+
+# ---------------------------------------------------------------------
+# sync_ranges.provider additive migration (provider-provenance design)
+# ---------------------------------------------------------------------
+
+def test_init_db_creates_provider_column_on_a_brand_new_database(tmp_path):
+    engine = get_engine(str(tmp_path / "cache.db"))
+    init_db(engine)
+    columns = {col["name"] for col in inspect(engine).get_columns("sync_ranges")}
+    assert "provider" in columns
+
+
+def test_init_db_adds_provider_column_to_a_pre_existing_database_without_losing_data(tmp_path):
+    # Simulate a database created BEFORE the provider column existed:
+    # build the table manually, without it, and seed a row.
+    engine = get_engine(str(tmp_path / "legacy.db"))
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE sync_ranges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ric VARCHAR(32) NOT NULL,
+                    interval VARCHAR(8) NOT NULL,
+                    start_datetime DATETIME NOT NULL,
+                    end_datetime DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO sync_ranges "
+                "(ric, interval, start_datetime, end_datetime, updated_at) "
+                "VALUES ('SRAH26', 'DAILY', '2026-01-01', '2026-01-05', '2026-01-01')"
+            )
+        )
+
+    columns_before = {col["name"] for col in inspect(engine).get_columns("sync_ranges")}
+    assert "provider" not in columns_before
+
+    init_db(engine)  # must migrate in place, not raise, not drop the existing row
+
+    columns_after = {col["name"] for col in inspect(engine).get_columns("sync_ranges")}
+    assert "provider" in columns_after
+
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT ric, provider FROM sync_ranges")).fetchone()
+    assert row.ric == "SRAH26"
+    assert row.provider is None  # pre-existing rows have no provenance recorded
+
+
+def test_init_db_provider_migration_is_idempotent(tmp_path):
+    engine = get_engine(str(tmp_path / "cache.db"))
+    init_db(engine)
+    init_db(engine)  # second call must be a no-op, not raise "duplicate column"
+    columns = {col["name"] for col in inspect(engine).get_columns("sync_ranges")}
+    assert "provider" in columns
 
 
 # ---------------------------------------------------------------------

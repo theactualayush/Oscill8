@@ -273,6 +273,62 @@ def test_record_sync_range_chained_merge_across_three_ranges(db_session):
 
 
 # ---------------------------------------------------------------------
+# Provider provenance: record_sync_range(provider=...) / get_established_provider
+# ---------------------------------------------------------------------
+
+def test_record_sync_range_without_provider_defaults_to_none(db_session):
+    # Every existing caller (a market with no QuantHub mapping) omits
+    # `provider` -- must remain fully backward compatible.
+    cache.record_sync_range(db_session, "SRAZ26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 5))
+    assert cache.get_established_provider(db_session, "SRAZ26", "DAILY") is None
+
+
+def test_record_sync_range_persists_provider_lseg(db_session):
+    cache.record_sync_range(
+        db_session, "SONH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 5), provider="LSEG"
+    )
+    assert cache.get_established_provider(db_session, "SONH26", "DAILY") == "LSEG"
+
+
+def test_record_sync_range_persists_provider_quanthub(db_session):
+    cache.record_sync_range(
+        db_session, "SONH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 5), provider="QUANTHUB"
+    )
+    assert cache.get_established_provider(db_session, "SONH26", "DAILY") == "QUANTHUB"
+
+
+def test_get_established_provider_returns_none_for_untouched_ric_interval(db_session):
+    assert cache.get_established_provider(db_session, "NEVER26", "DAILY") is None
+
+
+def test_provider_provenance_is_keyed_by_ric_and_interval_together(db_session):
+    # The SAME contract can legitimately have different established
+    # providers at different intervals.
+    cache.record_sync_range(
+        db_session, "SONH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 5), provider="LSEG"
+    )
+    cache.record_sync_range(
+        db_session, "SONH26", "HOURLY", datetime(2026, 1, 1), datetime(2026, 1, 1, 5), provider="QUANTHUB"
+    )
+    assert cache.get_established_provider(db_session, "SONH26", "DAILY") == "LSEG"
+    assert cache.get_established_provider(db_session, "SONH26", "HOURLY") == "QUANTHUB"
+
+
+def test_record_sync_range_merge_keeps_the_incoming_calls_provider(db_session):
+    cache.record_sync_range(
+        db_session, "SONH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 5), provider="LSEG"
+    )
+    # Adjacent range, same provider (as it must always be, by design) --
+    # merges into one row, provider still LSEG.
+    cache.record_sync_range(
+        db_session, "SONH26", "DAILY", datetime(2026, 1, 6), datetime(2026, 1, 10), provider="LSEG"
+    )
+    ranges = cache.get_sync_ranges(db_session, "SONH26", "DAILY")
+    assert ranges == [(datetime(2026, 1, 1), datetime(2026, 1, 10))]
+    assert cache.get_established_provider(db_session, "SONH26", "DAILY") == "LSEG"
+
+
+# ---------------------------------------------------------------------
 # bar_delta
 # ---------------------------------------------------------------------
 
@@ -285,3 +341,165 @@ def test_bar_delta_known_intervals():
 def test_bar_delta_unknown_interval_raises():
     with pytest.raises(ValueError, match="Unknown interval"):
         cache.bar_delta("WEEKLY")
+
+
+# ---------------------------------------------------------------------
+# delete_bars_and_sync_ranges: cache invalidation ahead of a provider
+# switch (cache -> LSEG -> QuantHub fallback, database/service.py)
+# ---------------------------------------------------------------------
+
+def test_delete_bars_removes_bars_in_range(db_session):
+    df = _make_df(["2026-01-01", "2026-01-02", "2026-01-03"])
+    cache.insert_bars(db_session, "CRAH26", "DAILY", df)
+
+    deleted = cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 3, 23, 59, 59)
+    )
+
+    assert deleted == 3
+    remaining = cache.read_bars(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 3, 23, 59, 59)
+    )
+    assert remaining.empty
+
+
+def test_delete_bars_leaves_bars_outside_the_range_untouched(db_session):
+    df = _make_df(["2026-01-01", "2026-01-05", "2026-01-10"])
+    cache.insert_bars(db_session, "CRAH26", "DAILY", df)
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 4), datetime(2026, 1, 6)
+    )
+
+    remaining = cache.read_bars(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 10, 23, 59, 59)
+    )
+    assert sorted(remaining["Date"].dt.strftime("%Y-%m-%d")) == ["2026-01-01", "2026-01-10"]
+
+
+def test_delete_bars_never_touches_a_different_ric(db_session):
+    cache.insert_bars(db_session, "CRAH26", "DAILY", _make_df(["2026-01-01"]))
+    cache.insert_bars(db_session, "SRAH26", "DAILY", _make_df(["2026-01-01"]))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 1, 23, 59, 59)
+    )
+
+    assert cache.read_bars(
+        db_session, "SRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 1, 23, 59, 59)
+    ).shape[0] == 1
+
+
+def test_delete_bars_never_touches_a_different_interval(db_session):
+    cache.insert_bars(db_session, "CRAH26", "DAILY", _make_df(["2026-01-01"]))
+    cache.insert_bars(db_session, "CRAH26", "HOURLY", _make_df(["2026-01-01"]))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 1, 23, 59, 59)
+    )
+
+    assert cache.read_bars(
+        db_session, "CRAH26", "HOURLY", datetime(2026, 1, 1), datetime(2026, 1, 1, 23, 59, 59)
+    ).shape[0] == 1
+
+
+def test_delete_sync_range_fully_inside_window_is_removed(db_session):
+    cache.record_sync_range(db_session, "CRAH26", "DAILY", datetime(2026, 1, 5), datetime(2026, 1, 10))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 20)
+    )
+
+    assert cache.get_sync_ranges(db_session, "CRAH26", "DAILY") == []
+
+
+def test_delete_sync_range_not_overlapping_window_is_untouched(db_session):
+    cache.record_sync_range(db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 3))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 2, 1), datetime(2026, 2, 5)
+    )
+
+    ranges = cache.get_sync_ranges(db_session, "CRAH26", "DAILY")
+    assert ranges == [(datetime(2026, 1, 1), datetime(2026, 1, 3))]
+
+
+def test_delete_sync_range_trims_the_left_overlap(db_session):
+    # Existing range starts before the deletion window and ends inside
+    # it -- must be trimmed to stop just before the deletion window.
+    cache.record_sync_range(db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 10))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 5), datetime(2026, 1, 20)
+    )
+
+    ranges = cache.get_sync_ranges(db_session, "CRAH26", "DAILY")
+    assert len(ranges) == 1
+    assert ranges[0][0] == datetime(2026, 1, 1)
+    assert ranges[0][1] < datetime(2026, 1, 5)
+
+
+def test_delete_sync_range_trims_the_right_overlap(db_session):
+    # Existing range starts inside the deletion window and ends after
+    # it -- must be trimmed to start just after the deletion window.
+    cache.record_sync_range(db_session, "CRAH26", "DAILY", datetime(2026, 1, 5), datetime(2026, 1, 20))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 10)
+    )
+
+    ranges = cache.get_sync_ranges(db_session, "CRAH26", "DAILY")
+    assert len(ranges) == 1
+    assert ranges[0][0] > datetime(2026, 1, 10)
+    assert ranges[0][1] == datetime(2026, 1, 20)
+
+
+def test_delete_sync_range_splits_a_row_that_fully_contains_the_window(db_session):
+    # Existing range fully contains the deletion window -- must survive
+    # as TWO separate rows, one on each side, never deleted wholesale.
+    cache.record_sync_range(db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 31))
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 10), datetime(2026, 1, 20)
+    )
+
+    ranges = sorted(cache.get_sync_ranges(db_session, "CRAH26", "DAILY"))
+    assert len(ranges) == 2
+    assert ranges[0][0] == datetime(2026, 1, 1)
+    assert ranges[0][1] < datetime(2026, 1, 10)
+    assert ranges[1][0] > datetime(2026, 1, 20)
+    assert ranges[1][1] == datetime(2026, 1, 31)
+
+
+def test_delete_sync_range_split_preserves_provider_on_both_surviving_fragments(db_session):
+    # A partial reset must not erase provenance for the portion of
+    # coverage NOT being reset.
+    cache.record_sync_range(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 31), provider="LSEG"
+    )
+
+    cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 10), datetime(2026, 1, 20)
+    )
+
+    ranges = cache.get_sync_ranges(db_session, "CRAH26", "DAILY")
+    assert len(ranges) == 2
+    assert cache.get_established_provider(db_session, "CRAH26", "DAILY") == "LSEG"
+
+
+def test_delete_bars_and_sync_ranges_returns_deleted_bar_count(db_session):
+    cache.insert_bars(db_session, "CRAH26", "DAILY", _make_df(["2026-01-01", "2026-01-02"]))
+
+    deleted = cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 2, 23, 59, 59)
+    )
+
+    assert deleted == 2
+
+
+def test_delete_bars_and_sync_ranges_on_empty_cache_is_a_safe_no_op(db_session):
+    deleted = cache.delete_bars_and_sync_ranges(
+        db_session, "CRAH26", "DAILY", datetime(2026, 1, 1), datetime(2026, 1, 2)
+    )
+    assert deleted == 0
+    assert cache.get_sync_ranges(db_session, "CRAH26", "DAILY") == []

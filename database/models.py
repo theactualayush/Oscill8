@@ -69,11 +69,38 @@ class PriceBar(Base):
 class SyncRange(Base):
     """A confirmed-downloaded coverage window for one (ric, interval).
 
-    A row means "we successfully asked LSEG for bars across the entire
-    [start_datetime, end_datetime] span" -- not that every timestamp in
-    that span has a bar (non-trading days/holidays are legitimately
-    absent). Datetime (not date) granularity is required because
-    intraday intervals (HOURLY, 4H) need sub-day coverage precision.
+    A row means "we successfully asked a market-data provider for bars
+    across the entire [start_datetime, end_datetime] span" -- not that
+    every timestamp in that span has a bar (non-trading days/holidays
+    are legitimately absent). Datetime (not date) granularity is
+    required because intraday intervals (HOURLY, 4H) need sub-day
+    coverage precision.
+
+    provider: which provider ("LSEG" or "QUANTHUB", see core.providers.
+        Provider) actually supplied this coverage window -- NULL for a
+        market with no QuantHub mapping at all (core.providers.
+        resolve_provider returns Provider.LSEG unconditionally for
+        these; there is no per-(ric, interval) decision to record, so
+        this column is simply never populated for them). For a
+        QuantHub-mapped market, every row for a given (ric, interval)
+        is guaranteed to carry the SAME provider value once a provider
+        has been established (see database.service's cache -> LSEG ->
+        QuantHub provider-provenance design and database.cache.
+        get_established_provider) -- this column is that provider's
+        one and only persisted record; it is never inferred from
+        whether bars happen to exist.
+
+        MIGRATION NOTE: this column was added after price_bars/
+        sync_ranges already shipped. database.connection.init_db()
+        only creates MISSING tables (SQLAlchemy's create_all does not
+        alter an existing one) -- unlike the earlier PriceBar
+        nullability tightening (whose migration note said to delete
+        and rebuild the local cache, since it's fully re-fetchable),
+        this column must NOT cost an existing installation its cached
+        history, so init_db() additionally runs a small, idempotent
+        `ALTER TABLE sync_ranges ADD COLUMN provider` migration for a
+        pre-existing database that predates this column (see
+        database/connection.py's _ensure_sync_ranges_provider_column).
     """
 
     __tablename__ = "sync_ranges"
@@ -83,6 +110,7 @@ class SyncRange(Base):
     interval: Mapped[str] = mapped_column(String(8), nullable=False)
     start_datetime: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_datetime: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(16), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow
     )

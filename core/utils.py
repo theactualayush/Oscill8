@@ -69,6 +69,65 @@ def to_date(value: DateLike) -> date:
     raise TypeError(f"Cannot coerce {type(value)} to date")
 
 
+def missing_business_days(dates: pd.Series) -> list[pd.Timestamp]:
+    """Weekdays (Mon-Fri) within [dates.min(), dates.max()] with no bar
+    anywhere in `dates` -- i.e. holidays, market closures, or a genuine
+    vendor data gap. Deliberately excludes Saturday/Sunday: a market-
+    closure signal only makes sense on days the market could plausibly
+    have traded.
+
+    Mirrors the exact same 'valid-observation' concept already
+    established for chart rendering (ui.chart_view._missing_weekdays,
+    DAILY-only there) -- duplicated here rather than imported, since a
+    lower layer (core/, and database/service.py which uses this) must
+    never depend on ui/. Generalizes cleanly to HOURLY/4H too: `dates`
+    is normalized to midnight before comparison, so a date with a bar
+    at ANY time of day counts as present -- this checks "does this
+    weekday have any bar at all", not "does every expected intraday
+    timestamp have one" (Oscill8 has no per-market trading-session
+    calendar to check the latter against, and none is invented here).
+
+    Returns [] for an empty input.
+    """
+    if dates.empty:
+        return []
+    normalized = pd.DatetimeIndex(dates).normalize()
+    full_range = pd.date_range(normalized.min(), normalized.max(), freq="D")
+    present = set(normalized)
+    return [d for d in full_range if d.weekday() < 5 and d not in present]
+
+
+def longest_missing_business_day_run(dates: pd.Series) -> int:
+    """Longest run of CONSECUTIVE missing business days within `dates`
+    (see missing_business_days) -- used to distinguish a normal holiday
+    cluster (a short run) from a genuine data gap (a long one) without
+    assuming a fixed number of calendar days must always contain a bar.
+
+    A weekend (Friday -> Monday, 3 calendar days) between two missing
+    weekdays does NOT break the run: weekends are never themselves
+    "missing" (missing_business_days excludes them entirely by
+    definition), so two missing weekdays separated only by a weekend
+    represent one unbroken stretch of missing trading days, not two
+    separate gaps -- e.g. a whole month of missing weekdays must not be
+    fragmented into a sequence of isolated 5-day runs just because each
+    week's weekend sits between them.
+
+    Returns 0 if no business day is missing.
+    """
+    missing = missing_business_days(dates)
+    if not missing:
+        return 0
+    longest = 1
+    current = 1
+    for prev, curr in zip(missing, missing[1:]):
+        if (curr - prev).days <= 3:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    return longest
+
+
 def resample_to_4h(df: pd.DataFrame, resample_rule: str) -> pd.DataFrame:
     """Aggregate hourly OHLCV bars into 4-hour bars.
 

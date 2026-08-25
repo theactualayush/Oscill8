@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from core import config
@@ -70,6 +70,34 @@ def init_db(engine: Engine | None = None) -> None:
 
     logger.info("Ensuring market-data cache schema exists at %s", db_path)
     Base.metadata.create_all(engine)
+    _ensure_sync_ranges_provider_column(engine)
+
+
+def _ensure_sync_ranges_provider_column(engine: Engine) -> None:
+    """Additive migration for sync_ranges.provider (added for the cache
+    -> LSEG -> QuantHub provider-provenance design -- see database/
+    models.py's SyncRange.provider docstring).
+
+    Base.metadata.create_all() above only creates tables that don't
+    exist yet -- it never alters an EXISTING table's columns -- so a
+    pre-existing local data/oscill8.db created before this column
+    existed would otherwise silently be missing it forever. Unlike the
+    earlier PriceBar nullability-tightening migration (which could
+    safely tell users to delete and rebuild a pure, fully re-fetchable
+    cache), this one must NOT lose an existing installation's cached
+    history, so it adds the column to the existing table in place
+    instead. Idempotent and cheap: a no-op once the column already
+    exists, safe to run on every startup alongside create_all() above.
+    """
+    inspector = inspect(engine)
+    if "sync_ranges" not in inspector.get_table_names():
+        return  # brand-new database -- create_all() above already made it with this column
+    existing_columns = {col["name"] for col in inspector.get_columns("sync_ranges")}
+    if "provider" in existing_columns:
+        return
+    logger.info("Migrating sync_ranges: adding 'provider' column (additive, no data loss)")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE sync_ranges ADD COLUMN provider VARCHAR(16)"))
 
 
 def get_session(engine: Engine | None = None) -> Session:

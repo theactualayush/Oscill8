@@ -32,10 +32,23 @@ from datetime import datetime, time
 import pandas as pd
 import pytest
 
+from core.downloader import MarketDataUnavailableError
 from database import cache, service
 from database.connection import get_session as _real_get_session
 
 _CANONICAL_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+# CORRA is QuantHub-mapped -- since the cache -> LSEG -> QuantHub
+# fallback design (see database.service's module docstring), its LSEG
+# attempt is now tried FIRST too, before falling back to QuantHub. This
+# side_effect raises unconditionally (a deterministic stand-in for
+# CORRA's real, documented LSEG entitlement gap) so tests below still
+# reach the QuantHub mock exactly as they did before this design
+# existed. Use only where CORRA is the sole ric calling download_history
+# in that test; where SOFR (or another LSEG-only ric) shares the same
+# mock target, branch on `ric` explicitly instead (see the tests below).
+def _lseg_unavailable_for_corra(ric, interval, start, end):
+    raise MarketDataUnavailableError(ric, "User does not have permission")
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +140,12 @@ def test_downloading_one_interval_does_not_mark_another_interval_as_synced(mocke
 # ---------------------------------------------------------------------
 
 def test_different_rics_same_interval_do_not_share_sync_ranges_or_bars(mocker, db_session):
-    mocker.patch("database.service.download_history", return_value=_df(["2020-01-01"], 100.0))
+    def _lseg(ric, interval, start, end):
+        if ric == "CRAU6":
+            raise MarketDataUnavailableError(ric, "User does not have permission")
+        return _df(["2020-01-01"], 100.0)
+
+    mocker.patch("database.service.download_history", side_effect=_lseg)
     mocker.patch(
         "database.service.download_history_quanthub", return_value=_df(["2020-01-01"], 200.0)
     )
@@ -153,6 +171,7 @@ def test_caching_corra_does_not_satisfy_a_later_sofr_request(mocker, db_session)
     """Direct regression for the audit's exact concern: caching CORRA
     history must never be mistaken for cached SOFR coverage, or vice
     versa -- each RIC always triggers its own download."""
+    mocker.patch("database.service.download_history", side_effect=_lseg_unavailable_for_corra)
     mock_download = mocker.patch(
         "database.service.download_history_quanthub", return_value=_df(["2020-01-01"], 200.0)
     )
@@ -178,10 +197,14 @@ def test_ric_interval_matrix_is_fully_independent(mocker, db_session):
         ("CRAU6", "DAILY"): 3.0,
         ("CRAU6", "HOURLY"): 4.0,
     }
-    mocker.patch(
-        "database.service.download_history",
-        side_effect=[_df(["2020-01-01"], matrix[("SRAU26", "DAILY")]), _df(["2020-01-01"], matrix[("SRAU26", "HOURLY")])],
-    )
+    sofr_levels = iter([matrix[("SRAU26", "DAILY")], matrix[("SRAU26", "HOURLY")]])
+
+    def _lseg(ric, interval, start, end):
+        if ric == "CRAU6":
+            raise MarketDataUnavailableError(ric, "User does not have permission")
+        return _df(["2020-01-01"], next(sofr_levels))
+
+    mocker.patch("database.service.download_history", side_effect=_lseg)
     mocker.patch(
         "database.service.download_history_quanthub",
         side_effect=[_df(["2020-01-01"], matrix[("CRAU6", "DAILY")]), _df(["2020-01-01"], matrix[("CRAU6", "HOURLY")])],

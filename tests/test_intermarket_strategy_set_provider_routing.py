@@ -27,6 +27,7 @@ import pandas as pd
 import pytest
 
 from core.config import BarInterval
+from core.downloader import MarketDataUnavailableError
 from core.ric import parse_ric
 from core.providers import Provider, qh_root_for_market, resolve_provider
 from core.quanthub import build_instrument
@@ -147,8 +148,14 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     get_history_batch() BEFORE the per-instance pricing loop (see the
     QuantHub-batching phase). LSEG-routed RICs are still fetched one at
     a time through the completely unmodified database.service.
-    download_history (via get_history()); QuantHub-routed instruments
-    are now fetched through database.service.download_history_quanthub_batch
+    download_history (via get_history()); the six QuantHub-mapped
+    markets now go through the cache -> LSEG -> QuantHub fallback (see
+    database.service's module docstring) instead of skipping LSEG
+    entirely -- the LSEG mock below raises MarketDataUnavailableError
+    for anything that isn't a SOFR-style RIC (a deterministic stand-in
+    for a real LSEG gap, e.g. CORRA's documented entitlement error) so
+    those six still resolve via QuantHub exactly as before this design
+    existed, via database.service.download_history_quanthub_batch
     (core.quanthub.download_history_batch) -- ONE call carrying every
     QuantHub instrument needing a fetch for this scan's single DAILY
     interval group, not one call per instrument.
@@ -168,9 +175,12 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
             }
         )
 
-    mock_lseg = mocker.patch(
-        "database.service.download_history", return_value=_bars(["2026-01-05", "2026-01-06"])
-    )
+    def _lseg(ric, interval, start, end):
+        if ric.startswith("SRA"):
+            return _bars(["2026-01-05", "2026-01-06"])
+        raise MarketDataUnavailableError(ric, "The universe is not found")
+
+    mock_lseg = mocker.patch("database.service.download_history", side_effect=_lseg)
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
         side_effect=lambda instruments, interval, start, end: {
@@ -184,10 +194,12 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     assert len(report.results) == len(instances)
     assert {r.market_key for r in report.results} == set(ALL_SEVEN_MARKETS)
 
-    lseg_instance_count = sum(1 for i in instances if i.definition.market_key == "SOFR")
     quanthub_instance_count = sum(1 for i in instances if i.definition.market_key != "SOFR")
 
-    assert mock_lseg.call_count == lseg_instance_count
+    # Every candidate's LSEG attempt is tried, including the six
+    # QuantHub-mapped markets (cache -> LSEG -> QuantHub fallback) --
+    # only the ones the mock rejects (non-SOFR RICs) go on to QuantHub.
+    assert mock_lseg.call_count == len(instances)
     # All six QuantHub markets share one DAILY interval group, so
     # prewarm_leg_cache() -> get_history_batch() issues exactly ONE
     # download_history_quanthub_batch() call carrying every distinct
@@ -199,11 +211,13 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     quanthub_instruments_seen = set(mock_qh.call_args_list[0].args[0])
     assert len(quanthub_instruments_seen) == quanthub_instance_count
 
-    # Every call the LSEG mock actually received was a SOFR-style RIC
-    # (root "SRA"); every instrument the QuantHub mock received was one
-    # of the six markets' own QuantHub instruments -- never a raw LSEG RIC.
+    # Every call the LSEG mock received was a genuine LSEG-style RIC
+    # string (never a QuantHub instrument identifier) -- confirms LSEG
+    # is tried for every candidate's own RIC, not some QH-derived value.
     lseg_instruments_seen = {call.args[0] for call in mock_lseg.call_args_list}
-    assert all(instr.startswith("SRA") for instr in lseg_instruments_seen)
+    all_instance_rics = {ric for i in instances for ric in i.rics}
+    assert lseg_instruments_seen == all_instance_rics
+    assert any(instr.startswith("SRA") for instr in lseg_instruments_seen)  # SOFR was tried too
 
     quanthub_roots_expected = {qh_root_for_market(mk) for mk in ALL_SEVEN_MARKETS if mk != "SOFR"}
     assert all(
