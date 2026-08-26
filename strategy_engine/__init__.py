@@ -12,6 +12,11 @@ lseg.data directly.
 from strategy_engine.definitions import StrategyDefinition
 from strategy_engine.combinations import StrategyInstance, generate_instances
 from strategy_engine.pricing import StrategyHistory, build_history, generate_histories
+from strategy_engine.intermarket_definitions import LegSpec, IntermarketDefinition
+from strategy_engine.intermarket_combinations import (
+    IntermarketStrategyInstance,
+    generate_intermarket_instances,
+)
 
 __all__ = [
     "StrategyDefinition",
@@ -20,4 +25,8 @@ __all__ = [
     "StrategyHistory",
     "build_history",
     "generate_histories",
+    "LegSpec",
+    "IntermarketDefinition",
+    "IntermarketStrategyInstance",
+    "generate_intermarket_instances",
 ]
