@@ -41,6 +41,8 @@ from range_analytics.multi_lookback import analyze_multi_lookback
 
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import IntermarketStrategyInstance
+from strategy_engine.intermarket_definitions import resolve_display_market_key, resolve_display_offsets
 from strategy_engine.pricing import StrategyHistory, build_history, prewarm_leg_cache
 
 from template_scanner.scan_results import ScanCandidateResult
@@ -126,7 +128,12 @@ def analyze_histories(
     with no knowledge of how those histories were generated (REAL-mode
     dated contracts today; a future candidate source that produces
     StrategyHistory objects some other way could call this directly
-    without touching filtering/ranking/results).
+    without touching filtering/ranking/results) -- and, since
+    resolve_display_market_key()/resolve_display_offsets() dispatch by
+    type, no knowledge of whether a given history's instance is a
+    single-market StrategyInstance or an intermarket
+    IntermarketStrategyInstance either. Both flow through this exact
+    same loop into one ScanReport.
     """
     results = []
     for history in histories:
@@ -141,10 +148,10 @@ def analyze_histories(
         definition = history.instance.definition
         results.append(
             ScanCandidateResult(
-                market_key=definition.market_key,
+                market_key=resolve_display_market_key(definition),
                 rics=history.instance.rics,
                 weights=definition.weights,
-                offsets=definition.offsets,
+                offsets=resolve_display_offsets(definition),
                 interval=definition.interval,
                 price_field=history.price_field,
                 instance=history.instance,
@@ -159,7 +166,7 @@ def analyze_histories(
 
 
 def run_scan_on_instances(
-    instances: list[StrategyInstance],
+    instances: list[StrategyInstance | IntermarketStrategyInstance],
     price_start: DateLike,
     price_end: DateLike,
     lookbacks: tuple[int, ...] = (20, 40, 60, 90, 120),
@@ -182,6 +189,13 @@ def run_scan_on_instances(
     it built its candidate list. run_scan() itself is refactored below
     to call this function too, so there is only one implementation of
     the loop, not two.
+
+    `instances` may freely mix single-market StrategyInstance and
+    intermarket IntermarketStrategyInstance objects in one call -- this
+    function (and build_history()/prewarm_leg_cache() beneath it) reads
+    only `.rics` off each instance, never `.definition.market_key`, so
+    it is already agnostic to which kind of instance it's given and to
+    whatever caller assembled the mixed list.
 
     leg_cache is pre-warmed via strategy_engine.pricing.prewarm_leg_cache()
     -- batches every distinct QuantHub-routed leg required by `instances`

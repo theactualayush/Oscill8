@@ -18,17 +18,21 @@ generate_contracts.
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
 from core.config import BarInterval
 
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 
 from strategy_sets.execution import run_strategy_set, with_interval_override
 from strategy_sets.expansion import expand_strategy_set
-from strategy_sets.model import StrategySet, StrategySetEntry
+from strategy_sets.model import IntermarketStrategySetEntry, StrategySet, StrategySetEntry
 from strategy_sets.repository import StrategySetRepository
+from strategy_sets.serialization import strategy_set_from_dict
 
 from template_scanner.scanner import ScanReport, ScanRequest
 
@@ -45,6 +49,16 @@ def _outright(market_key: str, interval: BarInterval, weight: float = 1.0) -> St
 
 def _fly(market_key: str, interval: BarInterval, weights: tuple[float, ...]) -> StrategyDefinition:
     return StrategyDefinition(market_key=market_key, offsets=(0, 1, 2), weights=weights, interval=interval)
+
+
+def _basis(interval: BarInterval) -> IntermarketDefinition:
+    """Arbitrary two-market intermarket shape (SOFR/CORRA are test data,
+    not a case this module has any special handling for) -- both legs
+    anchored at offset=0, sharing the same 8-contract window as
+    _SOFR_CONTRACTS/_CORRA_CONTRACTS below."""
+    return IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)), interval=interval,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -111,6 +125,40 @@ def test_override_rejects_an_invalid_interval_like_any_strategydefinition_would(
 
     with pytest.raises(ValueError):
         with_interval_override(strategy_set, "NOT_A_REAL_INTERVAL")
+
+
+def test_override_replaces_interval_on_intermarket_entries_too():
+    """Regression for a real bug found during Phase 2 hardening: an
+    earlier version of with_interval_override() only rebuilt
+    strategy_set.entries, silently leaving intermarket_entries at their
+    ORIGINAL interval -- contradicting this function's own "every
+    entry" contract. intermarket_entries did not exist when this
+    function was first written."""
+    single = StrategySetEntry(name="A", definition=_outright("SOFR", BarInterval.DAILY))
+    intermarket = IntermarketStrategySetEntry(name="B", definition=_basis(BarInterval.DAILY))
+    strategy_set = StrategySet(name="Mixed", entries=(single,), intermarket_entries=(intermarket,))
+
+    overridden = with_interval_override(strategy_set, BarInterval.FOUR_HOUR)
+
+    assert all(e.definition.interval == BarInterval.FOUR_HOUR for e in overridden.entries)
+    assert all(
+        e.definition.interval == BarInterval.FOUR_HOUR for e in overridden.intermarket_entries
+    )
+
+
+def test_override_preserves_intermarket_entry_fields_other_than_interval():
+    entry = IntermarketStrategySetEntry(
+        name="Basis", definition=_basis(BarInterval.DAILY), enabled=False,
+    )
+    strategy_set = StrategySet(name="Set", entries=(), intermarket_entries=(entry,))
+
+    overridden = with_interval_override(strategy_set, BarInterval.HOURLY)
+    result_entry = overridden.intermarket_entries[0]
+
+    assert result_entry.name == "Basis"
+    assert result_entry.enabled is False
+    assert result_entry.definition.market_keys == ("SOFR", "CORRA")
+    assert result_entry.definition.weights == (1.0, -1.0)
 
 
 def test_persisted_strategy_set_is_unchanged_after_being_run(tmp_path):
@@ -309,3 +357,92 @@ def test_run_strategy_set_report_is_a_real_scanreport_of_scancandidateresults(fa
         assert result.market_key == "SOFR"
         assert result.interval == BarInterval.DAILY
         assert result.multi_lookback is not None  # Module 4A/4B analytics actually ran
+
+
+# ---------------------------------------------------------------------
+# Full chain through the actual public execution entry point:
+#   StrategySet JSON -> strategy_set_from_dict() -> run_strategy_set()
+#     -> expand_strategy_set() -> scanner execution -> results
+# using a GENUINELY MIXED StrategySet (>= 1 single-market entry,
+# >= 1 intermarket entry). This is the test that verifies
+# strategy_sets/execution.py needs no further modification beyond the
+# with_interval_override() fix above -- it caught that fix's absence
+# before this test was added (a mixed run_strategy_set() call silently
+# left the intermarket entry at its original interval, which the fake
+# provider's _SERIES_LEVEL lookup would have KeyError'd on).
+# ---------------------------------------------------------------------
+
+_MIXED_STRATEGY_SET_JSON = {
+    "schema_version": 1,
+    "name": "Mixed Execution Set",
+    "description": "",
+    "entries": [
+        {
+            "name": "SOFR Outright",
+            "enabled": True,
+            "market_key": "SOFR",
+            "offsets": [0],
+            "weights": [1.0],
+            # Deliberately HOURLY -- _SERIES_LEVEL only has DAILY
+            # entries, so a clean pass is direct proof run_strategy_set()
+            # actually applied the DAILY override before fetching.
+            "interval": "HOURLY",
+            "price_field": "Close",
+            "expansion": {"max_curve_position": None, "eligible_rics": None},
+        },
+        {
+            "name": "SOFR vs CORRA basis",
+            "enabled": True,
+            "legs": [
+                {"market_key": "SOFR", "offset": 0, "weight": 1.0},
+                {"market_key": "CORRA", "offset": 0, "weight": -1.0},
+            ],
+            "interval": "HOURLY",
+            "price_field": "Close",
+            "bp_per_point": 100.0,
+            "expansion": {"max_curve_position": None, "eligible_rics": None},
+        },
+    ],
+}
+
+
+def test_run_strategy_set_end_to_end_from_json_with_a_mixed_strategy_set(fake_provider):
+    # --- StrategySet JSON -> strategy_set_from_dict() -> StrategySet ---
+    strategy_set = strategy_set_from_dict(json.loads(json.dumps(_MIXED_STRATEGY_SET_JSON)))
+    assert len(strategy_set.entries) == 1
+    assert len(strategy_set.intermarket_entries) == 1
+
+    # --- run_strategy_set() -> expand_strategy_set() -> scanner execution ---
+    request, report = run_strategy_set(
+        strategy_set, BarInterval.DAILY, _START, _END, _PRICE_START, _PRICE_END,
+    )
+
+    # The override reached BOTH entry types before pricing -- every
+    # fetch the fake provider recorded was for DAILY, never the
+    # original HOURLY (which would have KeyError'd against
+    # _SERIES_LEVEL, so a clean run is itself proof of this).
+    assert all(interval == BarInterval.DAILY for (_, interval, _, _) in fake_provider.calls)
+
+    # --- results: both a single-market and an intermarket ScanCandidateResult ---
+    assert report.skipped == ()
+    single_market_results = [r for r in report.results if r.market_key == "SOFR"]
+    intermarket_results = [r for r in report.results if r.market_key == "SOFR/CORRA"]
+    assert len(single_market_results) == len(_SOFR_CONTRACTS)
+    assert len(intermarket_results) == len(_CORRA_CONTRACTS)
+    assert len(report.results) == len(single_market_results) + len(intermarket_results)
+
+    for result in report.results:
+        assert result.interval == BarInterval.DAILY
+        assert result.multi_lookback is not None
+
+    basis = next(r for r in intermarket_results if r.rics == ("SRAH26", "CRAH6"))
+    assert basis.weights == (1.0, -1.0)
+    assert basis.offsets == (0, 0)
+    headline = basis.multi_lookback.per_lookback[0]
+    assert headline.current_price == pytest.approx(100.0 - 200.0)  # SOFR H26 - CORRA H6
+    assert headline.bp_per_point == pytest.approx(100.0)
+
+    # The stored ScanRequest still carries the UI-relevant fields
+    # regardless of the mix of entry types behind it.
+    assert isinstance(request, ScanRequest)
+    assert str(request.price_start) == _PRICE_START

@@ -17,6 +17,8 @@ from core.config import BarInterval
 from range_analytics import RangeAnalytics, analyze_range
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import IntermarketStrategyInstance
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 from strategy_engine.pricing import StrategyHistory
 
 
@@ -29,6 +31,32 @@ def _history(dates: list[str], values: list[float], market_key: str = "SOFR") ->
         {
             "Date": pd.to_datetime(dates),
             "Leg_1": values,
+            "Strategy": values,
+        }
+    )
+    return StrategyHistory(instance=instance, price_field="Close", history=df)
+
+
+def _intermarket_history(
+    dates: list[str], values: list[float], bp_per_point: float | None = None,
+) -> StrategyHistory:
+    """Same shape as _history() above, but built from an
+    IntermarketDefinition -- exercises analyze_range()'s generic,
+    type-dispatched handling of a strategy whose legs span different
+    markets. Any two distinct registry markets would do; SOFR/CORRA are
+    arbitrary test data here, not a special case analyze_range() knows
+    about."""
+    definition = IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)),
+        interval=BarInterval.DAILY,
+        bp_per_point=bp_per_point,
+    )
+    instance = IntermarketStrategyInstance(definition=definition, rics=("SRAH26", "CRAH6"))
+    df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(dates),
+            "Leg_1": values,
+            "Leg_2": [0.0] * len(values),
             "Strategy": values,
         }
     )
@@ -48,6 +76,7 @@ def test_analyze_range_populates_all_fields_for_a_simple_series():
 
     assert isinstance(result, RangeAnalytics)
     assert result.market_key == "SOFR"
+    assert result.bp_per_point == pytest.approx(100.0)
     assert result.interval == BarInterval.DAILY
     assert result.observation_count == 10
     assert result.window_start == pd.Timestamp(dates[0])
@@ -389,3 +418,55 @@ def test_analyze_range_movement_is_independent_of_percentile_selection():
     assert default.oscillation_count != narrow.oscillation_count
     assert default.mean_abs_change_price == pytest.approx(narrow.mean_abs_change_price)
     assert default.mean_abs_change_bp == pytest.approx(narrow.mean_abs_change_bp)
+
+
+# ---------------------------------------------------------------------
+# Intermarket integration: analyze_range() dispatches on TYPE
+# (isinstance) alone -- no market-specific branching anywhere.
+# ---------------------------------------------------------------------
+
+def test_analyze_range_intermarket_market_key_is_display_composite():
+    dates = _dates(5)
+    values = [1.0, 1.02, 0.98, 1.05, 0.95]
+    history = _intermarket_history(dates, values, bp_per_point=100.0)
+
+    result = analyze_range(history)
+
+    assert result.market_key == "SOFR/CORRA"
+
+
+def test_analyze_range_intermarket_uses_explicit_bp_per_point_override():
+    dates = _dates(5)
+    values = [1.0, 1.02, 0.98, 1.05, 0.95]
+    history = _intermarket_history(dates, values, bp_per_point=50.0)
+
+    result = analyze_range(history)
+
+    assert result.bp_per_point == pytest.approx(50.0)
+    assert result.realized_vol_bp == pytest.approx(result.realized_vol_price * 50.0)
+    assert result.mean_abs_change_bp == pytest.approx(result.mean_abs_change_price * 50.0)
+
+
+def test_analyze_range_intermarket_without_bp_per_point_is_nan_only_on_bp_fields():
+    """No bp_per_point set: the two bp-derived fields are NaN (never
+    fabricated from either leg's own market), but every other field --
+    price-unit levels, position, z-score, efficiency, AR1 -- still
+    computes normally. A missing bp convention must not make the whole
+    RangeAnalytics unusable."""
+    dates = [f"2026-01-{d:02d}" for d in range(1, 11)]
+    values = [1.0, 1.02, 0.98, 1.05, 0.95, 1.03, 0.97, 1.01, 0.99, 1.0]
+    history = _intermarket_history(dates, values, bp_per_point=None)
+
+    result = analyze_range(history)
+
+    assert math.isnan(result.bp_per_point)
+    assert math.isnan(result.realized_vol_bp)
+    assert math.isnan(result.mean_abs_change_bp)
+
+    assert result.observation_count == 10
+    assert result.current_price == pytest.approx(1.0)
+    assert result.range_low_full == pytest.approx(min(values))
+    assert result.range_high_full == pytest.approx(max(values))
+    assert not math.isnan(result.realized_vol_price)
+    assert not math.isnan(result.efficiency_ratio)
+    assert not math.isnan(result.z_score)

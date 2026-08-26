@@ -27,8 +27,8 @@ from core.utils import DateLike, get_logger
 
 from range_analytics.results import RangeAnalytics, analyze_range
 from range_analytics.stability import LookbackStability, build_stability
-from range_analytics.units import price_to_bp
 
+from strategy_engine.intermarket_definitions import resolve_display_market_key
 from strategy_engine.pricing import StrategyHistory
 
 logger = get_logger(__name__)
@@ -51,10 +51,17 @@ def range_to_volatility_ratio(result: RangeAnalytics) -> float:
     trend apart from an oscillating range.
 
     NaN when realized_vol_bp is 0 (genuine 0/0 -- a flat window's width
-    is also necessarily 0) or itself NaN (too few observations to
-    define volatility).
+    is also necessarily 0), itself NaN (too few observations to define
+    volatility), or when `result.bp_per_point` is itself NaN (an
+    intermarket strategy with no explicit bp_per_point override -- see
+    range_analytics.units.resolve_bp_per_point). Uses `result.
+    bp_per_point` (the conversion factor already resolved once by
+    analyze_range()) rather than re-deriving it from `result.market_key`
+    -- market_key is a DISPLAY label for an intermarket strategy (a
+    "/"-joined composite, not a registry key) and must never be passed
+    to a market lookup.
     """
-    width_bp = price_to_bp(result.range_width_robust, result.market_key)
+    width_bp = result.range_width_robust * result.bp_per_point
     vol_bp = result.realized_vol_bp
     if math.isnan(vol_bp) or vol_bp == 0:
         return _NAN
@@ -106,6 +113,10 @@ class MultiLookbackAnalytics:
     information beyond a single RangeAnalytics or a direct read of
     per_lookback. Never classifies, scores, or selects a window -- that
     judgment belongs to Module 5 (Template/Scanner).
+
+    `market_key` is a DISPLAY label only -- see RangeAnalytics' own
+    docstring for the exact same caveat (a "/"-joined composite for an
+    intermarket strategy, never a real registry key).
     """
 
     market_key: str
@@ -175,7 +186,7 @@ def analyze_multi_lookback(
     )
 
     definition = history.instance.definition
-    market_key = definition.market_key
+    market_key = resolve_display_market_key(definition)
     interval = definition.interval
 
     logger.debug(

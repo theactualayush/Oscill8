@@ -11,9 +11,12 @@ being written.
 from __future__ import annotations
 
 from core.config import BarInterval
+from strategy_engine.intermarket_combinations import generate_intermarket_instances
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 from template_scanner.templates import template_from_dense_weights
 from template_scanner.universe import (
     dedupe_candidates,
+    dedupe_intermarket_candidates,
     generate_candidate_universe,
     generate_candidates,
 )
@@ -25,6 +28,17 @@ def _fly():
 
 def _spread():
     return template_from_dense_weights("SOFR", (1, -1), BarInterval.DAILY)
+
+
+def _basis(weight_scale: float = 1.0) -> IntermarketDefinition:
+    """Arbitrary two-market intermarket shape -- test data only."""
+    return IntermarketDefinition(
+        legs=(
+            LegSpec("SOFR", 0, 1.0 * weight_scale),
+            LegSpec("CORRA", 0, -1.0 * weight_scale),
+        ),
+        interval=BarInterval.DAILY,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -193,3 +207,62 @@ def test_dedupe_distinguishes_by_interval_and_price_field():
 
 def test_dedupe_empty_list():
     assert dedupe_candidates([]) == []
+
+
+# ---------------------------------------------------------------------
+# dedupe_intermarket_candidates -- sibling to dedupe_candidates, same
+# philosophy: identity is the REALIZED instance (RICs/weights/interval/
+# price_field), never the abstract legs/offsets that generated it.
+# ---------------------------------------------------------------------
+
+def test_dedupe_intermarket_removes_exact_duplicates_across_definitions():
+    definition = _basis()
+    raw = generate_intermarket_instances(definition, "2026-01-01", "2027-12-31") + \
+        generate_intermarket_instances(definition, "2026-01-01", "2027-12-31")
+    assert len(raw) == 2 * len(generate_intermarket_instances(definition, "2026-01-01", "2027-12-31"))
+
+    deduped = dedupe_intermarket_candidates(raw)
+    assert len(deduped) == len(generate_intermarket_instances(definition, "2026-01-01", "2027-12-31"))
+
+
+def test_dedupe_intermarket_preserves_first_occurrence_order():
+    raw = generate_intermarket_instances(_basis(), "2026-01-01", "2027-12-31")
+    deduped = dedupe_intermarket_candidates(raw)
+    assert deduped == raw  # nothing to remove, order must be unchanged
+
+
+def test_dedupe_intermarket_scaled_weights_are_not_deduplicated():
+    basis = generate_intermarket_instances(_basis(1.0), "2026-01-01", "2027-12-31")
+    basis_2x = generate_intermarket_instances(_basis(2.0), "2026-01-01", "2027-12-31")
+    combined = basis + basis_2x
+
+    deduped = dedupe_intermarket_candidates(combined)
+    assert len(deduped) == len(combined)  # scaled weights are economically different
+
+    weight_sets = {inst.definition.weights for inst in deduped}
+    assert weight_sets == {(1.0, -1.0), (2.0, -2.0)}
+
+
+def test_dedupe_intermarket_distinguishes_by_market_keys_order():
+    """Reversing leg order (MARKET_A, MARKET_B) -> (MARKET_B, MARKET_A)
+    changes both the resulting RICs tuple order and the market_keys
+    tuple order -- _intermarket_candidate_identity() includes
+    market_keys explicitly (not just RICs), so both instances are kept
+    as genuinely distinct identities, exactly mirroring how weight order
+    matters for the single-market _candidate_identity()."""
+    forward = IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)), interval=BarInterval.DAILY,
+    )
+    reversed_legs = IntermarketDefinition(
+        legs=(LegSpec("CORRA", 0, -1.0), LegSpec("SOFR", 0, 1.0)), interval=BarInterval.DAILY,
+    )
+    combined = generate_intermarket_instances(
+        forward, "2026-01-01", "2026-12-31"
+    ) + generate_intermarket_instances(reversed_legs, "2026-01-01", "2026-12-31")
+
+    deduped = dedupe_intermarket_candidates(combined)
+    assert len(deduped) == len(combined)  # both kept -- different market_keys tuple order
+
+
+def test_dedupe_intermarket_empty_list():
+    assert dedupe_intermarket_candidates([]) == []

@@ -21,6 +21,7 @@ from core.utils import get_logger
 from range_analytics.multi_lookback import MultiLookbackAnalytics
 
 from strategy_engine.combinations import StrategyInstance
+from strategy_engine.intermarket_combinations import IntermarketStrategyInstance
 
 from template_scanner.metrics import at_lookback, metric_value
 
@@ -110,6 +111,17 @@ class ScanCandidateResult:
     (including the tuple-valued values/pairwise_diffs/pairwise_ratios)
     stays reachable here even though results_to_dataframe() only
     surfaces a curated scalar subset as columns.
+
+    `market_key`/`offsets` are populated via strategy_engine.
+    intermarket_definitions.resolve_display_market_key()/
+    resolve_display_offsets() (see template_scanner.scanner.
+    analyze_histories()) -- for a single-market `instance` these are the
+    real StrategyDefinition.market_key/.offsets, unchanged; for an
+    intermarket `instance` they are DISPLAY-ONLY (a "/"-joined market
+    label, and each leg's own-curve offset) and must never be used for
+    pricing/provider/cache/market-registry/bp purposes -- `instance`
+    itself (its `.rics` and `.definition`) remains the sole source of
+    truth for that.
     """
 
     market_key: str
@@ -118,7 +130,7 @@ class ScanCandidateResult:
     offsets: tuple[int, ...]
     interval: BarInterval
     price_field: str
-    instance: StrategyInstance
+    instance: StrategyInstance | IntermarketStrategyInstance
     multi_lookback: MultiLookbackAnalytics
 
 

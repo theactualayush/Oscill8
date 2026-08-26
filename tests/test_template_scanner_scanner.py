@@ -20,6 +20,11 @@ from core.config import BarInterval
 from core.downloader import MarketDataUnavailableError
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import (
+    IntermarketStrategyInstance,
+    generate_intermarket_instances,
+)
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 from strategy_engine.pricing import StrategyHistory
 from range_analytics import analyze_multi_lookback
 
@@ -647,3 +652,113 @@ def test_run_scan_delegates_to_run_scan_on_instances_with_deduped_candidates(moc
 
     assert {r.rics for r in via_run_scan.results} == {r.rics for r in via_manual_call.results}
     assert len(via_run_scan.results) == len(via_manual_call.results)
+
+
+# ---------------------------------------------------------------------
+# Intermarket integration: analyze_histories()/run_scan_on_instances()
+# handle IntermarketStrategyInstance with the exact same code path as
+# StrategyInstance -- no separate scanner, no type-specific branching
+# visible from the outside.
+# ---------------------------------------------------------------------
+
+def _basis_definition() -> IntermarketDefinition:
+    """Arbitrary two-market intermarket shape -- test data only, not a
+    case the scanner has any special handling for."""
+    return IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)), interval=BarInterval.DAILY,
+    )
+
+
+def test_analyze_histories_populates_composite_display_market_key_for_intermarket():
+    definition = _basis_definition()
+    instance = IntermarketStrategyInstance(definition=definition, rics=("SRAH26", "CRAH6"))
+    history = StrategyHistory(
+        instance=instance,
+        price_field="Close",
+        history=pd.DataFrame(
+            {"Date": pd.to_datetime(_DATES), "Leg_1": _VALUES, "Leg_2": _VALUES, "Strategy": _VALUES}
+        ),
+    )
+
+    report = analyze_histories([history], lookbacks=(20, 40))
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.rics == ("SRAH26", "CRAH6")
+    assert result.market_key == "SOFR/CORRA"
+    assert result.offsets == (0, 0)
+    assert result.weights == (1.0, -1.0)
+
+
+def test_run_scan_on_instances_prices_a_pure_intermarket_candidate_list(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+
+    instances = generate_intermarket_instances(_basis_definition(), "2026-01-01", "2026-12-31")
+    report = run_scan_on_instances(instances, "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    assert report.results
+    assert all(len(r.rics) == 2 for r in report.results)
+    assert all(r.market_key == "SOFR/CORRA" for r in report.results)
+
+
+def test_run_scan_on_instances_processes_a_genuinely_mixed_candidate_list(mocker):
+    """The most important scanner-level proof: a list mixing
+    StrategyInstance and IntermarketStrategyInstance flows through ONE
+    call to run_scan_on_instances() and comes back as ONE ScanReport."""
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+
+    single_market = generate_candidates(_spread(), "2026-01-01", "2026-12-31")
+    intermarket = generate_intermarket_instances(_basis_definition(), "2026-01-01", "2026-12-31")
+    assert single_market and intermarket  # sanity: both contributed candidates
+
+    combined = single_market + intermarket
+    report = run_scan_on_instances(combined, "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    assert len(report.results) == len(combined)
+    single_market_results = [r for r in report.results if r.market_key == "SOFR"]
+    intermarket_results = [r for r in report.results if r.market_key == "SOFR/CORRA"]
+    assert len(single_market_results) == len(single_market)
+    assert len(intermarket_results) == len(intermarket)
+
+    # Both types ranked/filterable through the exact same result list --
+    # e.g. sorting by a headline metric works uniformly across types,
+    # and actually reorders the mixed list away from its raw
+    # single-market-then-intermarket order (see strategy_sets/
+    # expansion.py's own "ORDERING NOTE" -- this is the concrete proof
+    # that raw order is superseded by ranking, not just an assertion).
+    from template_scanner.ranking import SortKey, rank_results
+
+    raw_kinds = [type(r.instance).__name__ for r in report.results]
+    assert raw_kinds[0] == "StrategyInstance"  # confirms raw order is single-market-first
+
+    ranked = rank_results(
+        report.results,
+        [SortKey(accessor=lambda r: r.rics, ascending=False)],  # arbitrary, deterministic key
+    )
+    ranked_kinds = [type(r.instance).__name__ for r in ranked]
+    assert ranked_kinds != raw_kinds  # ranking actually changed the order
+    assert set(ranked) == set(report.results)  # same candidates, just reordered
+
+
+def test_run_scan_on_instances_skips_unavailable_leg_on_intermarket_instance(mocker):
+    """The existing MarketDataUnavailableError skip machinery (no
+    changes of its own) works identically for an intermarket instance's
+    leg as it already does for a single-market one."""
+    definition = _basis_definition()
+    instance = IntermarketStrategyInstance(definition=definition, rics=("SRAH26", "CRAH6"))
+
+    mocker.patch(
+        "strategy_engine.pricing.get_history_batch",
+        side_effect=lambda rics, interval, start, end: {r: _leg_df() for r in rics if r != "CRAH6"},
+    )
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=MarketDataUnavailableError("CRAH6", "The universe is not found"),
+    )
+
+    report = run_scan_on_instances([instance], "2020-01-01", "2020-06-30", lookbacks=(20,))
+
+    assert report.results == ()
+    assert len(report.skipped) == 1
+    assert report.skipped[0].unavailable_ric == "CRAH6"
+    assert report.skipped[0].instance is instance

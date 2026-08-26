@@ -55,6 +55,7 @@ import re
 from dataclasses import dataclass, field
 
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_definitions import IntermarketDefinition
 
 # Filesystem-safe by construction: StrategySetRepository uses a
 # StrategySet's own `name` directly as a JSON filename (see
@@ -139,6 +140,59 @@ class StrategySetEntry:
 
 
 @dataclass(frozen=True)
+class IntermarketStrategySetEntry:
+    """One named, individually enable-able INTERMARKET strategy within a
+    StrategySet -- the additive sibling to StrategySetEntry above, for
+    an entry whose legs belong to different markets (strategy_engine.
+    intermarket_definitions.IntermarketDefinition) rather than one
+    market's own curve (strategy_engine.definitions.StrategyDefinition).
+
+    Field shape deliberately mirrors StrategySetEntry exactly (name,
+    definition, expansion, enabled) so both entry types can be handled
+    uniformly wherever that's possible (e.g. name-uniqueness checking
+    below) and diverge only where the underlying definition genuinely
+    requires it.
+
+    `expansion.max_curve_position` is NOT supported here and is
+    rejected at construction: "curve position" is a single-market-curve
+    concept (see template_scanner.universe.generate_candidates) with no
+    well-defined intermarket equivalent (an intermarket instance has no
+    one shared curve to measure a position on) -- silently ignoring a
+    trader-set filter would be worse than rejecting it outright.
+    `expansion.eligible_rics` IS supported (see strategy_sets.expansion.
+    expand_strategy_set()) since it needs no curve-position concept at
+    all, applying identically to any instance type via its `.rics`.
+    """
+
+    name: str
+    definition: IntermarketDefinition
+    expansion: ExpansionSettings = field(default_factory=ExpansionSettings)
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(
+                f"IntermarketStrategySetEntry name must be a non-empty string, got {self.name!r}"
+            )
+        if not isinstance(self.definition, IntermarketDefinition):
+            raise TypeError(
+                "IntermarketStrategySetEntry.definition must be an IntermarketDefinition, "
+                f"got {type(self.definition)}"
+            )
+        if not isinstance(self.expansion, ExpansionSettings):
+            raise TypeError(
+                "IntermarketStrategySetEntry.expansion must be an ExpansionSettings, "
+                f"got {type(self.expansion)}"
+            )
+        if self.expansion.max_curve_position is not None:
+            raise ValueError(
+                "IntermarketStrategySetEntry.expansion.max_curve_position is not "
+                "supported -- 'curve position' has no well-defined meaning for a "
+                "strategy whose legs span different markets/curves"
+            )
+
+
+@dataclass(frozen=True)
 class StrategySet:
     """A named, ordered collection of StrategySetEntry objects
     representing one trading workflow -- e.g. "Churning", "6M
@@ -153,11 +207,24 @@ class StrategySet:
     repository.py. Entry `name`s must be unique within one set (two
     entries named identically inside the same StrategySet would make
     "which one do you mean" ambiguous for a future rename/duplicate/
-    editor UI operating on entries by name).
+    editor UI operating on entries by name) -- uniqueness is checked
+    across `entries` AND `intermarket_entries` TOGETHER, one shared
+    namespace, since a trader thinks of them as one flat list of named
+    strategies in the set (see the module's own JSON schema, where both
+    entry shapes live in the same `entries` array).
+
+    `intermarket_entries` (additive sibling to `entries`, defaults to an
+    empty tuple so every pre-existing single-market-only StrategySet
+    construction is completely unaffected) holds any entries whose legs
+    span different markets. A StrategySet may contain `entries` only,
+    `intermarket_entries` only, or a genuine mix of both -- there is no
+    requirement to keep single-market and intermarket strategies in
+    separate sets.
     """
 
     name: str
     entries: tuple[StrategySetEntry, ...]
+    intermarket_entries: tuple[IntermarketStrategySetEntry, ...] = ()
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -169,12 +236,22 @@ class StrategySet:
             )
 
         entries = tuple(self.entries)
-        if len(entries) < 1:
-            raise ValueError("A StrategySet needs at least 1 StrategySetEntry")
+        intermarket_entries = tuple(self.intermarket_entries)
+
+        if len(entries) + len(intermarket_entries) < 1:
+            raise ValueError(
+                "A StrategySet needs at least 1 entry (StrategySetEntry or "
+                "IntermarketStrategySetEntry)"
+            )
         if not all(isinstance(e, StrategySetEntry) for e in entries):
             raise TypeError("StrategySet.entries must contain only StrategySetEntry instances")
+        if not all(isinstance(e, IntermarketStrategySetEntry) for e in intermarket_entries):
+            raise TypeError(
+                "StrategySet.intermarket_entries must contain only "
+                "IntermarketStrategySetEntry instances"
+            )
 
-        names = [e.name for e in entries]
+        names = [e.name for e in entries] + [e.name for e in intermarket_entries]
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
             raise ValueError(
@@ -182,3 +259,4 @@ class StrategySet:
             )
 
         object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "intermarket_entries", intermarket_entries)

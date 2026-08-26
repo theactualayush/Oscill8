@@ -25,8 +25,18 @@ import template_scanner.scanner
 from core.config import BarInterval
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import (
+    IntermarketStrategyInstance,
+    generate_intermarket_instances,
+)
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 from strategy_sets.expansion import expand_strategy_set
-from strategy_sets.model import ExpansionSettings, StrategySet, StrategySetEntry
+from strategy_sets.model import (
+    ExpansionSettings,
+    IntermarketStrategySetEntry,
+    StrategySet,
+    StrategySetEntry,
+)
 from template_scanner.universe import generate_candidates
 
 _START, _END = "2026-01-01", "2027-12-31"
@@ -182,6 +192,176 @@ def test_expand_insufficient_contracts_returns_empty_list_not_error():
     # own documented "empty, not an error" behaviour.
     s = StrategySet(name="Churning", entries=(_fly_entry(),))
     assert expand_strategy_set(s, "2026-01-01", "2026-06-30") == []
+
+
+def _basis_definition() -> IntermarketDefinition:
+    """Arbitrary two-market intermarket shape, both legs anchored at
+    offset=0 -- test data only, not a special case the engine knows
+    about."""
+    return IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)), interval=BarInterval.DAILY,
+    )
+
+
+def _calendar_definition() -> IntermarketDefinition:
+    """Arbitrary mixed-listing-cycle intermarket shape (SOFR quarterly
+    anchor, FED_FUNDS monthly non-anchor leg at offset=1) -- exercises
+    the Phase 1 corrected offset semantics through the StrategySet
+    layer, not just generate_intermarket_instances() directly."""
+    return IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("FED_FUNDS", 1, -1.0)), interval=BarInterval.DAILY,
+    )
+
+
+def _basis_entry(name="Cross-market basis", **expansion_overrides) -> IntermarketStrategySetEntry:
+    return IntermarketStrategySetEntry(
+        name=name, definition=_basis_definition(), expansion=ExpansionSettings(**expansion_overrides),
+    )
+
+
+def _calendar_entry(name="Cross-cycle calendar") -> IntermarketStrategySetEntry:
+    return IntermarketStrategySetEntry(name=name, definition=_calendar_definition())
+
+
+# ---------------------------------------------------------------------
+# Intermarket entries -- additive expansion, reusing
+# generate_intermarket_instances() unchanged (no rolling/dedup logic
+# duplicated here)
+# ---------------------------------------------------------------------
+
+def test_expand_intermarket_entry_matches_generate_intermarket_instances_directly():
+    s = StrategySet(name="Cross-market", entries=(), intermarket_entries=(_basis_entry(),))
+    expected = generate_intermarket_instances(_basis_definition(), _START, _END)
+    result = expand_strategy_set(s, _START, _END)
+    assert result == expected
+    assert all(isinstance(inst, IntermarketStrategyInstance) for inst in result)
+
+
+def test_expand_intermarket_entry_preserves_corrected_offset_semantics():
+    """Regression, through the StrategySet layer: FED_FUNDS's offset=1
+    leg must land on FED_FUNDS's OWN next contract, never the next
+    contract common to both markets' calendars (the reverted
+    "interpretation A" behavior) -- exactly the Phase 1 fix, now proven
+    reachable via expand_strategy_set() too, not just
+    generate_intermarket_instances() called directly."""
+    s = StrategySet(name="Cross-cycle", entries=(), intermarket_entries=(_calendar_entry(),))
+    result = expand_strategy_set(s, "2026-01-01", "2026-06-30")
+    assert [inst.rics for inst in result] == [("SRAH26", "FFJ26")]  # FFJ26 = April 2026, not June
+
+
+def test_expand_mixed_strategy_set_produces_one_combined_collection():
+    """Requirement: a single StrategySet containing BOTH a single-market
+    entry and an intermarket entry produces ONE combined list, not two
+    separate collections the caller has to merge themselves."""
+    s = StrategySet(
+        name="Mixed Strategies",
+        entries=(_fly_entry(), _sonia_entry()),
+        intermarket_entries=(_basis_entry(), _calendar_entry()),
+    )
+    result = expand_strategy_set(s, _START, _END)
+
+    single_market = [inst for inst in result if isinstance(inst, StrategyInstance)]
+    intermarket = [inst for inst in result if isinstance(inst, IntermarketStrategyInstance)]
+    assert len(single_market) + len(intermarket) == len(result)
+    assert single_market  # the fly/SONIA entries contributed something
+    assert intermarket  # the basis/calendar entries contributed something
+
+    expected_single = generate_candidates(_fly_definition(), _START, _END) + generate_candidates(
+        _sonia_definition(), _START, _END
+    )
+    expected_intermarket = generate_intermarket_instances(
+        _basis_definition(), _START, _END
+    ) + generate_intermarket_instances(_calendar_definition(), _START, _END)
+    assert len(single_market) == len(expected_single)
+    assert len(intermarket) == len(expected_intermarket)
+
+
+def test_expand_mixed_set_orders_all_single_market_before_all_intermarket():
+    """Documented ordering rule (see expand_strategy_set()'s own
+    "ORDERING NOTE"): the combined list is always every single-market
+    instance first, then every intermarket instance -- regardless of
+    which order the entries were constructed/passed in, and regardless
+    of original JSON interleaving. This is deterministic, just not
+    literal-original-entry-order; see the docstring for why that's an
+    accepted, documented tradeoff rather than a bug."""
+    s = StrategySet(
+        name="Mixed Strategies",
+        entries=(_fly_entry(),),
+        intermarket_entries=(_basis_entry(),),
+    )
+    result = expand_strategy_set(s, _START, _END)
+
+    kinds = [type(inst).__name__ for inst in result]
+    first_intermarket_idx = kinds.index("IntermarketStrategyInstance")
+    assert all(k == "StrategyInstance" for k in kinds[:first_intermarket_idx])
+    assert all(k == "IntermarketStrategyInstance" for k in kinds[first_intermarket_idx:])
+
+
+def test_expand_intermarket_dedupes_duplicate_entries_by_default():
+    single = expand_strategy_set(
+        StrategySet(name="A", entries=(), intermarket_entries=(_basis_entry("A"),)), _START, _END,
+    )
+    s = StrategySet(
+        name="Churning", entries=(), intermarket_entries=(_basis_entry("A"), _basis_entry("B")),
+    )
+    result = expand_strategy_set(s, _START, _END)
+    assert len(result) == len(single)
+
+
+def test_expand_intermarket_dedupe_false_keeps_duplicates():
+    single = expand_strategy_set(
+        StrategySet(name="A", entries=(), intermarket_entries=(_basis_entry("A"),)), _START, _END,
+    )
+    s = StrategySet(
+        name="Churning", entries=(), intermarket_entries=(_basis_entry("A"), _basis_entry("B")),
+    )
+    result = expand_strategy_set(s, _START, _END, dedupe=False)
+    assert len(result) == 2 * len(single)
+
+
+def test_single_market_and_intermarket_dedup_never_cross_contaminate():
+    """A single-market instance and an intermarket instance can never be
+    'the same strategy' by construction -- confirm dedup runs
+    independently per type and never accidentally drops one because it
+    superficially resembles the other."""
+    s = StrategySet(
+        name="Mixed", entries=(_fly_entry(),), intermarket_entries=(_basis_entry(),),
+    )
+    result = expand_strategy_set(s, _START, _END)
+    single_market = [inst for inst in result if isinstance(inst, StrategyInstance)]
+    intermarket = [inst for inst in result if isinstance(inst, IntermarketStrategyInstance)]
+    assert len(single_market) == len(generate_candidates(_fly_definition(), _START, _END))
+    assert len(intermarket) == len(generate_intermarket_instances(_basis_definition(), _START, _END))
+
+
+def test_expand_skips_disabled_intermarket_entries_by_default():
+    enabled_entry = _basis_entry("Enabled")
+    disabled_entry = IntermarketStrategySetEntry(
+        name="Disabled", definition=_calendar_definition(), enabled=False,
+    )
+    s = StrategySet(
+        name="Churning", entries=(), intermarket_entries=(enabled_entry, disabled_entry),
+    )
+    result = expand_strategy_set(s, _START, _END)
+    assert result == generate_intermarket_instances(_basis_definition(), _START, _END)
+
+
+def test_expand_intermarket_eligible_rics_passes_through():
+    all_instances = generate_intermarket_instances(_basis_definition(), _START, _END)
+    eligible = set(all_instances[0].rics)
+    entry = _basis_entry(eligible_rics=tuple(eligible))
+    s = StrategySet(name="Churning", entries=(), intermarket_entries=(entry,))
+    result = expand_strategy_set(s, _START, _END)
+    assert result == [inst for inst in all_instances if set(inst.rics) <= eligible]
+
+
+def test_expand_intermarket_insufficient_contracts_returns_empty_list_not_error():
+    s = StrategySet(name="Churning", entries=(), intermarket_entries=(_calendar_entry(),))
+    # SOFR anchors on March 2026 (the window's only quarterly month),
+    # but FED_FUNDS's own curve in this same window is Jan/Feb/Mar --
+    # its offset=1 leg has no "one more month past March" to resolve to,
+    # so this anchor period contributes no instance (empty, not an error).
+    assert expand_strategy_set(s, "2026-01-01", "2026-03-31") == []
 
 
 def test_scanner_module_remains_unaware_of_strategy_sets():

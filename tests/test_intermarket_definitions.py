@@ -10,7 +10,13 @@ from __future__ import annotations
 import pytest
 
 from core.config import BarInterval
-from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
+from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_definitions import (
+    IntermarketDefinition,
+    LegSpec,
+    resolve_display_market_key,
+    resolve_display_offsets,
+)
 
 
 def test_single_leg_intermarket_definition_is_valid():
@@ -168,3 +174,56 @@ def test_non_positive_bp_per_point_raises():
             interval=BarInterval.DAILY,
             bp_per_point=0.0,
         )
+
+
+# ---------------------------------------------------------------------
+# resolve_display_market_key / resolve_display_offsets -- dispatched
+# purely by TYPE (isinstance), never by inspecting a market_key VALUE.
+# Any two/three distinct registry markets exercise this identically;
+# the specific markets used here are arbitrary test data, not special
+# cases the functions know about.
+# ---------------------------------------------------------------------
+
+def test_resolve_display_market_key_returns_scalar_for_single_market():
+    d = StrategyDefinition(
+        market_key="CORRA", offsets=(0, 1), weights=(1, -1), interval=BarInterval.DAILY,
+    )
+    assert resolve_display_market_key(d) == "CORRA"
+
+
+def test_resolve_display_offsets_returns_scalar_for_single_market():
+    d = StrategyDefinition(
+        market_key="CORRA", offsets=(0, 2, 4), weights=(1, -2, 1), interval=BarInterval.DAILY,
+    )
+    assert resolve_display_offsets(d) == (0, 2, 4)
+
+
+def test_resolve_display_market_key_joins_leg_markets_in_order_for_intermarket():
+    d = IntermarketDefinition(
+        legs=(LegSpec("FED_FUNDS", 0, 1.0), LegSpec("SOFR", 1, -1.0), LegSpec("CORRA", 0, 2.0)),
+        interval=BarInterval.DAILY,
+    )
+    assert resolve_display_market_key(d) == "FED_FUNDS/SOFR/CORRA"
+
+
+def test_resolve_display_offsets_returns_per_leg_offsets_in_order_for_intermarket():
+    d = IntermarketDefinition(
+        legs=(LegSpec("FED_FUNDS", 0, 1.0), LegSpec("SOFR", 1, -1.0), LegSpec("CORRA", 0, 2.0)),
+        interval=BarInterval.DAILY,
+    )
+    assert resolve_display_offsets(d) == (0, 1, 0)
+
+
+def test_resolve_display_functions_never_depend_on_which_markets_are_present():
+    """The resolver's OUTPUT shape/behavior is identical regardless of
+    WHICH two markets are combined -- swapping in a different market
+    pair changes only the label content, never the code path taken."""
+    pair_one = IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("SONIA", 0, -1.0)), interval=BarInterval.DAILY,
+    )
+    pair_two = IntermarketDefinition(
+        legs=(LegSpec("EURIBOR", 0, 1.0), LegSpec("SARON", 0, -1.0)), interval=BarInterval.DAILY,
+    )
+    assert resolve_display_market_key(pair_one) == "SOFR/SONIA"
+    assert resolve_display_market_key(pair_two) == "EURIBOR/SARON"
+    assert resolve_display_offsets(pair_one) == resolve_display_offsets(pair_two) == (0, 0)

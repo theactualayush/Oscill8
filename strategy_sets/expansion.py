@@ -63,17 +63,18 @@ pipeline.py and tests/test_multimarket_cache_key_independence.py for
 the regression coverage proving both paths keep every entry's market,
 interval, RICs, and cached history fully independent of one another.
 
-A future intermarket "Set A" (one combined strategy whose own legs
-belong to different markets, e.g. SOFR +1 / CORRA -1 priced and
-analyzed as a SINGLE series) is not part of either path today, and
-won't be a variation of either one when it arrives: today's
-StrategyDefinition is deliberately single-market_key (see strategy_
-engine/definitions.py and template_scanner/templates.py's own scope
-notes), and build_history()'s leg alignment assumes every leg shares
-one instance's interval/calendar. "Set A" is expected to need an
-additive sibling concept alongside today's StrategyDefinition/
-StrategyInstance, not a change to either of the two entry points
-described above -- not started, not designed yet.
+Intermarket entries (Phase 2, additive): `StrategySet.intermarket_entries`
+(strategy_sets/model.py) holds any entries whose legs span different
+markets -- expand_strategy_set() below now ALSO rolls those, via the
+existing, UNMODIFIED strategy_engine.intermarket_combinations.
+generate_intermarket_instances() (exactly the same "this module adds no
+new rolling/dedup logic of its own" principle as the single-market loop
+above), and returns ONE combined list mixing both instance types. No
+change was needed to generate_intermarket_instances() itself, to
+build_history()/prewarm_leg_cache(), or to template_scanner.scanner.
+run_scan_on_instances() -- all three already operate on `.rics` alone,
+agnostic to which instance type they're given (see each module's own
+docstring for confirmation of exactly what it reads off an instance).
 """
 
 from __future__ import annotations
@@ -81,7 +82,15 @@ from __future__ import annotations
 from core.utils import DateLike, get_logger
 
 from strategy_engine.combinations import StrategyInstance
-from template_scanner.universe import dedupe_candidates, generate_candidates
+from strategy_engine.intermarket_combinations import (
+    IntermarketStrategyInstance,
+    generate_intermarket_instances,
+)
+from template_scanner.universe import (
+    dedupe_candidates,
+    dedupe_intermarket_candidates,
+    generate_candidates,
+)
 
 from strategy_sets.model import StrategySet
 
@@ -94,10 +103,13 @@ def expand_strategy_set(
     contract_end: DateLike,
     only_enabled: bool = True,
     dedupe: bool = True,
-) -> list[StrategyInstance]:
+) -> list[StrategyInstance | IntermarketStrategyInstance]:
     """Roll every (by default, enabled-only) entry in `strategy_set`
+    (both `strategy_set.entries` and `strategy_set.intermarket_entries`)
     across the SAME `contract_start`/`contract_end` window and combine
-    the results into one list of StrategyInstance.
+    the results into ONE list, single-market and intermarket instances
+    freely mixed -- ready to pass directly to template_scanner.scanner.
+    run_scan_on_instances().
 
     `contract_start`/`contract_end` are supplied here, not stored on
     the StrategySet or any entry, so the same saved set can be expanded
@@ -105,27 +117,60 @@ def expand_strategy_set(
     exactly matching template_scanner.scanner.ScanRequest's own
     contract_start/contract_end, one shared window per call/request.
 
-    Each entry's own `max_curve_position`/`eligible_rics`
-    (StrategySetEntry.expansion) ARE still applied per entry -- those
-    are strategy-shape/liquidity-dependent filters, not a calendar
-    concept, so they stay independent per entry even though the window
-    itself is shared.
+    Each entry's own `eligible_rics` (StrategySetEntry.expansion /
+    IntermarketStrategySetEntry.expansion) IS still applied per entry,
+    for both entry types -- it needs no single-shared-curve concept,
+    applying identically to any instance via its own `.rics`.
+    `max_curve_position` is applied per single-market entry exactly as
+    before; it is rejected at IntermarketStrategySetEntry construction
+    time instead (see strategy_sets/model.py), since "curve position"
+    has no defined meaning once legs span different markets/curves.
 
-    `only_enabled` (default True) skips any entry whose `enabled` flag
-    is False -- e.g. a strategy temporarily switched off without being
-    removed from the set. Set False to expand every entry regardless
-    of its enabled flag.
+    `only_enabled` (default True) skips any entry (of either type)
+    whose `enabled` flag is False. Set False to expand every entry
+    regardless of its enabled flag.
 
-    `dedupe` (default True) removes exact duplicate StrategyInstances
-    (same market, RICs, weights, interval, price_field) that can arise
-    when two entries happen to roll into the same concrete instance --
-    see template_scanner.universe.dedupe_candidates. Set False to keep
-    one instance per entry even if some turn out identical.
+    `dedupe` (default True) removes exact duplicates WITHIN each
+    instance type independently -- see template_scanner.universe.
+    dedupe_candidates() (single-market) and dedupe_intermarket_
+    candidates() (intermarket). The two types are never compared
+    against each other for dedup purposes: a single-market instance and
+    an intermarket instance can never be "the same strategy" by
+    construction (their definitions are different types entirely), so
+    no cross-type dedup step exists or is needed.
 
-    Returns [] (not an error) if `strategy_set` has no enabled entries,
-    or if the contract window doesn't contain enough listed contracts
-    to fill some entry's largest offset span -- inherited unchanged
-    from strategy_engine.generate_instances().
+    Returns [] (not an error) if `strategy_set` has no enabled entries
+    of either type, or if the contract window doesn't contain enough
+    listed contracts to fill some entry's largest offset span --
+    inherited unchanged from strategy_engine.generate_instances()/
+    generate_intermarket_instances().
+
+    ORDERING NOTE (Phase 2 design review): the returned list is always
+    every single-market instance (in `strategy_set.entries` order)
+    followed by every intermarket instance (in `strategy_set.
+    intermarket_entries` order) -- NOT necessarily the original relative
+    order entries appeared in when a StrategySet was deserialized from
+    one JSON `entries` array (see strategy_sets/serialization.py's own
+    "Intermarket entries" docstring section), since that original
+    cross-type interleaving is not retained once split into these two
+    separate, typed collections. This was deliberately NOT "fixed" by
+    adding order-tracking to StrategySet, for two reasons: (1) doing so
+    would need a real change to StrategySet's stored shape (a new field
+    plus a new cross-field consistency invariant to validate), which is
+    a materially bigger change than anything else in this phase for a
+    narrow benefit; (2) the only current consumer that displays
+    ScanCandidateResult order to a trader (ui/results_view.py's results
+    grid) ALWAYS applies a ranking before display -- its own
+    `_current_rank_state()` defaults `primary_field` to the first
+    available rank metric rather than "no ranking", so this raw,
+    pre-ranking order is never actually what a trader sees. It is
+    directly observable only to a caller that inspects ScanReport.
+    results (or this function's own return value) without ranking --
+    e.g. a test, or a future non-UI consumer -- and is fully
+    deterministic (stable within each type, single-market always first
+    across types) even though it isn't literal-JSON-order. Revisit if a
+    future UI ever lets a trader author/reorder intermarket entries
+    directly and displays raw scan order without ranking.
     """
     instances: list[StrategyInstance] = []
     skipped_disabled = 0
@@ -148,9 +193,29 @@ def expand_strategy_set(
     if dedupe:
         instances = dedupe_candidates(instances)
 
+    intermarket_instances: list[IntermarketStrategyInstance] = []
+    skipped_intermarket_disabled = 0
+    for entry in strategy_set.intermarket_entries:
+        if only_enabled and not entry.enabled:
+            skipped_intermarket_disabled += 1
+            continue
+
+        generated = generate_intermarket_instances(entry.definition, contract_start, contract_end)
+        if entry.expansion.eligible_rics is not None:
+            eligible = set(entry.expansion.eligible_rics)
+            generated = [inst for inst in generated if set(inst.rics) <= eligible]
+        intermarket_instances.extend(generated)
+
+    if dedupe:
+        intermarket_instances = dedupe_intermarket_candidates(intermarket_instances)
+
+    combined: list[StrategyInstance | IntermarketStrategyInstance] = instances + intermarket_instances
+
     logger.debug(
-        "expand_strategy_set: '%s' (%d entrie(s), %d skipped disabled) -> %d instance(s) [%s -> %s]",
-        strategy_set.name, len(strategy_set.entries), skipped_disabled, len(instances),
-        contract_start, contract_end,
+        "expand_strategy_set: '%s' (%d entrie(s), %d skipped disabled; %d intermarket "
+        "entrie(s), %d skipped disabled) -> %d instance(s) [%s -> %s]",
+        strategy_set.name, len(strategy_set.entries), skipped_disabled,
+        len(strategy_set.intermarket_entries), skipped_intermarket_disabled,
+        len(combined), contract_start, contract_end,
     )
-    return instances
+    return combined

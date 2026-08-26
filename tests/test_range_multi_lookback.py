@@ -29,6 +29,8 @@ from range_analytics import (
 )
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import IntermarketStrategyInstance
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
 from strategy_engine.pricing import StrategyHistory
 
 
@@ -41,6 +43,28 @@ def _history(dates: list[str], values: list[float], market_key: str = "SOFR") ->
         {
             "Date": pd.to_datetime(dates),
             "Leg_1": values,
+            "Strategy": values,
+        }
+    )
+    return StrategyHistory(instance=instance, price_field="Close", history=df)
+
+
+def _intermarket_history(
+    dates: list[str], values: list[float], bp_per_point: float | None = None,
+) -> StrategyHistory:
+    """Arbitrary two-market intermarket fixture -- SOFR/CORRA are test
+    data, not a case analyze_multi_lookback() knows about specifically."""
+    definition = IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 0, -1.0)),
+        interval=BarInterval.DAILY,
+        bp_per_point=bp_per_point,
+    )
+    instance = IntermarketStrategyInstance(definition=definition, rics=("SRAH26", "CRAH6"))
+    df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(dates),
+            "Leg_1": values,
+            "Leg_2": [0.0] * len(values),
             "Strategy": values,
         }
     )
@@ -445,3 +469,48 @@ def test_range_to_volatility_ratio_is_large_for_a_smooth_trend_not_only_oscillat
     assert result.efficiency_ratio == pytest.approx(1.0)
     assert result.hysteresis_crossing_count <= 1
     assert range_to_volatility_ratio(result) > 100  # large, despite being a pure trend
+
+
+# ---------------------------------------------------------------------
+# Intermarket integration
+# ---------------------------------------------------------------------
+
+def test_analyze_multi_lookback_intermarket_market_key_is_display_composite():
+    dates = _dates(150)
+    values = [1.0 + 0.01 * math.sin(i / 5) for i in range(150)]
+    history = _intermarket_history(dates, values, bp_per_point=100.0)
+
+    result = analyze_multi_lookback(history, lookbacks=(20, 40))
+
+    assert result.market_key == "SOFR/CORRA"
+    assert all(r.market_key == "SOFR/CORRA" for r in result.per_lookback)
+
+
+def test_range_to_volatility_ratio_uses_result_bp_per_point_not_market_key_lookup():
+    """range_to_volatility_ratio() must never call a market-registry
+    lookup with `result.market_key` -- for an intermarket result that
+    string ("SOFR/CORRA") is not a registered market and would raise
+    KeyError if it were. It must use `result.bp_per_point` (already
+    resolved once by analyze_range()) instead."""
+    dates = _dates(150)
+    values = [1.0 + 0.01 * math.sin(i / 5) for i in range(150)]
+    history = _intermarket_history(dates, values, bp_per_point=100.0)
+
+    result = analyze_range(history, lookback=100)
+
+    assert result.market_key == "SOFR/CORRA"  # confirm it's the composite, non-registry label
+    ratio = range_to_volatility_ratio(result)
+    assert not math.isnan(ratio)
+    expected = (result.range_width_robust * 100.0) / result.realized_vol_bp
+    assert ratio == pytest.approx(expected)
+
+
+def test_range_to_volatility_ratio_nan_when_intermarket_has_no_bp_per_point():
+    dates = _dates(150)
+    values = [1.0 + 0.01 * math.sin(i / 5) for i in range(150)]
+    history = _intermarket_history(dates, values, bp_per_point=None)
+
+    result = analyze_range(history, lookback=100)
+
+    assert math.isnan(result.bp_per_point)
+    assert math.isnan(range_to_volatility_ratio(result))

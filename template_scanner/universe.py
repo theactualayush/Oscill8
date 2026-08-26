@@ -26,6 +26,7 @@ from core.utils import DateLike, get_logger
 
 from strategy_engine.combinations import StrategyInstance, generate_instances
 from strategy_engine.definitions import StrategyDefinition
+from strategy_engine.intermarket_combinations import IntermarketStrategyInstance
 
 logger = get_logger(__name__)
 
@@ -138,6 +139,45 @@ def dedupe_candidates(instances: list[StrategyInstance]) -> list[StrategyInstanc
     result: list[StrategyInstance] = []
     for instance in instances:
         key = _candidate_identity(instance)
+        if key not in seen:
+            seen.add(key)
+            result.append(instance)
+    return result
+
+
+def _intermarket_candidate_identity(instance: IntermarketStrategyInstance) -> tuple:
+    """Deterministic identity for intermarket deduplication -- the exact
+    same philosophy as _candidate_identity() above (identity is the
+    REALIZED instance: which RICs, which weights, which interval/price
+    field -- never the abstract legs/offsets that generated it), with
+    `definition.market_key` (a single string, meaningless for an
+    IntermarketDefinition) replaced by `definition.market_keys` (the
+    tuple of every leg's own market, in leg order).
+    """
+    definition = instance.definition
+    return (
+        definition.market_keys,
+        instance.rics,
+        definition.weights,
+        definition.interval,
+        definition.price_field,
+    )
+
+
+def dedupe_intermarket_candidates(
+    instances: list[IntermarketStrategyInstance],
+) -> list[IntermarketStrategyInstance]:
+    """Remove exact duplicate IntermarketStrategyInstances -- same leg
+    markets (in order), same RICs, same weights (unscaled), same
+    interval, same price_field -- keeping the first occurrence and
+    preserving order. Sibling to dedupe_candidates() above; does not
+    modify it and is never called on a mix of the two instance types --
+    each type is deduped against its own kind only.
+    """
+    seen: set[tuple] = set()
+    result: list[IntermarketStrategyInstance] = []
+    for instance in instances:
+        key = _intermarket_candidate_identity(instance)
         if key not in seen:
             seen.add(key)
             result.append(instance)

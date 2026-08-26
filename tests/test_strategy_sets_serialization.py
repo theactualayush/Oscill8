@@ -13,13 +13,23 @@ import pytest
 
 from core.config import BarInterval
 from strategy_engine.definitions import StrategyDefinition
-from strategy_sets.model import ExpansionSettings, StrategySet, StrategySetEntry
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
+from strategy_sets.model import (
+    ExpansionSettings,
+    IntermarketStrategySetEntry,
+    StrategySet,
+    StrategySetEntry,
+)
 from strategy_sets.serialization import (
     SCHEMA_VERSION,
     entry_from_dict,
     entry_to_dict,
     expansion_from_dict,
     expansion_to_dict,
+    intermarket_entry_from_dict,
+    intermarket_entry_to_dict,
+    leg_from_dict,
+    leg_to_dict,
     strategy_set_from_dict,
     strategy_set_from_json,
     strategy_set_to_dict,
@@ -360,3 +370,174 @@ def test_strategy_set_json_loads_without_a_persisted_contract_window():
     )
     restored = strategy_set_from_json(text)
     assert restored.entries[0].expansion == ExpansionSettings()
+
+
+# ---------------------------------------------------------------------
+# Intermarket entries -- discriminated by "legs" key presence, same
+# "entries" array
+# ---------------------------------------------------------------------
+
+def _intermarket_entry() -> IntermarketStrategySetEntry:
+    definition = IntermarketDefinition(
+        legs=(LegSpec("SOFR", 0, 1.0), LegSpec("CORRA", 1, -1.0)),
+        interval=BarInterval.DAILY,
+        bp_per_point=50.0,
+    )
+    return IntermarketStrategySetEntry(name="Cross-market basis", definition=definition)
+
+
+def test_leg_round_trips():
+    leg = LegSpec("SOFR", 2, -1.5)
+    assert leg_from_dict(leg_to_dict(leg)) == leg
+
+
+def test_leg_from_dict_missing_key_raises_clear_value_error():
+    with pytest.raises(ValueError, match="market_key"):
+        leg_from_dict({"offset": 0, "weight": 1.0})
+
+
+def test_intermarket_entry_to_dict_shape():
+    data = intermarket_entry_to_dict(_intermarket_entry())
+    assert data["name"] == "Cross-market basis"
+    assert data["enabled"] is True
+    assert data["legs"] == [
+        {"market_key": "SOFR", "offset": 0, "weight": 1.0},
+        {"market_key": "CORRA", "offset": 1, "weight": -1.0},
+    ]
+    assert data["interval"] == "DAILY"
+    assert data["price_field"] == "Close"
+    assert data["bp_per_point"] == 50.0
+    assert "market_key" not in data  # never a flat single market_key, unlike entry_to_dict
+    assert "offsets" not in data
+    assert "weights" not in data
+
+
+def test_intermarket_entry_round_trips():
+    original = _intermarket_entry()
+    restored = intermarket_entry_from_dict(intermarket_entry_to_dict(original))
+    assert restored.name == original.name
+    assert restored.definition.legs == original.definition.legs
+    assert restored.definition.interval == original.definition.interval
+    assert restored.definition.bp_per_point == original.definition.bp_per_point
+
+
+def test_intermarket_entry_from_dict_missing_required_key_raises_clear_value_error():
+    with pytest.raises(ValueError, match="legs"):
+        intermarket_entry_from_dict({"name": "Bad", "interval": "DAILY"})
+
+
+def test_intermarket_entry_from_dict_defaults_price_field_bp_per_point_expansion():
+    entry = intermarket_entry_from_dict(
+        {
+            "name": "Minimal",
+            "legs": [
+                {"market_key": "SOFR", "offset": 0, "weight": 1.0},
+                {"market_key": "CORRA", "offset": 0, "weight": -1.0},
+            ],
+            "interval": "DAILY",
+        }
+    )
+    assert entry.definition.price_field == "Close"
+    assert entry.definition.bp_per_point is None
+    assert entry.expansion == ExpansionSettings()
+
+
+def test_intermarket_entry_from_dict_propagates_domain_validation_unmodified():
+    # An unknown market_key is IntermarketDefinition/LegSpec's own
+    # __post_init__ validation, not a missing-JSON-key error.
+    with pytest.raises(KeyError):
+        intermarket_entry_from_dict(
+            {
+                "name": "Bad",
+                "legs": [{"market_key": "NOT_A_MARKET", "offset": 0, "weight": 1.0}],
+                "interval": "DAILY",
+            }
+        )
+
+
+# ---------------------------------------------------------------------
+# StrategySet-level: one JSON "entries" array, discriminated per item
+# ---------------------------------------------------------------------
+
+def test_strategy_set_round_trips_a_pure_intermarket_set():
+    original = StrategySet(
+        name="Cross-market Only", entries=(), intermarket_entries=(_intermarket_entry(),),
+    )
+    restored = strategy_set_from_dict(strategy_set_to_dict(original))
+    assert restored.entries == ()
+    assert len(restored.intermarket_entries) == 1
+    assert restored.intermarket_entries[0].name == "Cross-market basis"
+
+
+def test_strategy_set_round_trips_a_mixed_set():
+    original = StrategySet(
+        name="Mixed Strategies",
+        entries=(_fly_entry(),),
+        intermarket_entries=(_intermarket_entry(),),
+    )
+    data = strategy_set_to_dict(original)
+
+    # Both shapes land in the SAME "entries" array.
+    assert len(data["entries"]) == 2
+    assert any("legs" in e for e in data["entries"])
+    assert any("market_key" in e for e in data["entries"])
+
+    restored = strategy_set_from_dict(data)
+    assert len(restored.entries) == 1
+    assert restored.entries[0].name == "SOFR Fly"
+    assert len(restored.intermarket_entries) == 1
+    assert restored.intermarket_entries[0].name == "Cross-market basis"
+
+
+def test_strategy_set_from_dict_discriminates_by_legs_key_not_by_name():
+    """An entry named to LOOK like an intermarket strategy (or vice
+    versa) must still be parsed by its actual JSON shape, never by its
+    name string."""
+    data = {
+        "schema_version": SCHEMA_VERSION,
+        "name": "Naming Trap",
+        "description": "",
+        "entries": [
+            {
+                "name": "This Looks Like An Intermarket Spread",
+                "enabled": True,
+                "market_key": "SOFR",
+                "offsets": [0, 1],
+                "weights": [1.0, -1.0],
+                "interval": "DAILY",
+                "price_field": "Close",
+                "expansion": {"max_curve_position": None, "eligible_rics": None},
+            },
+            {
+                "name": "This Looks Like An Ordinary Fly",
+                "enabled": True,
+                "legs": [
+                    {"market_key": "SOFR", "offset": 0, "weight": 1.0},
+                    {"market_key": "CORRA", "offset": 0, "weight": -1.0},
+                ],
+                "interval": "DAILY",
+                "price_field": "Close",
+                "bp_per_point": None,
+                "expansion": {"max_curve_position": None, "eligible_rics": None},
+            },
+        ],
+    }
+    restored = strategy_set_from_dict(data)
+    assert len(restored.entries) == 1
+    assert restored.entries[0].name == "This Looks Like An Intermarket Spread"
+    assert len(restored.intermarket_entries) == 1
+    assert restored.intermarket_entries[0].name == "This Looks Like An Ordinary Fly"
+
+
+def test_existing_single_market_only_json_is_byte_identical_on_round_trip():
+    """Backward compatibility: a file with no 'legs' anywhere parses and
+    re-serializes with intermarket_entries staying empty, and the
+    existing single-market entry_to_dict()/entry_from_dict() functions
+    are never even reached differently than before this feature existed."""
+    original = StrategySet(name="Legacy Only", entries=(_fly_entry(), _sonia_entry()))
+    data = strategy_set_to_dict(original)
+    assert not any("legs" in e for e in data["entries"])
+
+    restored = strategy_set_from_dict(data)
+    assert restored.intermarket_entries == ()
+    assert [e.name for e in restored.entries] == [e.name for e in original.entries]

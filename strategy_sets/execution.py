@@ -17,8 +17,17 @@ without editing every row.
 Architecture (see the design discussion this module implements):
     StrategySet
         -> with_interval_override()   -- transient copy, interval only
-        -> strategy_sets.expansion.expand_strategy_set()   -- UNMODIFIED
-        -> template_scanner.scanner.run_scan_on_instances() -- UNMODIFIED
+        -> strategy_sets.expansion.expand_strategy_set()
+        -> template_scanner.scanner.run_scan_on_instances()
+
+Intermarket note (Phase 2): expand_strategy_set() and
+run_scan_on_instances() both already handle a StrategySet's
+intermarket_entries alongside its entries with no further change needed
+in THIS module beyond the with_interval_override() fix described on
+that function itself -- this module still adds no candidate-generation,
+dedup, pricing, or analytics logic of its own; both flow through
+verbatim, single-market and intermarket instances alike, exactly as
+they already did for single-market-only StrategySets.
 
 run_scan_on_instances() is not a parallel implementation of run_scan()
 -- run_scan() itself calls it internally after its own candidate-
@@ -76,22 +85,42 @@ logger = get_logger(__name__)
 
 def with_interval_override(strategy_set: StrategySet, interval: BarInterval) -> StrategySet:
     """A new, transient StrategySet -- never saved, never written back to
-    the repository -- identical to `strategy_set` except every entry's
-    StrategyDefinition.interval is replaced with `interval`. Every other
-    field (market_key, offsets, weights, price_field, expansion filters,
+    the repository -- identical to `strategy_set` except EVERY entry's
+    (both `entries` and `intermarket_entries`) definition.interval is
+    replaced with `interval`. Every other field (market_key/legs,
+    offsets, weights, price_field, bp_per_point, expansion filters,
     enabled flag, entry/set names) is preserved unchanged.
 
+    Bug fixed here (Phase 2 hardening pass): an earlier version of this
+    function only rebuilt `strategy_set.entries`, silently leaving
+    `strategy_set.intermarket_entries` at their ORIGINAL interval --
+    contradicting this function's own "every entry" contract for any
+    StrategySet containing intermarket entries. `intermarket_entries`
+    did not exist when this function was first written; it was not
+    updated when that field was added. Both collections are now
+    rebuilt identically.
+
     Uses dataclasses.replace() on the frozen StrategySet/StrategySetEntry/
-    StrategyDefinition dataclasses, which re-runs each object's own
-    __post_init__ validation for free -- an invalid override (e.g. an
-    interval string that doesn't coerce to a real BarInterval) fails the
-    same way constructing any StrategyDefinition would, not silently.
+    IntermarketStrategySetEntry/StrategyDefinition/IntermarketDefinition
+    dataclasses, which re-runs each object's own __post_init__
+    validation for free -- an invalid override (e.g. an interval string
+    that doesn't coerce to a real BarInterval) fails the same way
+    constructing any StrategyDefinition/IntermarketDefinition would, not
+    silently.
     """
     overridden_entries = tuple(
         replace(entry, definition=replace(entry.definition, interval=interval))
         for entry in strategy_set.entries
     )
-    return replace(strategy_set, entries=overridden_entries)
+    overridden_intermarket_entries = tuple(
+        replace(entry, definition=replace(entry.definition, interval=interval))
+        for entry in strategy_set.intermarket_entries
+    )
+    return replace(
+        strategy_set,
+        entries=overridden_entries,
+        intermarket_entries=overridden_intermarket_entries,
+    )
 
 
 def run_strategy_set(

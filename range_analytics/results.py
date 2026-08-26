@@ -20,6 +20,7 @@ import pandas as pd
 
 from core.config import BarInterval
 from core.utils import DateLike, get_logger
+from strategy_engine.intermarket_definitions import resolve_display_market_key
 from strategy_engine.pricing import StrategyHistory
 
 from range_analytics import efficiency, location, movement, oscillation, units, volatility
@@ -39,9 +40,23 @@ class RangeAnalytics:
     unavailable (e.g. too few observations, a zero denominator) -- no
     field is ever fabricated. No field here classifies, scores, or
     ranks a strategy; those decisions belong to a later module.
+
+    `market_key` is a DISPLAY label (strategy_engine.intermarket_
+    definitions.resolve_display_market_key) -- for a single-market
+    StrategyDefinition it is the real, registrable market_key; for an
+    IntermarketDefinition it is a cosmetic "/"-joined composite (e.g.
+    "MARKET_A/MARKET_B") that is NOT a registry key and must never be
+    passed to core.config.get_market/core.providers.resolve_provider/
+    any other market-identity lookup. `bp_per_point` is the resolved
+    conversion factor actually used for `realized_vol_bp`/
+    `mean_abs_change_bp` below (see range_analytics.units.
+    resolve_bp_per_point) -- NaN when no valid conversion is available
+    (an intermarket strategy with no explicit bp_per_point override),
+    never fabricated from any one leg's market.
     """
 
     market_key: str
+    bp_per_point: float
     interval: BarInterval
     window_start: pd.Timestamp
     window_end: pd.Timestamp
@@ -159,8 +174,13 @@ def analyze_range(
     n = len(series)
 
     definition = history.instance.definition
-    market_key = definition.market_key
+    market_key = resolve_display_market_key(definition)
     interval = definition.interval
+
+    try:
+        bp_per_point = units.resolve_bp_per_point(definition)
+    except units.BpConversionUnavailable:
+        bp_per_point = float("nan")
 
     window_start = window["Date"].iloc[0] if n else pd.NaT
     window_end = window["Date"].iloc[-1] if n else pd.NaT
@@ -183,7 +203,7 @@ def analyze_range(
     z = location.z_score(current, mean_value, std_value)
 
     vol_price = volatility.realized_volatility(series)
-    vol_bp = units.price_to_bp(vol_price, market_key)
+    vol_bp = vol_price * bp_per_point
 
     er = efficiency.efficiency_ratio(series)
 
@@ -195,7 +215,7 @@ def analyze_range(
     oscillation_count = oscillation.count_oscillations(series, low_robust, high_robust)
 
     mean_abs_change_price = movement.mean_absolute_change(series)
-    mean_abs_change_bp = units.price_to_bp(mean_abs_change_price, market_key)
+    mean_abs_change_bp = mean_abs_change_price * bp_per_point
 
     ar1 = fit_ar1(series)
 
@@ -206,6 +226,7 @@ def analyze_range(
 
     return RangeAnalytics(
         market_key=market_key,
+        bp_per_point=bp_per_point,
         interval=interval,
         window_start=window_start,
         window_end=window_end,

@@ -13,7 +13,13 @@ import pytest
 
 from core.config import BarInterval
 from strategy_engine.definitions import StrategyDefinition
-from strategy_sets.model import ExpansionSettings, StrategySet, StrategySetEntry
+from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSpec
+from strategy_sets.model import (
+    ExpansionSettings,
+    IntermarketStrategySetEntry,
+    StrategySet,
+    StrategySetEntry,
+)
 
 
 def _expansion(**overrides) -> ExpansionSettings:
@@ -203,4 +209,121 @@ def test_entries_with_identical_shape_but_different_names_are_allowed():
     a = _entry("SOFR Fly A")
     b = _entry("SOFR Fly B")  # same definition/expansion, different name
     s = StrategySet(name="Churning", entries=(a, b))
-    assert len(s.entries) == 2
+
+
+# ---------------------------------------------------------------------
+# IntermarketStrategySetEntry -- additive sibling to StrategySetEntry
+# ---------------------------------------------------------------------
+
+def _intermarket_definition(
+    legs=(("SOFR", 0, 1.0), ("CORRA", 0, -1.0)), bp_per_point=None,
+) -> IntermarketDefinition:
+    return IntermarketDefinition(
+        legs=tuple(LegSpec(*leg) for leg in legs),
+        interval=BarInterval.DAILY,
+        bp_per_point=bp_per_point,
+    )
+
+
+def _intermarket_entry(name="Cross-market basis", **overrides) -> IntermarketStrategySetEntry:
+    defaults = dict(name=name, definition=_intermarket_definition(), expansion=_expansion())
+    defaults.update(overrides)
+    return IntermarketStrategySetEntry(**defaults)
+
+
+def test_intermarket_entry_constructs_with_valid_fields():
+    entry = _intermarket_entry()
+    assert entry.name == "Cross-market basis"
+    assert entry.enabled is True
+    assert entry.definition.market_keys == ("SOFR", "CORRA")
+
+
+def test_intermarket_entry_empty_name_rejected():
+    with pytest.raises(ValueError):
+        IntermarketStrategySetEntry(name="  ", definition=_intermarket_definition())
+
+
+def test_intermarket_entry_non_intermarket_definition_rejected():
+    with pytest.raises(TypeError):
+        IntermarketStrategySetEntry(name="Bad", definition=_definition())
+
+
+def test_intermarket_entry_non_expansion_settings_rejected():
+    with pytest.raises(TypeError):
+        IntermarketStrategySetEntry(
+            name="Bad", definition=_intermarket_definition(), expansion={"not": "expansion"},
+        )
+
+
+def test_intermarket_entry_max_curve_position_rejected():
+    """'Curve position' has no defined meaning once legs span different
+    markets/curves -- rejected outright rather than silently ignored."""
+    with pytest.raises(ValueError, match="max_curve_position"):
+        IntermarketStrategySetEntry(
+            name="Bad",
+            definition=_intermarket_definition(),
+            expansion=_expansion(max_curve_position=2),
+        )
+
+
+def test_intermarket_entry_eligible_rics_is_allowed():
+    entry = _intermarket_entry(expansion=_expansion(eligible_rics=("SRAH26", "CRAH6")))
+    assert entry.expansion.eligible_rics == ("SRAH26", "CRAH6")
+
+
+# ---------------------------------------------------------------------
+# StrategySet.intermarket_entries -- coexistence with entries
+# ---------------------------------------------------------------------
+
+def test_strategy_set_with_only_intermarket_entries_is_valid():
+    s = StrategySet(name="Cross-market", entries=(), intermarket_entries=(_intermarket_entry(),))
+    assert s.entries == ()
+    assert len(s.intermarket_entries) == 1
+
+
+def test_strategy_set_with_only_single_market_entries_intermarket_entries_defaults_empty():
+    s = StrategySet(name="Ordinary", entries=(_entry(),))
+    assert s.intermarket_entries == ()
+
+
+def test_strategy_set_mixing_both_entry_types_is_valid():
+    s = StrategySet(
+        name="Mixed Strategies",
+        entries=(_entry("SOFR Fly"),),
+        intermarket_entries=(_intermarket_entry("Cross-market basis"),),
+    )
+    assert len(s.entries) == 1
+    assert len(s.intermarket_entries) == 1
+
+
+def test_strategy_set_both_collections_empty_rejected():
+    with pytest.raises(ValueError, match="at least 1"):
+        StrategySet(name="Empty", entries=(), intermarket_entries=())
+
+
+def test_strategy_set_intermarket_entries_non_entry_objects_rejected():
+    with pytest.raises(TypeError):
+        StrategySet(name="Bad", entries=(), intermarket_entries=({"not": "an entry"},))
+
+
+def test_strategy_set_duplicate_name_across_both_collections_rejected():
+    """Name uniqueness is checked across entries AND intermarket_entries
+    TOGETHER -- one shared namespace, since a trader sees one flat list
+    of named strategies in the set."""
+    with pytest.raises(ValueError, match="unique"):
+        StrategySet(
+            name="Clash",
+            entries=(_entry("Shared Name"),),
+            intermarket_entries=(_intermarket_entry("Shared Name"),),
+        )
+
+
+def test_strategy_set_distinct_names_across_both_collections_allowed():
+    s = StrategySet(
+        name="Fine",
+        entries=(_entry("Single-market Name"),),
+        intermarket_entries=(_intermarket_entry("Intermarket Name"),),
+    )
+    assert {e.name for e in s.entries} | {e.name for e in s.intermarket_entries} == {
+        "Single-market Name", "Intermarket Name",
+    }

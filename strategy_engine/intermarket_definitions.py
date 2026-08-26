@@ -46,15 +46,16 @@ class LegSpec:
     """One leg of an IntermarketDefinition: its own market, its own
     offset into that market's contract calendar, and its own weight.
 
-    `offset` is NOT an index into this leg's own market's raw contract
-    list -- it is an index into the SHARED, calendar-month-aligned
-    sequence computed across every leg's market in one
-    IntermarketDefinition (see intermarket_combinations.
-    generate_intermarket_instances). `offset=0` means "this leg's
-    contract at the shared window's current aligned position";
-    `offset=1` means "this leg's contract at the next aligned position"
-    -- never simply "the next contract on this market's own curve" once
-    that curve has been intersected with another market's.
+    `offset` is a position on THIS LEG'S OWN contract curve, counted
+    forward from the nearest position at or after the current anchor
+    period (see intermarket_combinations.generate_intermarket_instances
+    for the full algorithm). `offset=0` legs collectively define the
+    anchor period (their calendars are intersected to find valid shared
+    anchor months); a non-anchor leg's `offset=1` means "the next
+    contract on THIS market's own curve after the anchor month" -- it is
+    NEVER an index into a curve shared/intersected across all legs,
+    which would make its meaning depend on which other markets happen to
+    share the same IntermarketDefinition.
     """
 
     market_key: str
@@ -143,3 +144,39 @@ class IntermarketDefinition:
         which market produced which leg (e.g. tests, future analytics)
         without re-parsing RICs."""
         return tuple(leg.market_key for leg in self.legs)
+
+
+def resolve_display_market_key(definition) -> str:
+    """A human-readable market label for ANY strategy definition --
+    strategy_engine.definitions.StrategyDefinition (single-market) or
+    IntermarketDefinition (this module) -- dispatched purely by TYPE,
+    never by inspecting a specific market_key value (no
+    `if market_key == "..."` anywhere).
+
+    DISPLAY ONLY. Never pass this value into provider resolution
+    (core.providers.resolve_provider), cache lookup, QuantHub/LSEG
+    instrument mapping, core.config market-registry lookups, or bp
+    conversion -- all of those operate strictly per RIC or per single
+    LegSpec/StrategyDefinition.market_key, never via a composite label.
+    An intermarket definition's label here is simply its leg market
+    keys joined with "/" in leg order -- purely cosmetic, carries no
+    identity/economic meaning of its own.
+    """
+    if isinstance(definition, IntermarketDefinition):
+        return "/".join(definition.market_keys)
+    return definition.market_key
+
+
+def resolve_display_offsets(definition) -> tuple[int, ...]:
+    """Leg offsets for ANY strategy definition, single-market or
+    intermarket, in leg order -- dispatched purely by TYPE, same caveat
+    as resolve_display_market_key: DISPLAY ONLY.
+
+    An intermarket definition's offsets are each a position on that
+    leg's OWN contract curve (see LegSpec's own docstring), not
+    positions on one shared curve -- this tuple must never be
+    reinterpreted downstream as if it were.
+    """
+    if isinstance(definition, IntermarketDefinition):
+        return tuple(leg.offset for leg in definition.legs)
+    return definition.offsets
