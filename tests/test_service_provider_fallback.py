@@ -562,30 +562,208 @@ def test_m_b_legacy_cache_fully_covering_the_request_calls_no_provider(mocker, d
     assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
 
 
-def test_m_c_legacy_cache_lseg_unavailable_propagates_no_quanthub_fallback_cache_preserved(mocker, db_session):
+def test_m_c_legacy_cache_lseg_unavailable_falls_back_to_quanthub_provider_stays_null(mocker, db_session):
+    # Corrected design (see database.service._fetch_legacy_unknown_provider):
+    # a confirmed-unavailable LSEG response for a legacy/unknown-
+    # provenance ric's missing range now falls back to QuantHub for
+    # JUST that sub-range, rather than aborting the scan -- but the
+    # provider is STILL never established either way.
     legacy_start = datetime(2026, 1, 1)
     legacy_end = datetime(2026, 8, 20, 23, 59, 59, 999999)
     _seed_legacy(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end, seed=1.0)
 
-    mocker.patch(
+    mock_lseg = mocker.patch(
         "database.service.download_history",
         side_effect=MarketDataUnavailableError(_YBA_H28, "The universe is not found"),
     )
+    mock_qh = mocker.patch(
+        "database.service.download_history_quanthub",
+        return_value=_bars(_daily_dates("2026-08-21", 4), seed=500.0),
+    )
+
+    # No exception -- the scan does not abort.
+    result = service.get_history(_YBA_H28, "DAILY", "2026-07-25", "2026-08-24")
+
+    assert mock_lseg.call_count == 1
+    assert mock_qh.call_count == 1
+
+    # Provider is STILL not established -- neither LSEG nor QuantHub.
+    assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
+
+    # The pre-existing legacy cache is untouched, and the newly-fetched
+    # QuantHub bars are appended under the SAME provider=None row.
+    ranges = cache.get_sync_ranges(db_session, _YBA_H28, "DAILY")
+    assert len(ranges) == 1
+    assert ranges[0][0] == legacy_start
+    assert ranges[0][1].date().isoformat() == "2026-08-24"
+
+    reread = cache.read_bars(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end)
+    assert all(close < 500.0 for close in reread["Close"])  # untouched legacy values
+    by_date = result.set_index(result["Date"].dt.strftime("%Y-%m-%d"))["Close"]
+    assert by_date["2026-08-21"] >= 500.0  # the QuantHub-fallback bars
+
+
+def test_m_c2_legacy_cache_real_intraday_92000_message_falls_back_to_quanthub_no_retry_storm(mocker, db_session):
+    # Uses the EXACT production error text (TS.Intraday.UserNotPermission.
+    # 92000) as the MarketDataUnavailableError's message -- the actual
+    # LDError -> MarketDataUnavailableError CONVERSION (and its own
+    # no-retry-storm guarantee at the core.downloader/tenacity layer) is
+    # separately, rigorously proven in tests/test_downloader.py's
+    # test_is_confirmed_no_intraday_permission_* and
+    # test_download_history_confirmed_no_intraday_permission_raises_typed_error_not_retried.
+    # This test proves the SERVICE-layer consequence once that typed
+    # error reaches _fetch_legacy_unknown_provider: exactly one call
+    # (no internal retry-storm at this layer either), QuantHub fallback,
+    # no exception, provider stays NULL.
+    legacy_start = datetime(2026, 1, 1)
+    legacy_end = datetime(2026, 8, 20, 23, 59, 59, 999999)
+    _seed_legacy(db_session, _YBA_H28, "4H", legacy_start, legacy_end, seed=1.0)
+
+    mock_lseg = mocker.patch(
+        "database.service.download_history",
+        side_effect=MarketDataUnavailableError(
+            _YBA_H28,
+            "No data to return, please check errors: ERROR: No successful response. "
+            "(TS.Intraday.UserNotPermission.92000, User does not have permission for this universe)",
+        ),
+    )
+    mock_qh = mocker.patch(
+        "database.service.download_history_quanthub",
+        return_value=_bars(_daily_dates("2026-08-21", 4), seed=500.0),
+    )
+
+    result = service.get_history(_YBA_H28, "4H", "2026-07-25", "2026-08-24")
+
+    assert mock_lseg.call_count == 1  # no retry storm at this layer
+    assert mock_qh.call_count == 1
+    assert cache.get_established_provider(db_session, _YBA_H28, "4H") is None
+    assert len(result) > 0
+
+
+def test_m_d_legacy_cache_lseg_empty_dataframe_falls_back_to_quanthub_not_marked_synced(mocker, db_session):
+    # SONM8/SONZ7's live-observed case: LSEG succeeds (no exception) but
+    # returns 0 bars. Must NOT be silently accepted as "confirmed empty,
+    # mark synced" -- _is_complete_history treats an empty frame as
+    # incomplete, triggering the SAME QuantHub fallback as an exception.
+    legacy_start = datetime(2026, 1, 1)
+    legacy_end = datetime(2026, 8, 20, 23, 59, 59, 999999)
+    _seed_legacy(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end, seed=1.0)
+
+    mock_lseg = mocker.patch(
+        "database.service.download_history",
+        return_value=pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"]),
+    )
+    mock_qh = mocker.patch(
+        "database.service.download_history_quanthub",
+        return_value=_bars(_daily_dates("2026-08-21", 4), seed=500.0),
+    )
+
+    result = service.get_history(_YBA_H28, "DAILY", "2026-07-25", "2026-08-24")
+
+    assert mock_lseg.call_count == 1
+    assert mock_qh.call_count == 1  # the empty LSEG result triggered fallback, not a no-op
+    assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
+
+    # The missing range is filled by QuantHub's bars, not left as a
+    # false "confirmed empty" gap.
+    by_date = result.set_index(result["Date"].dt.strftime("%Y-%m-%d"))["Close"]
+    assert by_date["2026-08-21"] >= 500.0
+    assert len(result) == 31  # the full requested window, gap-free
+
+
+def test_m_e_legacy_cache_lseg_incomplete_interior_gap_falls_back_to_quanthub(mocker, db_session):
+    # LSEG returns SOME data but with a genuine interior gap (far wider
+    # than any real holiday cluster) -- _is_complete_history rejects it,
+    # same fallback as empty/unavailable.
+    legacy_start = datetime(2026, 1, 1)
+    legacy_end = datetime(2026, 8, 20, 23, 59, 59, 999999)
+    _seed_legacy(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end, seed=1.0)
+
+    # A ~25-day interior gap (Aug21 -> Sep15), far beyond any real
+    # holiday cluster -- unambiguously an interior failure, not a
+    # trailing/leading contract-lifecycle shortfall.
+    mock_lseg = mocker.patch(
+        "database.service.download_history",
+        return_value=pd.concat(
+            [_bars(["2026-08-21"], seed=1.0), _bars(["2026-09-15"], seed=2.0)], ignore_index=True
+        ),
+    )
+    mock_qh = mocker.patch(
+        "database.service.download_history_quanthub",
+        return_value=_bars(_daily_dates("2026-08-21", 10), seed=500.0),
+    )
+
+    service.get_history(_YBA_H28, "DAILY", "2026-07-25", "2026-09-15")
+
+    assert mock_lseg.call_count == 1
+    assert mock_qh.call_count == 1
+    assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
+
+
+def test_m_f_batch_legacy_ric_uses_lseg_first_quanthub_fallback_never_joins_qh_batch(mocker, db_session):
+    # The batch path must apply the SAME LSEG-first/QuantHub-fallback
+    # logic to a legacy ric as the single-RIC path -- and that ric must
+    # NEVER be folded into the shared QuantHub BATCH call queued for
+    # established/newly-establishing rics, even when its own fallback
+    # also happens to use QuantHub.
+    legacy_start = datetime(2026, 1, 1)
+    legacy_end = datetime(2026, 1, 3, 23, 59, 59, 999999)
+    _seed_legacy(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end, seed=1.0)
+    # A second, genuinely-new QH-mapped ric in the SAME batch call, whose
+    # own establishment ALSO ends up on QuantHub (via the real batched
+    # QH call) -- proves the legacy ric's per-sub-range QuantHub
+    # fallback stays completely separate from that batch queue.
+    _CORRA_FRESH = build_ric("CORRA", 6, 2026)
+
+    def _lseg(ric, interval, start, end):
+        if ric == _YBA_H28:
+            return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+        raise MarketDataUnavailableError(ric, "The universe is not found")
+
+    mocker.patch("database.service.download_history", side_effect=_lseg)
+    mock_qh_single = mocker.patch(
+        "database.service.download_history_quanthub",
+        return_value=_bars(["2026-01-04", "2026-01-05"], seed=500.0),
+    )
+    mock_qh_batch = mocker.patch(
+        "database.service.download_history_quanthub_batch",
+        side_effect=_qh_batch_side_effect,
+    )
+
+    result = service.get_history_batch(
+        [_YBA_H28, _CORRA_FRESH], "DAILY", "2026-01-01", "2026-01-05"
+    )
+
+    assert set(result) == {_YBA_H28, _CORRA_FRESH}
+    # The legacy ric's fallback goes through the single-instrument
+    # QuantHub call, NOT the batch call.
+    assert mock_qh_single.call_count == 1
+    # The batch call carries only the genuinely-new ric's instrument.
+    assert mock_qh_batch.call_count == 1
+    assert len(mock_qh_batch.call_args[0][0]) == 1
+
+    assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
+    assert cache.get_established_provider(db_session, _CORRA_FRESH, "DAILY") == Provider.QUANTHUB.value
+
+
+def test_m_g_legacy_unrelated_exception_still_propagates_not_silently_swallowed(mocker, db_session):
+    # Only MarketDataUnavailableError (and an empty/incomplete frame)
+    # trigger the QuantHub fallback -- a genuine network/auth/programming
+    # error must still propagate and abort, exactly as everywhere else
+    # in the codebase's exception policy. No broad LDError/Exception
+    # catch was introduced.
+    legacy_start = datetime(2026, 1, 1)
+    legacy_end = datetime(2026, 8, 20, 23, 59, 59, 999999)
+    _seed_legacy(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end, seed=1.0)
+
+    mocker.patch("database.service.download_history", side_effect=RuntimeError("network boom"))
     mock_qh = mocker.patch("database.service.download_history_quanthub")
 
-    with pytest.raises(MarketDataUnavailableError):
+    with pytest.raises(RuntimeError, match="network boom"):
         service.get_history(_YBA_H28, "DAILY", "2026-07-25", "2026-08-24")
 
-    # No silent QuantHub fallback for a legacy/unknown-provenance ric --
-    # that would fabricate QuantHub provenance for the whole span.
     mock_qh.assert_not_called()
-    # Provider is still not established, and the legacy cache is fully
-    # intact -- nothing was inserted, nothing was relabeled.
     assert cache.get_established_provider(db_session, _YBA_H28, "DAILY") is None
-    ranges = cache.get_sync_ranges(db_session, _YBA_H28, "DAILY")
-    assert ranges == [(legacy_start, legacy_end)]
-    reread = cache.read_bars(db_session, _YBA_H28, "DAILY", legacy_start, legacy_end)
-    assert all(close < 500.0 for close in reread["Close"])
 
 
 def test_m_h_migration_then_get_history_recognizes_legacy_not_fresh(mocker, db_session, db_engine):

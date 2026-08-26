@@ -85,6 +85,16 @@ _NO_PERMISSION_MESSAGE = (
     "(TS.Interday.UserNotPermission.70112, User does not have permission for this universe)"
 )
 
+# CRAU7's own live-confirmed production failure (Intraday/4H request) --
+# same "UserNotPermission" shape as 70112 above, but a different
+# error-code FAMILY (Intraday, not Interday) and a different numeric
+# code -- exact wording quoted verbatim from the production log, not
+# guessed.
+_NO_INTRADAY_PERMISSION_MESSAGE = (
+    "No data to return, please check errors: ERROR: No successful response. "
+    "(TS.Intraday.UserNotPermission.92000, User does not have permission for this universe)"
+)
+
 
 def _make_lseg_df(dates: list[str], seed: float = 100.0) -> pd.DataFrame:
     """Build a fake DataFrame shaped like what lseg.data.get_history returns."""
@@ -587,6 +597,71 @@ def test_is_confirmed_no_permission_false_for_a_completely_different_code():
 
 
 # ---------------------------------------------------------------------
+# _is_confirmed_no_intraday_permission: narrow classification for
+# CRAU7's own live-confirmed production 92000 entitlement gap (an
+# Intraday-scoped condition, distinct from 70112's Interday scope)
+# ---------------------------------------------------------------------
+
+def test_is_confirmed_no_intraday_permission_true_for_exact_match():
+    exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_no_intraday_permission(exc) is True
+
+
+def test_is_confirmed_no_intraday_permission_false_for_generic_no_data_message():
+    exc = _make_ld_error("No data to return, please check errors: ERROR: No successful response.")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_different_error_code():
+    exc = _make_ld_error(
+        "No data to return (TS.Intraday.UserNotPermission.99999, User does not have permission for this universe)"
+    )
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_matching_code_different_phrase():
+    exc = _make_ld_error("(TS.Intraday.UserNotPermission.92000, Some unrelated reason)")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_generic_permission_mention():
+    exc = _make_ld_error("Some unrelated permission configuration issue")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_matching_message_wrong_type():
+    # Even the exact code+phrase must NOT be classified unless the
+    # exception is actually LSEG's LDError type.
+    exc = RuntimeError(_NO_INTRADAY_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_the_universe_not_found_message():
+    exc = _make_ld_error(_UNIVERSE_NOT_FOUND_MESSAGE)
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_false_for_a_completely_different_code():
+    exc = _make_ld_error("(TS.Interday.SomeOtherError.12345, A completely different problem)")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
+def test_is_confirmed_no_intraday_permission_never_conflated_with_interday_70112():
+    # The Interday 70112 predicate must NOT match the Intraday 92000
+    # message, and vice versa -- same error-code SHAPE ("UserNotPermission"
+    # + identical phrase), different FAMILY and numeric code, so neither
+    # predicate may broadly match on the shared phrase alone.
+    interday_exc = _make_ld_error(_NO_PERMISSION_MESSAGE)
+    intraday_exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE)
+
+    assert downloader._is_confirmed_no_permission(interday_exc) is True
+    assert downloader._is_confirmed_no_permission(intraday_exc) is False
+
+    assert downloader._is_confirmed_no_intraday_permission(intraday_exc) is True
+    assert downloader._is_confirmed_no_intraday_permission(interday_exc) is False
+
+
+# ---------------------------------------------------------------------
 # download_history: MarketDataUnavailableError translation + retry bypass
 # ---------------------------------------------------------------------
 
@@ -614,6 +689,23 @@ def test_download_history_confirmed_no_permission_raises_typed_error_not_retried
     assert exc_info.value.ric == "CRAH6"
     assert "70112" in exc_info.value.message
     # Confirmed-permanent condition -- must NOT be retried.
+    assert fake_lseg_data.get_history.call_count == 1
+
+
+def test_download_history_confirmed_no_intraday_permission_raises_typed_error_not_retried():
+    # CRAU7's real, live-confirmed production entitlement gap on a 4H
+    # (Intraday) request -- must be translated to the SAME typed error
+    # as the 70005/70112 cases, and must NOT trigger a retry storm (the
+    # exact production symptom this fixes: 3 retries then a raw LDError
+    # propagating and aborting the scan).
+    fake_lseg_data.get_history.side_effect = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE)
+
+    with pytest.raises(downloader.MarketDataUnavailableError) as exc_info:
+        downloader.download_history("CRAU7", "4H", "2026-01-01", "2026-01-05")
+
+    assert exc_info.value.ric == "CRAU7"
+    assert "92000" in exc_info.value.message
+    # Confirmed-permanent condition -- must NOT be retried (no retry storm).
     assert fake_lseg_data.get_history.call_count == 1
 
 

@@ -87,26 +87,28 @@ Is requested history fully covered?
                 |   (a LEGACY/UNKNOWN row -- e.g. cached before     |   |
                 |   provider provenance existed, migrated to        |   |
                 |   provider=NULL) -----------------------------.   |   |
-                |     _fetch_legacy_unknown_provider: incremental   |  |   |
-                |     LSEG-only fetch of ONLY the missing sub-      |  |   |
-                |     range(s), persisted with provider=None so the |  |   |
-                |     merged sync_ranges row STAYS provider=None.   |  |   |
-                |     NEVER runs the completeness test, NEVER       |  |   |
-                |     establishes a provider, NEVER touches         |  |   |
-                |     QuantHub -- the pre-existing history's true   |  |   |
-                |     origin is unknown and must never be           |  |   |
-                |     fabricated as either provider. A              |  |   |
-                |     MarketDataUnavailableError from LSEG here      |  |   |
-                |     propagates uncaught, exactly like the plain   |  |   |
-                |     non-QuantHub-mapped path -- it never silently |  |   |
-                |     falls back to QuantHub (see this function's   |  |   |
-                |     own docstring for the bug this fixes: an      |  |   |
-                |     earlier version treated a legacy NULL row as  |  |   |
-                |     "nothing established" and re-tested/relabeled |  |   |
-                |     the ENTIRE historical span as a fresh          |  |   |
-                |     establishment decision). This is a permanent  |  |   |
-                |     state -- only cache.delete_bars_and_             |  |   |
-                |     sync_ranges() (the administrative/reset         |  |   |
+                |     _fetch_legacy_unknown_provider: per missing    |  |   |
+                |     sub-range, LSEG is tried FIRST; if it returns  |  |   |
+                |     usable/complete data (_is_complete_history --  |  |   |
+                |     the SAME completeness test used below), that   |  |   |
+                |     sub-range is persisted with provider=None. If  |  |   |
+                |     LSEG is unavailable (a confirmed              |  |   |
+                |     MarketDataUnavailableError, e.g. an Interday   |  |   |
+                |     70112 or Intraday 92000 entitlement gap -- see |  |   |
+                |     core.downloader's classifiers), incomplete, or |  |   |
+                |     empty, that sub-range falls back to QuantHub   |  |   |
+                |     (_download_quanthub_full_window) for JUST that |  |   |
+                |     sub-range -- and is STILL persisted with       |  |   |
+                |     provider=None regardless of which provider     |  |   |
+                |     actually served it. NEVER runs the ONE-TIME     |  |   |
+                |     establishment decision, NEVER records          |  |   |
+                |     provider="LSEG" or "QUANTHUB" here -- the       |  |   |
+                |     pre-existing history's true origin is unknown  |  |   |
+                |     and must never be fabricated as either         |  |   |
+                |     provider, no matter which one served a given   |  |   |
+                |     sub-range this call. This is a permanent       |  |   |
+                |     state -- only cache.delete_bars_and_           |  |   |
+                |     sync_ranges() (the administrative/reset        |  |   |
                 |     utility) can clear it.                         |  |   |
                 |                                                     |   |
                 |-- Established LSEG --------------------------.   |   |
@@ -460,44 +462,83 @@ def _fetch_legacy_unknown_provider(
     coverage -- silently fabricating "LSEG" (or "QuantHub") provenance
     for months of data nobody had re-examined.
 
-    This function never does that. It behaves EXACTLY like the non-
-    QuantHub-mapped path in get_history() -- fetch ONLY the missing
-    sub-range(s) from LSEG, one at a time -- and persists with
-    provider=None explicitly. Because record_sync_range() merges an
-    incoming range with any existing overlapping row and the merged
-    row always takes the INCOMING call's provider (see its own
-    docstring), passing provider=None here is what keeps the merged
-    row's provider NULL afterward: the newly-fetched bars ARE verified
-    LSEG data, but the row as a whole is still never claimed as a
-    positive LSEG (or QuantHub) establishment, because the pre-existing
-    portion's true origin remains genuinely unknown. This state is
-    permanent -- nothing here ever "graduates" a legacy row into an
-    established one; only cache.delete_bars_and_sync_ranges() (the
-    administrative/reset utility) can clear it so a future request
-    performs fresh, explicit establishment.
+    For each missing sub-range, LSEG is tried FIRST. If it returns
+    usable, complete data (_is_complete_history -- the SAME completeness
+    test _establish_provider_and_fetch uses), that sub-range is
+    persisted with provider=None explicitly. If LSEG cannot provide
+    usable data for that sub-range -- a confirmed MarketDataUnavailableError
+    (e.g. CORRA's Interday 70112, or CRAU7's live-confirmed Intraday
+    92000 entitlement gap -- see core.downloader's own classifiers), a
+    returned-but-incomplete frame, or a returned-but-EMPTY frame (LSEG
+    can legitimately return 0 bars with no exception at all, e.g.
+    SONM8/SONZ7 in production -- _is_complete_history treats an empty
+    frame as incomplete too, so this is caught by the same check, not a
+    separate branch) -- that sub-range is instead fetched from QuantHub
+    (_download_quanthub_full_window, the SAME QuantHub-fetch mechanism
+    establishment/established-QuantHub already use) and STILL persisted
+    with provider=None.
 
-    A MarketDataUnavailableError from LSEG is deliberately NOT caught
-    here -- it propagates exactly like the non-QuantHub-mapped path
-    (_download_from_provider's caller in get_history() doesn't catch it
-    either), which is the safe choice explicitly required for this
-    state: an unknown-provenance RIC's missing range failing on LSEG
-    must never silently fall back to QuantHub, since that would
-    fabricate QuantHub provenance for the entire historical span just
-    as wrongly as the LSEG-establishment bug this function fixes.
-    Callers see the same MarketDataUnavailableError propagate/skip-and-
-    continue contract they already rely on elsewhere (see
-    template_scanner.scanner's own module docstring).
+    Because record_sync_range() merges an incoming range with any
+    existing overlapping row and the merged row always takes the
+    INCOMING call's provider (see its own docstring), passing
+    provider=None on EVERY branch here -- whether the bars actually came
+    from LSEG or from this QuantHub fallback -- is what keeps the merged
+    row's provider permanently NULL: this function NEVER establishes
+    "LSEG" or "QUANTHUB" as this (ric, interval)'s provider, no matter
+    which one actually served a given sub-range. The pre-existing
+    portion's true origin remains genuinely unknown regardless, and nothing
+    here ever "graduates" a legacy row into an established one; only
+    cache.delete_bars_and_sync_ranges() (the administrative/reset
+    utility) can clear it so a future request performs fresh, explicit
+    establishment.
+
+    This is a deliberate correction from an earlier version of this
+    function, which left MarketDataUnavailableError uncaught here on the
+    theory that falling back to QuantHub would risk fabricating
+    QuantHub provenance -- that concern doesn't apply once provider is
+    ALWAYS recorded as None regardless of which provider actually
+    served the data, and leaving it uncaught instead meant a single
+    confirmed-unavailable or empty LSEG response for ANY missing
+    sub-range aborted the entire scan (live-observed for CRAU7 in
+    production) instead of degrading gracefully to QuantHub, exactly as
+    every other QuantHub-mapped state already does. Any OTHER exception
+    (network/auth/an unrecognized LDError, a programming bug) is still
+    NOT caught and still propagates, aborting the caller -- this
+    deliberately does not broaden the exception policy into a general
+    "any LSEG failure means try QuantHub" bucket (see
+    _establish_provider_and_fetch's own docstring for the same
+    principle). The QuantHub fallback call itself is not wrapped in any
+    additional exception handling either -- a QuantHub failure here
+    propagates exactly as it already does from establishment/established-
+    QuantHub, unchanged.
     """
     for sub_start, sub_end in missing:
-        logger.info(
-            "%s [%s]: legacy/unknown-provenance cache -- downloading missing "
-            "%s -> %s from LSEG only (provider stays unrecorded)",
-            ric, interval.value, sub_start, sub_end,
-        )
-        downloaded = download_history(ric, interval.value, sub_start, sub_end)
-        _persist_downloaded(
-            session, ric, interval, downloaded, sub_start, sub_end, boundary, provider=None
-        )
+        downloaded_lseg = None
+        try:
+            downloaded_lseg = download_history(ric, interval.value, sub_start, sub_end)
+        except MarketDataUnavailableError:
+            downloaded_lseg = None
+
+        if downloaded_lseg is not None and _is_complete_history(downloaded_lseg):
+            logger.info(
+                "%s [%s]: legacy/unknown-provenance cache -- LSEG provided usable "
+                "data for missing %s -> %s (provider stays unrecorded)",
+                ric, interval.value, sub_start, sub_end,
+            )
+            _persist_downloaded(
+                session, ric, interval, downloaded_lseg, sub_start, sub_end, boundary, provider=None
+            )
+        else:
+            logger.info(
+                "%s [%s]: legacy/unknown-provenance cache -- LSEG could not provide "
+                "usable data for missing %s -> %s -- falling back to QuantHub for "
+                "this sub-range (provider stays unrecorded)",
+                ric, interval.value, sub_start, sub_end,
+            )
+            downloaded_qh = _download_quanthub_full_window(ric, interval, sub_start, sub_end)
+            _persist_downloaded(
+                session, ric, interval, downloaded_qh, sub_start, sub_end, boundary, provider=None
+            )
 
 
 def _establish_provider_and_fetch(
@@ -848,13 +889,15 @@ def _get_history_batch_with_provenance(
         QuantHub batch call below (see _get_history_batch_quanthub).
       - No recorded provider BUT existing sync_ranges coverage already
         exists (a LEGACY row, e.g. cached before provider provenance
-        existed) -> incremental LSEG-only fetch, individually, exactly
-        like the established-LSEG case, but provider=None is recorded
-        explicitly and the ric NEVER joins the QuantHub queue -- see
-        _fetch_legacy_unknown_provider's docstring (the single-RIC
-        equivalent of this branch) for why a legacy row's true
-        provenance must never be fabricated as either provider, even
-        when other RICs in this same batch call establish QuantHub.
+        existed) -> delegates to _fetch_legacy_unknown_provider(): LSEG
+        tried first per missing sub-range, QuantHub fallback per sub-
+        range whenever LSEG is unavailable/incomplete/empty, but
+        provider=None is recorded explicitly EITHER way and the ric
+        NEVER joins the QuantHub batch queue below -- see that
+        function's own docstring for why a legacy row's true provenance
+        must never be fabricated as either provider, even when other
+        RICs in this same batch call establish QuantHub, and even when
+        this ric's own missing range was itself served by QuantHub.
       - No recorded provider AND no existing coverage at all (a
         genuinely new (ric, interval)) -> queued for the same combined
         QuantHub batch call, but only AFTER a one-time LSEG trial for
@@ -909,22 +952,14 @@ def _get_history_batch_with_provenance(
                 qh_batch_rics.append(ric)
             elif sync_ranges:
                 # No recorded provider, but coverage already exists --
-                # a LEGACY row (see _fetch_legacy_unknown_provider's own
-                # docstring, the single-RIC equivalent of this branch).
-                # Incremental LSEG-only, never establishes a provider,
-                # never joins the QuantHub batch -- an unrelated ric's
-                # QuantHub establishment/batching must never cause this
-                # ric's unknown-provenance history to be touched.
-                for sub_start, sub_end in missing:
-                    logger.info(
-                        "%s [%s]: legacy/unknown-provenance cache -- downloading missing "
-                        "%s -> %s from LSEG only (batch, provider stays unrecorded)",
-                        ric, interval.value, sub_start, sub_end,
-                    )
-                    downloaded = download_history(ric, interval.value, sub_start, sub_end)
-                    _persist_downloaded(
-                        session, ric, interval, downloaded, sub_start, sub_end, boundary, provider=None
-                    )
+                # a LEGACY row. Delegates to the SAME helper get_history()
+                # uses (_fetch_legacy_unknown_provider) rather than
+                # duplicating its LSEG-first/QuantHub-fallback logic here
+                # -- never establishes a provider, never joins the
+                # QuantHub batch -- an unrelated ric's QuantHub
+                # establishment/batching must never cause this ric's
+                # unknown-provenance history to be touched.
+                _fetch_legacy_unknown_provider(session, ric, interval, missing, boundary)
             else:
                 # No recorded provider AND no existing coverage at all
                 # -- a genuinely new (ric, interval). One-time LSEG

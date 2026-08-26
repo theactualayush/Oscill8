@@ -38,7 +38,7 @@ logger = get_logger(__name__)
 
 class MarketDataUnavailableError(Exception):
     """Raised when LSEG has confirmed a requested RIC has no market data
-    available at all -- a permanent, per-RIC condition. Two narrow,
+    available at all -- a permanent, per-RIC condition. Three narrow,
     LSEG-confirmed conditions are translated to this today:
     - TS.Interday.UserRequestError.70005, "The universe is not found"
     - TS.Interday.UserNotPermission.70112, "User does not have
@@ -47,6 +47,10 @@ class MarketDataUnavailableError(Exception):
       permissions issue, not an Oscill8 RIC bug, but functionally the
       same "this RIC's data is not accessible to us right now"
       condition a caller needs to skip-and-continue past)
+    - TS.Intraday.UserNotPermission.92000, the same "no permission"
+      condition on an Intraday (HOURLY/4H) request -- live-confirmed in
+      production for CRAU7 [4H]; a different error-code family from
+      70112, not a duplicate of it
 
     Distinct from:
     - a valid RIC with no bars in the requested date range (returns an
@@ -142,6 +146,43 @@ def _is_confirmed_no_permission(exc: Exception) -> bool:
     message = getattr(exc, "message", None) or str(exc)
     return (
         "TS.Interday.UserNotPermission.70112" in message
+        and "User does not have permission for this universe" in message
+    )
+
+
+def _is_confirmed_no_intraday_permission(exc: Exception) -> bool:
+    """True only for the narrow, LSEG-confirmed "no permission for this
+    universe" condition on INTRADAY requests (TS.Intraday.
+    UserNotPermission.92000) -- live-confirmed in production for a 4H
+    request (CRAU7), distinct from _is_confirmed_no_permission()'s
+    Interday-scoped 70112: same "UserNotPermission" shape, a different
+    error-code family (Intraday, not Interday) and a different numeric
+    code. Same duck-typing/exact-match philosophy as
+    _is_confirmed_universe_not_found()/_is_confirmed_no_permission()
+    above -- one more specific, confirmed code recognized alongside
+    70005/70112, NOT a broadening of what counts as "unavailable".
+
+    Requires ALL of:
+    - the exception is LSEG's LDError type (module "lseg.data._errors",
+      class "LDError")
+    - its message contains the exact error code
+      "TS.Intraday.UserNotPermission.92000"
+    - its message contains the exact phrase "User does not have
+      permission for this universe"
+
+    A generic permission-flavored message without this exact code, this
+    exact code with different wording, the Interday-scoped 70112 code,
+    or a non-LDError exception, all return False and are left
+    untranslated -- exactly as narrow as the other two classifiers. No
+    other error code is treated as unavailable by this function.
+    """
+    exc_type = type(exc)
+    if exc_type.__module__ != "lseg.data._errors" or exc_type.__name__ != "LDError":
+        return False
+
+    message = getattr(exc, "message", None) or str(exc)
+    return (
+        "TS.Intraday.UserNotPermission.92000" in message
         and "User does not have permission for this universe" in message
     )
 
@@ -341,12 +382,14 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
     """Fetch a single chunk of history from LSEG, with retry on failure.
 
     A confirmed "universe is not found" or "no permission for this
-    universe" LDError (see _is_confirmed_universe_not_found /
-    _is_confirmed_no_permission) is translated to
+    universe" LDError -- Interday (_is_confirmed_universe_not_found /
+    _is_confirmed_no_permission) or Intraday
+    (_is_confirmed_no_intraday_permission) -- is translated to
     MarketDataUnavailableError right here, before the @retry decorator
     above ever evaluates whether to retry it -- this is what lets the
     retry predicate exclude it cleanly rather than retrying a condition
-    that can never succeed.
+    that can never succeed. Every other LDError (or any other exception)
+    is left untranslated and IS retried by the decorator above.
     """
     import lseg.data as ld
 
@@ -364,7 +407,11 @@ def _fetch_chunk(ric: str, native_interval: str, start: date, end: date) -> pd.D
             fields=None,
         )
     except Exception as exc:
-        if _is_confirmed_universe_not_found(exc) or _is_confirmed_no_permission(exc):
+        if (
+            _is_confirmed_universe_not_found(exc)
+            or _is_confirmed_no_permission(exc)
+            or _is_confirmed_no_intraday_permission(exc)
+        ):
             raise MarketDataUnavailableError(ric, getattr(exc, "message", None) or str(exc)) from exc
         raise
 
