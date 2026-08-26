@@ -265,3 +265,172 @@
   current LSEG account lacks entitlement for this universe
   (`TS.Interday.UserNotPermission.70112`), a permissions issue, not an
   Oscill8 RIC bug.
+
+---
+
+## v0.11.0
+
+### Fixed
+- **CORRA's `70112` entitlement error was not a typed
+  `MarketDataUnavailableError`.** LSEG's confirmed "no permission for
+  this universe" response (`TS.Interday.UserNotPermission.70112`) is
+  now classified alongside the existing `70005` ("universe not found")
+  classifier in `core/downloader.py` — same narrow, exact-match,
+  duck-typed approach (LSEG's real `LDError` type + this exact error
+  code), excluded from tenacity retry. (`tests/test_downloader.py`)
+
+### Added
+- **QuantHub as a second market-data provider** (`core/quanthub.py`,
+  `core/providers.py` — early version of what CLAUDE.md now documents
+  as Module 8). `core.providers.PROVIDER_ROUTING`/`resolve_provider()`
+  is the single source of truth for which markets are QuantHub-eligible;
+  today that's CORRA, SONIA, EURIBOR, SARON, YBA, and ESTR_ICE.
+- **New market metadata for EURIBOR, SARON, YBA, and ESTR_ICE**
+  (`core/config.py`'s `MARKETS`) — complete, trader-confirmed RIC root/
+  exchange/`bp_per_point`/year-digits for each, `verified=False` since
+  none has been live-LSEG-tested in this environment. `ESTR_ICE` is a
+  deliberately separate market key from the existing CME `ESTR` entry
+  (different RIC root, `SRE` vs. `EON3`) — never collapsed with it.
+- **QuantHub request capping and retry behavior**: a hard
+  `QUANTHUB_MAX_ROWS_PER_REQUEST = 10_000`-row ceiling per HTTP request
+  (live-confirmed: 10,000 succeeds, 10,001 returns HTTP 400), and HTTP
+  429 responses are no longer retried indefinitely.
+- **QuantHub request batching across a scan**: distinct instruments
+  needed within one scan are grouped into requests up to
+  `QUANTHUB_BATCH_SIZE = 10` instruments each (live-verified maximum);
+  because the row ceiling is shared across every instrument in a
+  request, `core.quanthub._max_count_for_batch(batch_size)` computes
+  `10_000 // batch_size` as the resulting per-instrument row cap for
+  that batch size — a smaller trailing batch legitimately gets a higher
+  per-instrument count than a full batch of 10.
+- **Documented, confirmed QuantHub API limitation**: live testing
+  confirmed the `/api/v2/ohlc/` endpoint accepts only `instruments=`/
+  `interval=`/`count=` — `start=`/`end=` return HTTP 500,
+  `from=`/`to=`/`offset=`/`page=`/`cursor=`/`before=` are all silently
+  ignored (byte-identical response with or without them). `count=`
+  always means "the most recent N observations as of now" — there is no
+  way to anchor a request to an earlier reference point, so older
+  history beyond what a single request's effective count can reach is
+  genuinely unretrievable in one call. This is why the SQLite cache
+  matters more for a QuantHub-served `(ric, interval)` than for an
+  LSEG-served one: a cold-started instrument only ever gets whatever
+  the ceiling allows on its first fetch, and accumulates the rest over
+  repeated scans as "now" (and therefore QuantHub's own reachable
+  window) advances — not via any incremental range request, since none
+  exists. (`tests/test_quanthub.py`)
+
+---
+
+## v0.12.0
+
+### Added
+- **Provider provenance** (`database/models.py`'s new nullable
+  `SyncRange.provider` column, `database/cache.py`'s
+  `get_established_provider()`/`record_sync_range(..., provider=...)`,
+  `database/service.py`'s rewritten `get_history()`/
+  `get_history_batch()`): a persisted, per-`(ric, interval)` decision of
+  which provider (LSEG or QuantHub) actually serves a given
+  contract/interval, for every QuantHub-eligible market. Decided
+  **exactly once** per `(ric, interval)`, on first request: LSEG is
+  tried for the full window first; a complete response establishes
+  LSEG, an incomplete/unavailable one discards the LSEG attempt
+  entirely (never persisted) and establishes QuantHub instead. Once
+  established, the decision is never automatically revisited —
+  established LSEG fetches only missing sub-ranges from LSEG forever
+  after; established QuantHub re-requests QuantHub's full effective
+  window whenever anything is missing (a QuantHub API limitation, not a
+  design choice), and never touches LSEG again either way. A
+  `(ric, interval)`'s bars are never a mix of both providers once
+  established.
+- **Legacy/unknown provenance handling**: a `(ric, interval)` with
+  `provider=NULL` but existing `sync_ranges` coverage (cached before
+  this column existed) is treated as a genuinely distinct fourth state,
+  not silently relabeled LSEG or QuantHub. `provider` stays `NULL`
+  permanently for such a row regardless of which provider actually
+  serves any given missing sub-range going forward — only an explicit
+  administrative reset (`cache.delete_bars_and_sync_ranges()`) can move
+  it into fresh establishment.
+- `connection.py`'s `init_db()` gained a small, additive, idempotent
+  migration (`ALTER TABLE sync_ranges ADD COLUMN provider`) so an
+  existing local `data/oscill8.db` gets the new column in place, without
+  losing any cached history.
+- Unit tests (`tests/test_service_provider_fallback.py`,
+  `tests/test_service_provider_routing.py`,
+  `tests/test_multimarket_cache_key_independence.py`) covering: no false
+  establishment for a legacy cache, no provider mixing once established,
+  and independent provider state across intervals for the same
+  contract.
+
+---
+
+## v0.13.0
+
+### Fixed
+- **A still-forming bar was re-fetched from the provider on every
+  identical re-scan.** A plain-date request (e.g. "today") previously
+  stayed uncapped to day-end all the way through missing-range detection
+  and into the provider request itself, so a scan for a currently-open
+  interval (e.g. an in-progress `4H` bucket) re-requested the same
+  partial bar every time, since nothing in that always-in-the-future
+  tail could ever be marked synced.
+  - `database/service.py`: every request's effective end is now capped,
+    before any cache-coverage check or provider call, to the last fully
+    closed bar as of "now" (`_effective_request_end`,
+    `_last_completed_boundary`) — applied independently in
+    `get_history()`, `_get_history_batch_with_provenance()`, and
+    `_get_history_batch_quanthub()`, and identically across `DAILY`,
+    `HOURLY`, and `4H`. A still-forming bar is consequently never
+    fetched, cached, **or returned** to any caller — a change from the
+    prior behavior, where such a bar was still returned for that one
+    call (never cached, but visible in the result).
+  - `_persist_downloaded()`'s existing `Date < boundary` filter is the
+    actual, load-bearing enforcement point — not a redundant safety
+    net: QuantHub's own API has no way to be asked, server-side, to
+    exclude a same-day in-progress bar.
+  - If the entire requested window falls inside the currently-forming
+    period, no provider is contacted at all — including skipping a
+    genuinely-new QuantHub-eligible RIC's one-time establishment test,
+    rather than running it against a window that could never produce a
+    usable result.
+- Unit tests (`tests/test_service_effective_request_end.py`): a repeated
+  identical scan during the same still-forming period now makes zero
+  additional provider requests, for every interval and every provider
+  state; the next request after the period closes fetches exactly the
+  newly-closed bar.
+
+---
+
+## v0.14.0
+
+### Fixed
+- **A legacy/unknown-provider RIC's LSEG failure aborted the entire
+  scan instead of falling back to QuantHub.** The legacy/unknown
+  provenance path (see v0.12.0) previously left `MarketDataUnavailableError`
+  uncaught for these rows — unlike every other provider state — on the
+  theory that falling back to QuantHub might risk fabricating QuantHub
+  provenance. That reasoning didn't hold once `provider` is recorded as
+  `NULL` unconditionally on every branch of the legacy path regardless
+  of which provider actually served the data.
+  - `database/service.py`'s `_fetch_legacy_unknown_provider()` (also
+    reused by `_get_history_batch_with_provenance()`'s legacy branch, an
+    inline duplicate eliminated in the same change): for each missing
+    sub-range, LSEG is tried first; if it fails with
+    `MarketDataUnavailableError`, is empty, or is incomplete, QuantHub
+    is fetched as a fallback for just that sub-range — reusing the
+    already-existing `_is_complete_history()` and
+    `_download_quanthub_full_window()` helpers unchanged. `provider`
+    still stays `NULL` on every branch. Live-observed in production for
+    `CRAU7 [4H]`.
+- **The `TS.Intraday.UserNotPermission.92000` classifier matched on the
+  wrong wording.** Added in an earlier round requiring both the error
+  code and the exact phrase `"User does not have permission for this
+  universe"` — but the real production error text is `"User has no
+  permission"`, a different phrase with the same code, so the
+  classifier never actually matched live. `core/downloader.py`'s
+  `_is_confirmed_no_intraday_permission()` now matches on the error
+  **code alone**, deliberately not requiring any specific trailing
+  wording — unlike the `70005`/`70112` classifiers, which still require
+  an exact phrase match. Confirmed not retried by tenacity
+  (`call_count == 1`, no retry storm) both at the `core.downloader`
+  classifier level and at the `database.service` legacy-fallback level.
+  (`tests/test_downloader.py`, `tests/test_service_provider_fallback.py`)
