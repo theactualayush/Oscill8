@@ -88,9 +88,19 @@ _NO_PERMISSION_MESSAGE = (
 # CRAU7's own live-confirmed production failure (Intraday/4H request) --
 # same "UserNotPermission" shape as 70112 above, but a different
 # error-code FAMILY (Intraday, not Interday) and a different numeric
-# code -- exact wording quoted verbatim from the production log, not
-# guessed.
+# code -- exact wording quoted verbatim from the ACTUAL production log
+# (confirmed a second time against real traffic; the previously assumed
+# wording below turned out to differ, which is exactly why this
+# classifier now matches on error code alone, not phrase).
 _NO_INTRADAY_PERMISSION_MESSAGE = (
+    "No data to return, please check errors: ERROR: No successful response. "
+    "(TS.Intraday.UserNotPermission.92000, User has no permission)"
+)
+
+# The wording originally assumed (before the real production text was
+# confirmed) for this same 92000 code -- must STILL be recognized, since
+# the classifier no longer depends on any particular trailing phrase.
+_NO_INTRADAY_PERMISSION_MESSAGE_PREVIOUSLY_ASSUMED_WORDING = (
     "No data to return, please check errors: ERROR: No successful response. "
     "(TS.Intraday.UserNotPermission.92000, User does not have permission for this universe)"
 )
@@ -602,8 +612,20 @@ def test_is_confirmed_no_permission_false_for_a_completely_different_code():
 # Intraday-scoped condition, distinct from 70112's Interday scope)
 # ---------------------------------------------------------------------
 
-def test_is_confirmed_no_intraday_permission_true_for_exact_match():
+def test_is_confirmed_no_intraday_permission_true_for_real_production_message():
+    # The ACTUAL wording confirmed a second time against real production
+    # traffic ("User has no permission") -- this is the message the
+    # classifier must match; see the module docstring's own note on why
+    # this classifier deliberately does not also require a phrase match.
     exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE)
+    assert downloader._is_confirmed_no_intraday_permission(exc) is True
+
+
+def test_is_confirmed_no_intraday_permission_true_for_previously_assumed_wording_too():
+    # The wording originally assumed before the real production text was
+    # confirmed must ALSO still be recognized -- proves the classifier
+    # doesn't depend on any particular trailing phrase, only the code.
+    exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE_PREVIOUSLY_ASSUMED_WORDING)
     assert downloader._is_confirmed_no_intraday_permission(exc) is True
 
 
@@ -614,14 +636,17 @@ def test_is_confirmed_no_intraday_permission_false_for_generic_no_data_message()
 
 def test_is_confirmed_no_intraday_permission_false_for_different_error_code():
     exc = _make_ld_error(
-        "No data to return (TS.Intraday.UserNotPermission.99999, User does not have permission for this universe)"
+        "No data to return (TS.Intraday.UserNotPermission.99999, User has no permission)"
     )
     assert downloader._is_confirmed_no_intraday_permission(exc) is False
 
 
-def test_is_confirmed_no_intraday_permission_false_for_matching_code_different_phrase():
+def test_is_confirmed_no_intraday_permission_true_for_matching_code_regardless_of_phrase():
+    # The error CODE alone is authoritative for this classifier -- an
+    # arbitrary trailing phrase must NOT prevent a match, since LSEG's
+    # own wording for this code has already been observed to vary.
     exc = _make_ld_error("(TS.Intraday.UserNotPermission.92000, Some unrelated reason)")
-    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+    assert downloader._is_confirmed_no_intraday_permission(exc) is True
 
 
 def test_is_confirmed_no_intraday_permission_false_for_generic_permission_mention():
@@ -648,9 +673,10 @@ def test_is_confirmed_no_intraday_permission_false_for_a_completely_different_co
 
 def test_is_confirmed_no_intraday_permission_never_conflated_with_interday_70112():
     # The Interday 70112 predicate must NOT match the Intraday 92000
-    # message, and vice versa -- same error-code SHAPE ("UserNotPermission"
-    # + identical phrase), different FAMILY and numeric code, so neither
-    # predicate may broadly match on the shared phrase alone.
+    # message, and vice versa -- same "UserNotPermission" error-code
+    # SHAPE but different FAMILY and numeric code (and, in production,
+    # even different trailing wording), so neither predicate may match
+    # the other code's message.
     interday_exc = _make_ld_error(_NO_PERMISSION_MESSAGE)
     intraday_exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE)
 

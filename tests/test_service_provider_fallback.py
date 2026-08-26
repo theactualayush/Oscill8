@@ -624,7 +624,7 @@ def test_m_c2_legacy_cache_real_intraday_92000_message_falls_back_to_quanthub_no
         side_effect=MarketDataUnavailableError(
             _YBA_H28,
             "No data to return, please check errors: ERROR: No successful response. "
-            "(TS.Intraday.UserNotPermission.92000, User does not have permission for this universe)",
+            "(TS.Intraday.UserNotPermission.92000, User has no permission)",
         ),
     )
     mock_qh = mocker.patch(

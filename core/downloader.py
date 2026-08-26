@@ -157,7 +157,7 @@ def _is_confirmed_no_intraday_permission(exc: Exception) -> bool:
     request (CRAU7), distinct from _is_confirmed_no_permission()'s
     Interday-scoped 70112: same "UserNotPermission" shape, a different
     error-code family (Intraday, not Interday) and a different numeric
-    code. Same duck-typing/exact-match philosophy as
+    code. Same duck-typing philosophy as
     _is_confirmed_universe_not_found()/_is_confirmed_no_permission()
     above -- one more specific, confirmed code recognized alongside
     70005/70112, NOT a broadening of what counts as "unavailable".
@@ -167,24 +167,28 @@ def _is_confirmed_no_intraday_permission(exc: Exception) -> bool:
       class "LDError")
     - its message contains the exact error code
       "TS.Intraday.UserNotPermission.92000"
-    - its message contains the exact phrase "User does not have
-      permission for this universe"
 
-    A generic permission-flavored message without this exact code, this
-    exact code with different wording, the Interday-scoped 70112 code,
-    or a non-LDError exception, all return False and are left
-    untranslated -- exactly as narrow as the other two classifiers. No
-    other error code is treated as unavailable by this function.
+    Deliberately does NOT also require an exact trailing-phrase match,
+    unlike the other two classifiers above -- live production traffic
+    has shown this code's own English wording vary ("User does not have
+    permission for this universe" was the originally observed text;
+    "User has no permission" is what a real production request actually
+    returned), so the phrase is not a reliable signal for THIS code the
+    way it apparently is for 70005/70112. The error CODE alone is the
+    authoritative, confirmed-permanent-condition signal here -- still a
+    single, specific, exact code (not a prefix or family-wide match),
+    so this remains exactly as narrow in spirit as the other two
+    classifiers; it just doesn't layer an unreliable phrase check on
+    top. A non-LDError exception, or any other error code (including
+    the Interday-scoped 70112, or an unrelated Intraday code), returns
+    False and is left untranslated.
     """
     exc_type = type(exc)
     if exc_type.__module__ != "lseg.data._errors" or exc_type.__name__ != "LDError":
         return False
 
     message = getattr(exc, "message", None) or str(exc)
-    return (
-        "TS.Intraday.UserNotPermission.92000" in message
-        and "User does not have permission for this universe" in message
-    )
+    return "TS.Intraday.UserNotPermission.92000" in message
 
 # --------------------------------------------------------------------------
 # Session management
