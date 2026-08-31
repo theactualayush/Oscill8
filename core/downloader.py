@@ -47,10 +47,14 @@ class MarketDataUnavailableError(Exception):
       permissions issue, not an Oscill8 RIC bug, but functionally the
       same "this RIC's data is not accessible to us right now"
       condition a caller needs to skip-and-continue past)
-    - TS.Intraday.UserNotPermission.92000, the same "no permission"
+    - *.UserNotPermission.92000 (any service/product prefix -- observed
+      in production as both "TS.Intraday.UserNotPermission.92000" and
+      "TSCC.QS.UserNotPermission.92000"), the same "no permission"
       condition on an Intraday (HOURLY/4H) request -- live-confirmed in
-      production for CRAU7 [4H]; a different error-code family from
-      70112, not a duplicate of it
+      production for CRAU7 [4H]; a different numeric code from 70112,
+      not a duplicate of it, and matched on the code alone regardless
+      of which prefix precedes it (see _is_confirmed_no_intraday_
+      permission()'s own docstring for why)
 
     Distinct from:
     - a valid RIC with no bars in the requested date range (returns an
@@ -152,35 +156,51 @@ def _is_confirmed_no_permission(exc: Exception) -> bool:
 
 def _is_confirmed_no_intraday_permission(exc: Exception) -> bool:
     """True only for the narrow, LSEG-confirmed "no permission for this
-    universe" condition on INTRADAY requests (TS.Intraday.
-    UserNotPermission.92000) -- live-confirmed in production for a 4H
-    request (CRAU7), distinct from _is_confirmed_no_permission()'s
-    Interday-scoped 70112: same "UserNotPermission" shape, a different
-    error-code family (Intraday, not Interday) and a different numeric
-    code. Same duck-typing philosophy as
-    _is_confirmed_universe_not_found()/_is_confirmed_no_permission()
-    above -- one more specific, confirmed code recognized alongside
-    70005/70112, NOT a broadening of what counts as "unavailable".
+    universe" condition carrying the 92000 UserNotPermission code --
+    live-confirmed in production for a 4H request (CRAU7), distinct
+    from _is_confirmed_no_permission()'s Interday-scoped 70112: same
+    "UserNotPermission" shape, a different numeric code. Same
+    duck-typing philosophy as _is_confirmed_universe_not_found()/
+    _is_confirmed_no_permission() above -- one more specific, confirmed
+    code recognized alongside 70005/70112, NOT a broadening of what
+    counts as "unavailable".
 
     Requires ALL of:
     - the exception is LSEG's LDError type (module "lseg.data._errors",
       class "LDError")
-    - its message contains the exact error code
-      "TS.Intraday.UserNotPermission.92000"
+    - its message contains "UserNotPermission.92000", where "92000" is
+      not itself the leading digits of a longer number (so a
+      hypothetical, unrelated ".920001" code can never false-positive)
 
-    Deliberately does NOT also require an exact trailing-phrase match,
+    Matches "UserNotPermission.92000" REGARDLESS of the service/product
+    prefix in front of it -- deliberately NOT anchored to a specific
+    prefix like "TS.Intraday." or "TSCC.QS.". This was corrected after
+    real production logs showed the SAME 92000 permission-denied
+    condition surfacing under at least two different prefixes:
+    "TS.Intraday.UserNotPermission.92000" (the originally observed
+    form) and "TSCC.QS.UserNotPermission.92000" (confirmed later,
+    silently NOT recognized by the previous prefix-anchored check,
+    which let the raw LDError propagate and abort the scan instead of
+    falling back to QuantHub). The numeric code plus the
+    "UserNotPermission" shape is the stable, LSEG-confirmed signal here;
+    the service/product prefix in front of it is not, and a fix that
+    simply added "TSCC.QS.UserNotPermission.92000" as a second
+    hardcoded prefix would only defer the next occurrence of this exact
+    bug to the next new prefix LSEG happens to use.
+
+    Also deliberately does NOT require an exact trailing-phrase match,
     unlike the other two classifiers above -- live production traffic
-    has shown this code's own English wording vary ("User does not have
-    permission for this universe" was the originally observed text;
-    "User has no permission" is what a real production request actually
-    returned), so the phrase is not a reliable signal for THIS code the
-    way it apparently is for 70005/70112. The error CODE alone is the
-    authoritative, confirmed-permanent-condition signal here -- still a
-    single, specific, exact code (not a prefix or family-wide match),
-    so this remains exactly as narrow in spirit as the other two
-    classifiers; it just doesn't layer an unreliable phrase check on
-    top. A non-LDError exception, or any other error code (including
-    the Interday-scoped 70112, or an unrelated Intraday code), returns
+    has shown this code's own English wording vary too ("User does not
+    have permission for this universe" was the originally observed
+    text; "User has no permission" is what real production requests
+    have actually returned under both prefixes). The error CODE alone
+    is the authoritative, confirmed-permanent-condition signal here --
+    still one single, specific, exact code (not a family-wide or
+    wildcard match), so this remains exactly as narrow in spirit as the
+    other two classifiers; it just doesn't anchor to an unreliable
+    prefix or phrase on top of it. A non-LDError exception, or any
+    other error code (including the Interday-scoped 70112, or an
+    unrelated code that merely starts with the digits "92000"), returns
     False and is left untranslated.
     """
     exc_type = type(exc)
@@ -188,7 +208,13 @@ def _is_confirmed_no_intraday_permission(exc: Exception) -> bool:
         return False
 
     message = getattr(exc, "message", None) or str(exc)
-    return "TS.Intraday.UserNotPermission.92000" in message
+    marker = "UserNotPermission.92000"
+    idx = message.find(marker)
+    if idx == -1:
+        return False
+
+    after = idx + len(marker)
+    return after >= len(message) or not message[after].isdigit()
 
 # --------------------------------------------------------------------------
 # Session management
