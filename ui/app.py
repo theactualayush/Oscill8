@@ -30,6 +30,10 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import streamlit as st
 
 from ui import state
