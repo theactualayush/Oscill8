@@ -105,6 +105,18 @@ _NO_INTRADAY_PERMISSION_MESSAGE_PREVIOUSLY_ASSUMED_WORDING = (
     "(TS.Intraday.UserNotPermission.92000, User does not have permission for this universe)"
 )
 
+# A SECOND real production log form of the exact same 92000 permission-
+# denied condition, confirmed under a DIFFERENT service/product prefix
+# ("TSCC.QS." instead of "TS.Intraday.") -- this is the form the
+# prefix-anchored classifier previously failed to recognize, letting the
+# raw LDError propagate and abort the scan instead of falling back to
+# QuantHub. Same numeric code, same "UserNotPermission" shape, same
+# "User has no permission" wording -- only the prefix differs.
+_NO_INTRADAY_PERMISSION_MESSAGE_TSCC_QS = (
+    "No data to return, please check errors: ERROR: No successful response. "
+    "(TSCC.QS.UserNotPermission.92000, User has no permission)"
+)
+
 
 def _make_lseg_df(dates: list[str], seed: float = 100.0) -> pd.DataFrame:
     """Build a fake DataFrame shaped like what lseg.data.get_history returns."""
@@ -649,6 +661,37 @@ def test_is_confirmed_no_intraday_permission_true_for_matching_code_regardless_o
     assert downloader._is_confirmed_no_intraday_permission(exc) is True
 
 
+def test_is_confirmed_no_intraday_permission_true_for_tscc_qs_prefix_variant():
+    # Regression: real production logs showed the SAME 92000
+    # permission-denied condition under a DIFFERENT service/product
+    # prefix ("TSCC.QS." instead of "TS.Intraday."). A prior version of
+    # this classifier was anchored to the "TS.Intraday." prefix and
+    # silently failed to recognize this form, letting the raw LDError
+    # propagate and abort the scan instead of falling back to QuantHub.
+    exc = _make_ld_error(_NO_INTRADAY_PERMISSION_MESSAGE_TSCC_QS)
+    assert downloader._is_confirmed_no_intraday_permission(exc) is True
+
+
+def test_is_confirmed_no_intraday_permission_true_regardless_of_prefix_generically():
+    # Not just the two prefixes actually observed so far in production --
+    # the classifier must not be anchored to ANY specific prefix at all,
+    # since the whole point of this fix is that LSEG may use others.
+    exc = _make_ld_error("(SOME.FUTURE.PREFIX.UserNotPermission.92000, User has no permission)")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is True
+
+    exc_no_prefix = _make_ld_error("UserNotPermission.92000")
+    assert downloader._is_confirmed_no_intraday_permission(exc_no_prefix) is True
+
+
+def test_is_confirmed_no_intraday_permission_false_when_92000_is_a_prefix_of_a_longer_code():
+    # Guards the one real risk of dropping the prefix anchor entirely:
+    # "92000" must not match as a substring of a longer, unrelated
+    # numeric code (e.g. a hypothetical 920001) just because it happens
+    # to start with the same five digits.
+    exc = _make_ld_error("(TSCC.QS.UserNotPermission.920001, some other condition)")
+    assert downloader._is_confirmed_no_intraday_permission(exc) is False
+
+
 def test_is_confirmed_no_intraday_permission_false_for_generic_permission_mention():
     exc = _make_ld_error("Some unrelated permission configuration issue")
     assert downloader._is_confirmed_no_intraday_permission(exc) is False
@@ -732,6 +775,28 @@ def test_download_history_confirmed_no_intraday_permission_raises_typed_error_no
     assert exc_info.value.ric == "CRAU7"
     assert "92000" in exc_info.value.message
     # Confirmed-permanent condition -- must NOT be retried (no retry storm).
+    assert fake_lseg_data.get_history.call_count == 1
+
+
+def test_download_history_confirmed_no_intraday_permission_tscc_qs_prefix_raises_typed_error_not_retried():
+    # Regression for the real-machine bug: CRAZ6's production failure
+    # under the "TSCC.QS." prefix form of the same 92000 condition must
+    # be translated and skip-not-retried EXACTLY like the "TS.Intraday."
+    # form above -- this is the case that previously propagated as a
+    # raw LDError and aborted the scan instead of falling back to
+    # QuantHub.
+    fake_lseg_data.get_history.side_effect = _make_ld_error(
+        _NO_INTRADAY_PERMISSION_MESSAGE_TSCC_QS
+    )
+
+    with pytest.raises(downloader.MarketDataUnavailableError) as exc_info:
+        downloader.download_history("CRAZ6", "4H", "2026-01-01", "2026-01-05")
+
+    assert exc_info.value.ric == "CRAZ6"
+    assert "92000" in exc_info.value.message
+    # Confirmed-permanent condition -- must NOT be retried (exactly one
+    # LSEG attempt before the caller's own legacy/unknown provider
+    # fallback logic takes over and tries QuantHub instead).
     assert fake_lseg_data.get_history.call_count == 1
 
 
