@@ -27,14 +27,39 @@
 $DevExitCodes = @{
     Success       = 0
     Usage         = 1
-    Preflight     = 10
+    Preflight     = 10   # repo/toolchain/path/recursion preflight refused the run
     SpecInvalid   = 20
-    BranchFailed  = 30   # reserved: branch creation is NOT implemented yet
-    TestsUnusable = 40
-    ClaudeFailed  = 50   # reserved: Claude invocation is NOT implemented yet
-    GateFailed    = 60   # reserved: delta gate is NOT implemented yet
+    BranchFailed  = 30
+    TestsUnusable = 40   # the suite could not be run or produced no usable result
+    ClaudeFailed  = 50   # Claude could not run, errored, was denied, or did nothing
+    GateFailed    = 60   # the suite ran and reported unexpected failures
     DataViolation = 70
-    PathViolation = 80   # reserved: allowed-path check is NOT implemented yet
+    PathViolation = 80   # a change landed outside the task's declared allowed_paths
+}
+
+# --- Claude execution layer defaults ---------------------------------------
+# Overridable per run by dev.ps1's -ClaudeBudgetUsd / -ClaudeTimeoutSeconds,
+# and per machine by these environment variables. Declared here rather than
+# inline so the harness has one place to look for its tunables.
+$DevClaudeDefaultBudgetUsd = 10.0
+if ($env:RBS_CLAUDE_BUDGET_USD) {
+    $parsedBudget = 0.0
+    if ([double]::TryParse($env:RBS_CLAUDE_BUDGET_USD,
+                           [System.Globalization.NumberStyles]::Float,
+                           [System.Globalization.CultureInfo]::InvariantCulture,
+                           [ref]$parsedBudget) -and $parsedBudget -gt 0) {
+        $DevClaudeDefaultBudgetUsd = $parsedBudget
+    }
+}
+
+# 45 minutes. Long enough for a real multi-file implementation task; the probe
+# measured trivial single-turn tasks at 5-16 seconds, so this is not tight.
+$DevClaudeDefaultTimeoutSeconds = 2700
+if ($env:RBS_CLAUDE_TIMEOUT_SECONDS) {
+    $parsedTimeout = 0
+    if ([int]::TryParse($env:RBS_CLAUDE_TIMEOUT_SECONDS, [ref]$parsedTimeout) -and $parsedTimeout -gt 0) {
+        $DevClaudeDefaultTimeoutSeconds = $parsedTimeout
+    }
 }
 
 # Repository-relative path prefixes holding live user data. These are never
