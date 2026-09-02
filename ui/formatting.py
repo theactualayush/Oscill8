@@ -461,7 +461,16 @@ DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("Osc", "oscillation_count", "number"),
     ("ER", "efficiency_ratio", "number"),
     ("Half-Life", "half_life", "number"),
+    ("Strategy Label", "label", "text"),
 )
+
+# The Strategy Label column shows the actual originating Strategy Set
+# entry name / strategy-grid row Label (see template_scanner.scanner.
+# run_scan()/ScanCandidateResult.label) -- never derived/reconstructed
+# from RICs or the strategy definition. It's a new, optional column
+# (Column selector below) and is deliberately NOT in DEFAULT_VISIBLE_
+# COLUMNS, so the default table's appearance is unchanged.
+STRATEGY_LABEL_COLUMN = "Strategy Label"
 
 # Cross Frequency is deliberately NOT in the default DISPLAY_COLUMNS --
 # Movement and Osc took its place to keep the default grid compact (see
@@ -486,6 +495,47 @@ RESULT_COLUMN_HELP: dict[str, str] = {
 
 RANK_COLUMN = "Rank"
 
+# Every column a user can independently show/hide in the result grid --
+# Rank plus every DISPLAY_COLUMNS label, in the same order the table
+# already renders them. OPTIONAL_COLUMN_LABELS/DEFAULT_VISIBLE_COLUMNS
+# are the single source of truth for the "Columns ▾" popover (see
+# ui.results_view) -- adding a future optional column means adding it to
+# DISPLAY_COLUMNS above, nothing else.
+OPTIONAL_COLUMN_LABELS: tuple[str, ...] = (RANK_COLUMN,) + tuple(
+    label for label, _, _ in DISPLAY_COLUMNS
+)
+
+# All existing columns stay visible by default, so a fresh scan looks
+# exactly as it did before the column selector existed; only the new
+# Strategy Label column starts hidden (see its own note above).
+DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = tuple(
+    label for label in OPTIONAL_COLUMN_LABELS if label != STRATEGY_LABEL_COLUMN
+)
+
+
+def apply_column_selection(display_df: pd.DataFrame, selected_labels: Sequence[str]) -> pd.DataFrame:
+    """Project `display_df` down to the user-selected columns.
+
+    Pure display-layer filtering: never removes/recomputes the
+    underlying metric on ScanCandidateResult, only whether it's shown.
+    Preserves `display_df`'s own existing column order (not the order
+    columns were selected in), so toggling one column never reshuffles
+    the rest. An empty `selected_labels` returns a same-row-count,
+    zero-column DataFrame -- the user's own explicit choice, not
+    special-cased.
+    """
+    selected = set(selected_labels)
+    keep = [c for c in display_df.columns if c in selected]
+    return display_df[keep]
+
+
+def available_markets(results: Sequence[ScanCandidateResult]) -> list[str]:
+    """Distinct `market_key` values represented in `results`, sorted --
+    the Market filter's options (see ui.results_view), always derived
+    fresh from the current scan's own results, never a fixed/global
+    market list."""
+    return sorted({result.market_key for result in results})
+
 
 def _is_nan(value: object) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value))
@@ -500,6 +550,16 @@ def fmt_number(value: float, decimals: int = 4) -> str:
     if isinstance(value, float):
         return f"{value:,.{decimals}f}"
     return str(value)
+
+
+def fmt_label(value: object) -> str:
+    """Format an optional caller-supplied label (e.g.
+    ScanCandidateResult.label); None/blank renders as '—', matching
+    fmt_number/fmt_percent's own missing-value convention."""
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    return text if text else "—"
 
 
 def fmt_percent(value: float, decimals: int = 1) -> str:
@@ -531,6 +591,8 @@ def to_display_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
             columns[label] = series.apply(lambda v: " / ".join(fmt_number(w, 2) for w in v))
         elif kind == "percent":
             columns[label] = series.apply(fmt_percent)
+        elif kind == "text":
+            columns[label] = series.apply(fmt_label)
         else:
             columns[label] = series.apply(fmt_number)
     return pd.DataFrame(columns)

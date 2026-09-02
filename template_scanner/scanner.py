@@ -121,6 +121,7 @@ def analyze_histories(
     crossing_threshold: float = 0.0,
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
+    labels: list[str | None] | None = None,
 ) -> ScanReport:
     """Measure a list of already-built StrategyHistory objects.
 
@@ -134,9 +135,21 @@ def analyze_histories(
     single-market StrategyInstance or an intermarket
     IntermarketStrategyInstance either. Both flow through this exact
     same loop into one ScanReport.
+
+    `labels`, if given, must be the same length as `histories` and is
+    zipped positionally onto each resulting ScanCandidateResult.label
+    -- purely descriptive caller-supplied metadata (e.g. a UI strategy-
+    grid row's name), never computed or inferred here. `None` (the
+    default) leaves every result's `label` as `None`, unchanged from
+    before this parameter existed.
     """
+    if labels is not None and len(labels) != len(histories):
+        raise ValueError(
+            f"labels length ({len(labels)}) must match histories length ({len(histories)})"
+        )
+
     results = []
-    for history in histories:
+    for i, history in enumerate(histories):
         multi_lookback = analyze_multi_lookback(
             history,
             lookbacks=lookbacks,
@@ -156,6 +169,7 @@ def analyze_histories(
                 price_field=history.price_field,
                 instance=history.instance,
                 multi_lookback=multi_lookback,
+                label=labels[i] if labels is not None else None,
             )
         )
 
@@ -174,6 +188,7 @@ def run_scan_on_instances(
     crossing_threshold: float = 0.0,
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
+    labels_by_definition_id: dict[int, str] | None = None,
 ) -> ScanReport:
     """Price and measure an already-built candidate list -- exactly the
     build_history()+skip-handling loop run_scan() runs internally (see
@@ -207,10 +222,22 @@ def run_scan_on_instances(
     prewarm_leg_cache() couldn't resolve simply falls back to the existing
     lazy build_history()/get_history() path and is caught here exactly as
     before (see prewarm_leg_cache's own docstring).
+
+    `labels_by_definition_id`, if given, maps `id(instance.definition)` ->
+    a caller-facing label -- e.g. a UI strategy-grid row's Label/Strategy
+    Set entry name (see ui.scan_view.handle_run_scan()). One definition
+    object is shared by reference across every rolled instance generated
+    from it (strategy_engine.combinations.generate_instances()/
+    template_scanner.universe never clone or replace it), so this single
+    id-keyed lookup correctly labels every candidate a given grid row
+    produced, however many contracts it rolled into. Purely descriptive:
+    never affects which candidates are generated, priced, skipped, or
+    deduplicated -- only ScanCandidateResult.label on the survivors.
     """
     leg_cache = prewarm_leg_cache(instances, price_start, price_end)
     unavailable_rics: set[str] = set()
     histories: list[StrategyHistory] = []
+    labels: list[str | None] = []
     skipped: list[SkippedCandidate] = []
 
     for instance in instances:
@@ -238,6 +265,11 @@ def run_scan_on_instances(
             continue
 
         histories.append(history)
+        labels.append(
+            labels_by_definition_id.get(id(instance.definition))
+            if labels_by_definition_id is not None
+            else None
+        )
 
     logger.info(
         "run_scan_on_instances: %d candidate(s) -> %d history(ies) priced, %d skipped "
@@ -252,11 +284,14 @@ def run_scan_on_instances(
         crossing_threshold=crossing_threshold,
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
+        labels=labels,
     )
     return ScanReport(results=report.results, skipped=tuple(skipped))
 
 
-def run_scan(request: ScanRequest) -> ScanReport:
+def run_scan(
+    request: ScanRequest, labels_by_definition_id: dict[int, str] | None = None
+) -> ScanReport:
     """Run a complete REAL-mode scan: candidate generation (Module 5A)
     -> pricing (Module 3, one leg cache shared across the whole
     universe) -> measurement (Module 4A/4B via analyze_histories).
@@ -265,6 +300,11 @@ def run_scan(request: ScanRequest) -> ScanReport:
     downloader.MarketDataUnavailableError) is skipped and recorded in
     the returned ScanReport.skipped; every other build_history()
     failure propagates and aborts the scan -- see the module docstring.
+
+    `labels_by_definition_id` is passed straight through to
+    run_scan_on_instances() -- see that function's own docstring. Purely
+    optional, caller-facing metadata; does not affect candidate
+    generation, pricing, or deduplication.
     """
     candidates = generate_candidate_universe(
         list(request.definitions),
@@ -284,4 +324,5 @@ def run_scan(request: ScanRequest) -> ScanReport:
         crossing_threshold=request.crossing_threshold,
         lower_percentile=request.lower_percentile,
         upper_percentile=request.upper_percentile,
+        labels_by_definition_id=labels_by_definition_id,
     )

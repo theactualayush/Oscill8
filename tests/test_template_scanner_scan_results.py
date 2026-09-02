@@ -54,6 +54,7 @@ def _candidate(
     rics=("SRAH26", "SRAM26", "SRAU26"),
     weights=(1.0, -2.0, 1.0),
     interval=BarInterval.DAILY,
+    label=None,
 ) -> ScanCandidateResult:
     values = values if values is not None else ([0.98, 1.00, 1.02] * 60)[:150]
     history = _history(
@@ -70,22 +71,25 @@ def _candidate(
         price_field=history.price_field,
         instance=history.instance,
         multi_lookback=multi_lookback,
+        label=label,
     )
 
 
 def test_results_to_dataframe_empty_list_returns_empty_frame_with_curated_columns():
     df = results_to_dataframe([], display_lookback=20)
     assert df.empty
-    assert len(df.columns) == 53
+    assert len(df.columns) == 54
 
 
-def test_results_to_dataframe_column_set_has_exactly_53_curated_columns():
+def test_results_to_dataframe_column_set_has_exactly_54_curated_columns():
     # 50 pre-existing (46 original + lower_percentile/upper_percentile/
     # z_score/abs_z_score) + oscillation_count/mean_abs_change_price/
     # mean_abs_change_bp (Tradability Analytics: Oscillation Count and
-    # Movement, exposed as canonical Module 5B metrics).
+    # Movement, exposed as canonical Module 5B metrics) + label (Range
+    # Bound Opportunities UI enhancement: the optional Strategy Label
+    # column, sourced from ScanCandidateResult.label).
     df = results_to_dataframe([_candidate()], display_lookback=20)
-    assert len(df.columns) == 53
+    assert len(df.columns) == 54
 
 
 def test_results_to_dataframe_excludes_tuple_valued_stability_internals():
@@ -111,6 +115,16 @@ def test_results_to_dataframe_one_row_per_candidate():
 def test_results_to_dataframe_raises_for_unrequested_display_lookback():
     with pytest.raises(ValueError, match="90"):
         results_to_dataframe([_candidate(lookbacks=(20, 40, 60))], display_lookback=90)
+
+
+def test_results_to_dataframe_label_defaults_to_none():
+    df = results_to_dataframe([_candidate()], display_lookback=20)
+    assert df.iloc[0]["label"] is None
+
+
+def test_results_to_dataframe_carries_explicit_label():
+    df = results_to_dataframe([_candidate(label="My Strategy Set Entry")], display_lookback=20)
+    assert df.iloc[0]["label"] == "My Strategy Set Entry"
 
 
 def test_results_to_dataframe_preserves_exact_scaled_weights():

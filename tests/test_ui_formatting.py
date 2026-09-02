@@ -26,17 +26,24 @@ from template_scanner.scan_results import ScanCandidateResult, results_to_datafr
 
 from ui.formatting import (
     ALL_FILTER_SPECS,
+    DEFAULT_VISIBLE_COLUMNS,
     DISPLAY_COLUMNS,
     FILTER_SPECS,
     NO_SECONDARY_RANK,
+    OPTIONAL_COLUMN_LABELS,
+    RANK_COLUMN,
     RANK_METRIC_OPTIONS,
     RESULT_COLUMN_HELP,
     STABILITY_FILTER_SPEC,
+    STRATEGY_LABEL_COLUMN,
     add_rank_column,
+    apply_column_selection,
     apply_interval_override,
+    available_markets,
     build_definitions_from_grid,
     build_filter_criteria,
     build_sort_keys,
+    fmt_label,
     fmt_number,
     fmt_percent,
     format_percentile,
@@ -372,6 +379,36 @@ def test_fmt_percent_formats_fraction():
     assert fmt_percent(0.4567, decimals=1) == "45.7%"
 
 
+def test_fmt_label_renders_none_as_dash():
+    assert fmt_label(None) == "—"
+
+
+def test_fmt_label_renders_blank_string_as_dash():
+    assert fmt_label("   ") == "—"
+
+
+def test_fmt_label_passes_through_a_real_label():
+    assert fmt_label("Churning") == "Churning"
+
+
+def test_to_display_dataframe_strategy_label_defaults_to_dash(_scan_candidate):
+    # _scan_candidate has no label set (ScanCandidateResult.label defaults
+    # to None) -- the new Strategy Label column must render the same
+    # missing-value dash as every other column, never "None".
+    results_df = results_to_dataframe([_scan_candidate], display_lookback=20)
+    display = to_display_dataframe(results_df)
+    assert display.iloc[0]["Strategy Label"] == "—"
+
+
+def test_to_display_dataframe_shows_a_real_strategy_label(_scan_candidate):
+    import dataclasses
+
+    labeled = dataclasses.replace(_scan_candidate, label="Churning")
+    results_df = results_to_dataframe([labeled], display_lookback=20)
+    display = to_display_dataframe(results_df)
+    assert display.iloc[0]["Strategy Label"] == "Churning"
+
+
 def test_to_display_dataframe_empty_results():
     empty = results_to_dataframe([], display_lookback=20)
     display = to_display_dataframe(empty)
@@ -413,11 +450,14 @@ def test_display_columns_match_approved_column_order():
     # fully available in the backend -- FILTER_SPECS still has
     # "normalized_crossing_frequency_min" and RANK_METRIC_OPTIONS still
     # has "Normalized Crossing Frequency" -- only the default visible
-    # table dropped it.
+    # table dropped it. Strategy Label is the newest column (Range Bound
+    # Opportunities UI enhancement) -- optional, appended last, not in
+    # DEFAULT_VISIBLE_COLUMNS (see test_default_visible_columns_* below).
     labels = [label for label, _, _ in DISPLAY_COLUMNS]
     assert labels == [
         "Strategy", "Ratio", "Current", "Low", "Median", "High",
         "Position", "Z", "|Z|", "Movement", "Osc", "ER", "Half-Life",
+        "Strategy Label",
     ]
     assert "Cross Freq" not in labels
 
@@ -483,6 +523,67 @@ def test_add_rank_column_prepends_sequential_rank():
     assert list(ranked["Rank"]) == ["#1", "#2", "#3"]
     # Row order/content otherwise untouched.
     assert list(ranked["Strategy"]) == ["A", "B", "C"]
+
+
+# ---------------------------------------------------------------------
+# Column selector (OPTIONAL_COLUMN_LABELS / DEFAULT_VISIBLE_COLUMNS /
+# apply_column_selection) -- Range Bound Opportunities UI enhancement.
+# ---------------------------------------------------------------------
+
+def test_optional_column_labels_is_rank_plus_every_display_column():
+    assert OPTIONAL_COLUMN_LABELS[0] == RANK_COLUMN
+    assert OPTIONAL_COLUMN_LABELS[1:] == tuple(label for label, _, _ in DISPLAY_COLUMNS)
+
+
+def test_default_visible_columns_excludes_only_strategy_label():
+    assert STRATEGY_LABEL_COLUMN not in DEFAULT_VISIBLE_COLUMNS
+    assert set(DEFAULT_VISIBLE_COLUMNS) == set(OPTIONAL_COLUMN_LABELS) - {STRATEGY_LABEL_COLUMN}
+
+
+def test_default_visible_columns_matches_the_original_thirteen_plus_rank():
+    # Pinning test: this is the exact set that must render when every
+    # column is left at its default (existing behaviour/appearance
+    # preserved) -- Strategy Label is the only new column and it is
+    # deliberately excluded here.
+    assert list(DEFAULT_VISIBLE_COLUMNS) == [
+        "Rank", "Strategy", "Ratio", "Current", "Low", "Median", "High",
+        "Position", "Z", "|Z|", "Movement", "Osc", "ER", "Half-Life",
+    ]
+
+
+def test_apply_column_selection_keeps_only_selected_columns_in_original_order():
+    df = pd.DataFrame({"Rank": ["#1"], "Strategy": ["SRAH26"], "Current": [1.0], "Z": [0.1]})
+    projected = apply_column_selection(df, ["Z", "Rank"])  # selection order shouldn't matter
+    assert list(projected.columns) == ["Rank", "Z"]
+
+
+def test_apply_column_selection_empty_selection_returns_zero_columns_same_rows():
+    df = pd.DataFrame({"Rank": ["#1", "#2"], "Strategy": ["A", "B"]})
+    projected = apply_column_selection(df, [])
+    assert list(projected.columns) == []
+    assert len(projected) == 2
+
+
+def test_apply_column_selection_never_recomputes_values():
+    df = pd.DataFrame({"Rank": ["#1"], "Current": [42.0]})
+    projected = apply_column_selection(df, ["Current"])
+    assert projected.iloc[0]["Current"] == 42.0
+
+
+# ---------------------------------------------------------------------
+# Market filter options (available_markets) -- Range Bound Opportunities
+# UI enhancement.
+# ---------------------------------------------------------------------
+
+def test_available_markets_returns_sorted_unique_market_keys(_scan_candidate):
+    import dataclasses
+
+    other = dataclasses.replace(_scan_candidate, market_key="SONIA")
+    assert available_markets([_scan_candidate, other, _scan_candidate]) == ["SOFR", "SONIA"]
+
+
+def test_available_markets_empty_results():
+    assert available_markets([]) == []
 
 
 def test_selected_strategy_summary_fields(_scan_candidate):
