@@ -434,3 +434,157 @@
   (`call_count == 1`, no retry storm) both at the `core.downloader`
   classifier level and at the `database.service` legacy-fallback level.
   (`tests/test_downloader.py`, `tests/test_service_provider_fallback.py`)
+
+---
+
+## v0.15.0
+
+### Added
+- **Intermarket Strategy Engine** — lets a SINGLE strategy combine legs
+  from DIFFERENT markets (e.g. a SOFR leg + a SONIA leg priced into one
+  series), as an additive sibling to the existing single-market
+  `StrategyDefinition`/`StrategyInstance` path, which is completely
+  unmodified.
+  - `strategy_engine/intermarket_definitions.py`: `LegSpec(market_key,
+    offset, weight)` and `IntermarketDefinition(legs, interval,
+    price_field, bp_per_point=None)`, plus `resolve_display_market_key()`/
+    `resolve_display_offsets()` (display-only composite labels for
+    scanner result tables — never used for provider/cache/pricing/bp
+    purposes).
+  - `strategy_engine/intermarket_combinations.py`:
+    `IntermarketStrategyInstance(definition, rics)` and
+    `generate_intermarket_instances()`. Offset semantics (design-
+    reviewed): a `LegSpec.offset` is always a position on THAT LEG'S OWN
+    contract curve — only the `offset == 0` "anchor" legs' calendars are
+    intersected to find valid anchor periods; every non-anchor leg then
+    steps forward on its OWN independent curve from there. An earlier
+    draft intersected every leg's calendar before applying offsets,
+    which silently discarded real contracts on a finer-grained market's
+    curve whenever paired with a coarser one — corrected before this was
+    committed.
+  - `range_analytics/units.py`: `BpConversionUnavailable` +
+    `resolve_bp_per_point()` — an `IntermarketDefinition` with no
+    explicit `bp_per_point` override leaves bp-derived fields as `NaN`
+    rather than guessing a market's bp convention or aborting the scan.
+  - `strategy_sets/model.py`: `IntermarketStrategySetEntry`,
+    `StrategySet.intermarket_entries` (additive, default-empty). JSON
+    entries are discriminated by `"legs"` key presence, never a type tag.
+  - `template_scanner/universe.py`: `dedupe_intermarket_candidates()`, a
+    sibling to the existing `dedupe_candidates()`.
+  - `test_intermarket.py` (repository root): a TEMPORARY, standalone
+    manual validation harness — NOT a pytest file — that independently
+    verifies leg-RIC-to-`LegSpec` correspondence and
+    `Strategy = sum(leg_price_i * leg_weight_i)` against real LSEG/
+    QuantHub data. Run directly (`python test_intermarket.py`), not via
+    pytest.
+  - Unit tests: `tests/test_intermarket_definitions.py`,
+    `tests/test_intermarket_combinations.py`,
+    `tests/test_intermarket_pricing_compatibility.py`,
+    `tests/test_intermarket_strategy_set_end_to_end.py`,
+    `tests/test_intermarket_strategy_set_provider_routing.py`, plus
+    extensions to the range_analytics/strategy_sets/template_scanner
+    test suites.
+
+### Fixed
+- `strategy_sets/execution.py`'s `with_interval_override()` previously
+  rebuilt only `strategy_set.entries` under the new interval, silently
+  leaving `intermarket_entries` at their original interval. Now rebuilds
+  both collections.
+
+### Notes
+- Backend only: there is no Streamlit UI to author/edit an intermarket
+  Strategy Set entry (JSON-only today), and no live UI button triggers
+  the execution path that would scan one
+  (`strategy_sets/execution.py`/`run_scan_on_instances()`).
+
+---
+
+## v0.15.1
+
+### Fixed
+- **`UserNotPermission.92000` was only recognized under one specific
+  service/product prefix.** `core/downloader.py`'s
+  `_is_confirmed_no_intraday_permission()` was hardcoded to
+  `"TS.Intraday.UserNotPermission.92000"`; a real production error
+  arrived as `"TSCC.QS.UserNotPermission.92000"` — same condition,
+  different prefix — and was not recognized, so it retried needlessly
+  (LSEG entitlement failures are not transient and can never succeed on
+  retry). The classifier now matches on the stable
+  `"UserNotPermission.92000"` substring, with a trailing-digit boundary
+  guard so a hypothetical longer code (e.g. `.920001`) can never
+  false-positive — deliberately prefix-agnostic rather than adding a
+  second hardcoded prefix. Confirmed not retried by tenacity
+  (`call_count == 1`) for both real-world forms, at both the
+  `core.downloader` classifier level and the `database.service`
+  legacy-fallback level. (`tests/test_downloader.py`,
+  `tests/test_service_provider_fallback.py`)
+
+---
+
+## v0.16.0
+
+### Fixed
+- **`ui/app.py` never loaded `.env`, so QuantHub/LSEG credentials set
+  only in a local `.env` file were invisible to the live Streamlit app**
+  even though `python-dotenv` was already a pinned dependency and other
+  entry points (test scripts) loaded it themselves. `core.config`/
+  `core.quanthub`/`core.downloader` read `RBS_*` settings via
+  `os.environ.get()` at module-import time, so the environment must be
+  populated before their first import. `ui/app.py` now calls
+  `load_dotenv()` immediately after its existing `sys.path` bootstrap
+  and before any `ui.*`/`core.*` import — no other file changed.
+
+---
+
+## v0.17.0
+
+### Added
+- **Range-Bound Opportunities: Market filter, column selector, and
+  Strategy Label.**
+  - **Market filter** (`ui.results_view`, `ui.formatting.
+    available_markets()`): a multiselect above the result table, options
+    drawn from the markets represented in the CURRENT scan's own
+    results, defaulting to every market selected. Filters displayed rows
+    only — never strategy expansion, pricing, provider, or cache logic —
+    and `Rank` stays contiguous over whatever's currently shown.
+  - **Column selector** ("Columns ▾" popover,
+    `ui.formatting.OPTIONAL_COLUMN_LABELS`/`DEFAULT_VISIBLE_COLUMNS`/
+    `apply_column_selection()`): every result-table column (`Rank`
+    through `Half-Life`) is independently optional; all 14 pre-existing
+    columns stay visible by default, preserving the table's appearance
+    exactly.
+  - **Strategy Label** (`ScanCandidateResult.label`, new optional
+    `"Strategy Label"` column, hidden by default): shows the actual
+    originating Strategy Set entry name / strategy-grid row Label,
+    threaded through `run_scan()`/`run_scan_on_instances()`/
+    `analyze_histories()` by `id(instance.definition)` — one grid row's
+    `StrategyDefinition` object is reused by reference across every
+    contract it rolls into, so this correctly labels every candidate a
+    given row produced. Never derived/reconstructed from RICs or
+    weights.
+  - Unit tests extended: `tests/test_template_scanner_scanner.py`,
+    `tests/test_template_scanner_scan_results.py`,
+    `tests/test_ui_formatting.py`.
+
+### Documentation
+- CLAUDE.md/README.md updated to reflect the Intermarket Strategy
+  Engine (v0.15.0), the prefix-agnostic `92000` fix (v0.15.1), the
+  `.env` loading fix (v0.16.0), and this Range-Bound Opportunities UI
+  enhancement, plus two QuantHub debugging notes found along the way:
+  `sync_ranges`/provider-provenance lookups are keyed on the LSEG RIC,
+  never the differently-formatted QuantHub instrument identifier
+  (e.g. `CRAU6` vs `CRAU26`); and an observed QuantHub `count=` can
+  legitimately differ between calls for a legacy-provenance RIC,
+  reflecting the cache's actual coverage at call time, not a bug in
+  `_estimate_count()`/`_missing_ranges()`.
+- **Known gap in this changelog**: the Module 7B Strategy Set UI
+  integration, Strategy Set Import (Excel/CSV), the configurable
+  robust-range percentile band, and the Movement/Oscillation Count
+  ("Tradability Analytics") metrics all shipped in the repository's
+  history between v0.14.0 and this entry but were never given their own
+  changelog entries at the time. CLAUDE.md/README.md now describe all
+  of them accurately as CURRENT functionality (verified directly
+  against the code in this documentation pass); this changelog is not
+  being retroactively backfilled for that older gap, to avoid
+  fabricating version numbers or dates for work this pass did not
+  itself trace commit-by-commit.

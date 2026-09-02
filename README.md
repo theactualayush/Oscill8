@@ -122,10 +122,32 @@ for display.
   rolling an enabled set into the same `StrategyInstance[]` shape
   `template_scanner` already builds internally. The contract-selection
   window is a call-time argument, not part of the saved object, so a
-  saved set never goes stale as "today" moves. (Additional Strategy Set
-  work beyond this engine has since landed in the repository but is out
-  of scope for this documentation pass — see the note at the end of this
-  README.)
+  saved set never goes stale as "today" moves.
+- **Module 7B — Strategy Set UI integration** (`ui/strategy_set_view.py`,
+  `ui/strategy_set_state.py`, `ui/strategy_set_formatting.py`): a
+  Strategy Set selector (with Save/"+ New"/Delete) built directly into
+  the Strategy Templates section — **not** a second grid or a second
+  Run button. "Strategy Templates is the working grid; a Strategy Set is
+  simply a saved named version of that grid" — loading a set populates
+  the grid's rows (each carrying its own Market/Interval, so a set can
+  mix markets, e.g. SOFR + SONIA + CORRA entries), and Run Scan always
+  goes through the one, single `run_scan()` path regardless of whether a
+  row was typed manually or loaded from a saved set. See [Current
+  UI](#current-ui) below.
+- **Strategy Set Import** (`strategy_import/`, `ui/strategy_import_view.py`):
+  turns an uploaded `.xlsx` workbook (one worksheet = one Strategy Set)
+  or `.csv` file (one file = one Strategy Set) into ordinary
+  `StrategySet` objects, via a parse → validate → preview → commit
+  pipeline (`strategy_import.parsing`/`validation`/`preview`/`commit`).
+  Each row's Market/position columns are validated with the same
+  dense-weight translator the manual grid uses; a row is classified as
+  ready, unavailable (a real market Oscill8 recognizes by name but has
+  no configured `MarketDefinition` for — currently none, since EURIBOR/
+  SARON/YBA/ESTR_ICE now all have entries), or invalid (bad market
+  code/position value) — never silently dropped. Nothing is written to
+  `StrategySetRepository` until the user explicitly confirms the preview.
+  An imported Strategy Set is byte-for-byte the same kind of object a
+  hand-built one is.
 - **Module 8 — QuantHub Secondary Provider & Provider Provenance**
   (`core/quanthub.py`, `core/providers.py`, `database/`): a second market-
   data provider for markets LSEG cannot fully serve, with a persisted
@@ -394,43 +416,65 @@ independent "generic curve" price series either — see
 ## Current UI
 
 Run with `streamlit run ui/app.py` (see [Running the application](#running-the-application)).
-The workflow, top to bottom:
+A dark, compact "trading terminal" theme (`.streamlit/config.toml`); the
+**Strategy Workspace renders above Scan Configuration** ("what am I
+scanning?" before "how should it be measured?"). Top to bottom:
 
-1. **Scan configuration panel** — Market, Interval, contract Universe
-   date range (which contracts get rolled into candidates), price
-   History date range (what date range gets priced for those legs, an
-   independent window from Universe), Lookbacks (bars) — one or more
-   analysis horizons in bars/observations, not calendar days — and
-   Primary Lookback: *"the horizon used for the headline range metrics
-   shown for each candidate; other requested lookbacks are used for
-   multi-lookback/stability analysis."* Run Scan triggers exactly one
-   `run_scan()` call; nothing below it re-runs the scan.
-2. **Strategy Templates grid** — one row per template, curve positions
-   (bare numbers, see [Templates](#templates-and-candidate-generation)
-   above for why they're not contract codes) as editable columns. `0` or
-   a blank cell means "skip this position." Multiple rows/multiple
-   templates in one scan are supported, as is adding/removing rows and
-   changing how many position columns are shown.
+1. **Strategy Workspace** — a Strategy Set selector (Save/"+ New"/
+   Delete/Import — see the Module 7B / Strategy Set Import bullets under
+   [Completed modules](#completed-modules) above) integrated into the
+   header of ONE strategy grid — there is no separate Strategy Set panel
+   and no second Run button. Each grid row carries its own Label, Market, and Interval
+   (so one grid/one Strategy Set can mix markets and intervals) plus
+   curve-position columns (bare numbers, see
+   [Templates](#templates-and-candidate-generation) above for why
+   they're not contract codes) — `0`/blank means "skip this position."
+   Rows can be added/removed and the position count changed freely.
+2. **Scan Configuration** — **Interval** (the single runtime interval
+   every leg of the scan is forced to, overriding whatever each row's
+   own Interval cell says — that cell still round-trips through
+   save/load unchanged); **Contracts** (the active-contract Universe —
+   fully automatic, not a user-entered date range: it always runs from
+   today out to a fixed ~2-year forward horizon, shown as a read-only
+   "📈 Automatic" indicator); **Price History** Start/End (a separate,
+   still user-editable window — what date range gets priced, defaulting
+   to the last ~6 months); **Lookbacks (bars)** — one or more analysis
+   horizons in bars/observations, not calendar days — with a **Primary
+   Lookback** selector (*"the horizon used for the headline range
+   metrics shown for each candidate; other requested lookbacks are used
+   for multi-lookback/stability analysis"*); and **Lower/Upper %ile** —
+   the robust-range percentile band (default 5/95, any `0 <= lower <
+   upper <= 100`, see [Range-Bound Metrics](#range-bound-metrics) below
+   — this is no longer hard-coded). "▶ Run Scan" triggers exactly one
+   `run_scan()` call; there is no separate Market selector — a row's own
+   Market always determines which market that leg prices against.
 3. **Range-Bound Opportunities** — after Run Scan: an analyzed/skipped/
-   shown status line, a "Ranked by: `<metric>` ↑/↓ · Lower/Higher is
-   better" label reflecting the current ranking, `Ranking ▾`/`Filters ▾`
-   popovers (primary + optional secondary ranking key; the existing
-   filter set — Efficiency Ratio, Normalized Crossing Frequency, AR(1)
-   Beta, Half-Life, Robust Range Width, AR(1) R², and one Module 4B
-   stability filter — each independently enable/disable-able, no
-   threshold hard-coded), and the ranked result table itself (`Rank`,
-   `Strategy`, `Ratio`, `Current`, `Median`, `Pos`, `Width`, `ER`, `Cross
-   Freq`, `Half-Life`, `AR1 β`). Skipped candidates (unavailable RICs)
-   stay visible in an expander, never silently hidden. A "Columns ▾"
-   popover (in-progress, uncommitted at the time of this documentation
-   pass) additionally lets the trader show/hide optional result-grid
-   columns via a multiselect — `Rank` and `Strategy` always stay visible
-   since they identify the row; hiding a column is display-only and
-   never removes the underlying metric from the scan result.
+   shown status line, a **Market** multiselect (options are exactly the
+   markets represented in the current scan's own results, default = all
+   selected) that filters which rows are displayed only — it never
+   touches strategy expansion, pricing, provider, or cache logic, and
+   the `Rank` column stays contiguous over whatever's currently shown; a
+   "Ranked by: `<metric>` ↑/↓ · Lower/Higher is better" label; `Ranking
+   ▾`/`Filters ▾` popovers (primary + optional secondary ranking key;
+   the filter set — Efficiency Ratio, Normalized Crossing Frequency,
+   AR(1) Beta, Half-Life, Robust Range Width, AR(1) R², Absolute
+   Z-Score, Oscillation Count, Movement, and one Module 4B stability
+   filter — each independently enable/disable-able, no threshold
+   hard-coded); a **Columns ▾** popover (a multiselect of every optional
+   result-table column, all selected by default so the table's default
+   appearance is unchanged); and the ranked result table itself:
+   `Rank`, `Strategy`, `Ratio`, `Current`, `Low`, `Median`, `High`,
+   `Position`, `Z`, `|Z|`, `Movement`, `Osc`, `ER`, `Half-Life` — plus an
+   optional **Strategy Label** column (hidden by default), which shows
+   the actual originating Strategy Set entry name/grid row Label rather
+   than anything derived from RICs or weights. Skipped candidates
+   (unavailable RICs) stay visible in an expander, never silently
+   hidden.
 4. **Selected Strategy** — clicking a result row's checkbox selects it
    (the whole row highlights); a summary panel shows its rank, RICs,
-   ratio, interval, and headline Current/Median/Robust Range/Position/ER
-   at the Primary Lookback.
+   ratio, interval, and headline Current/Mean/Median/Robust Range/
+   Position/Z-Score/ER/Movement/Oscillations at the Primary Lookback and
+   currently-selected percentile band.
 5. **Selected Strategy History chart** (Module 6B) — the selected
    candidate's Strategy price series plotted against its Robust Low/
    Median/Robust High levels, with a Chart Horizon selector limited to
@@ -452,10 +496,14 @@ in `range_analytics/results.py`).
 - **`range_low_full` / `range_high_full` / `range_width_full`** — the
   window's plain min/max/width.
 - **`range_low_robust` / `range_high_robust` / `range_width_robust`** —
-  the window's **5th and 95th percentiles** (`series.quantile(0.05)`,
-  `series.quantile(0.95)`) and their difference. **These percentile
-  bounds (5/95) are currently hard-coded** — there is no configurable
-  percentile band today (see [Current limitations](#current-limitations--deferred-work)).
+  a **configurable** percentile band of the window (`series.quantile(lower/100)`,
+  `series.quantile(upper/100)`) and their difference, threaded end to
+  end from `range_analytics.location`/`analyze_range()` through
+  `analyze_multi_lookback()`/`ScanRequest.lower_percentile`/
+  `upper_percentile` to the UI's own Lower/Upper %ile inputs (see
+  [Current UI](#current-ui) above); `validate_percentiles()` enforces
+  `0 <= lower_percentile < upper_percentile <= 100`. Defaults to 5/95 —
+  not a hard-coded value, just the default.
 - **`range_position_full` / `range_position_robust`** — `(current - low)
   / (high - low)` against the full or robust range respectively.
   Deliberately **not clipped to [0, 1]** — a value outside that band
@@ -483,6 +531,21 @@ in `range_analytics/results.py`).
 - **`normalized_crossing_frequency`** — a Module 5B derived metric,
   `hysteresis_crossing_count / (observation_count - 1)`
   (`template_scanner/metrics.py`), NaN when fewer than 2 observations.
+- **`oscillation_count`** ("Tradability Analytics", the UI's `Osc`
+  column) — the number of completed Top↔Bottom traversal-and-return
+  cycles between the window's `range_low_robust`/`range_high_robust`
+  boundaries (`range_analytics.oscillation.count_oscillations`); a
+  materially different metric from `raw_crossing_count`/
+  `hysteresis_crossing_count` above (single-equilibrium half-traversals
+  around the median) — neither replaces the other. Depends directly on
+  the selected percentile band.
+- **`mean_abs_change_price` / `mean_abs_change_bp`** ("Tradability
+  Analytics", the UI's `Movement` column) —
+  `mean(abs(S_t - S_(t-1)))` over the window
+  (`range_analytics.movement.mean_absolute_change`), converted to bp via
+  each market's own `bp_per_point`. Deliberately NOT percentile-
+  dependent — unlike the robust-range/oscillation fields above, changing
+  the percentile band never changes Movement for the same window.
 - **`range_to_volatility_ratio`** — a Module 4B/5B derived metric: the
   robust range width (in bp) divided by realized volatility (in bp) —
   how large the historical range is relative to a typical single-bar
@@ -521,27 +584,36 @@ object.
 
 ## Current limitations / deferred work
 
-- **Configurable robust-range percentile bounds** — not implemented. The
-  5th/95th percentile robust-range bounds are currently hard-coded (see
-  [Range-Bound Metrics](#range-bound-metrics)); letting a user choose a
-  different band (e.g. 10/90, 25/75) is a considered future change, not
-  yet built and not yet approved.
-- **Z-score / current-dislocation analytics** — not implemented. A
-  standard and/or robust Z-score to separate "quality of historical
-  range-boundedness" from "current distance from equilibrium" is under
-  consideration; its exact statistical definition has not been approved.
-- **Intermarket strategies** (legs spanning more than one market) — not
-  implemented. `StrategyDefinition.market_key` is singular by design;
-  cross-market alignment/risk-normalization is deferred.
+- **Z-score / current-dislocation analytics** — `RangeAnalytics.z_score`
+  (`(current - mean) / std` over the window) and a derived
+  `abs_z_score` (its absolute value, used for the UI's `Z`/`|Z|`
+  columns and an "Absolute Z-Score" filter/rank option) are implemented
+  and shown today. What's still **not implemented**: a *separate*
+  standard and/or robust Z-score intended specifically to distinguish
+  "quality of historical range-boundedness" from "current distance from
+  equilibrium" — that is a distinct statistical concept from `z_score`/
+  `abs_z_score` and has not been designed or approved.
+- **Intermarket strategies** (legs spanning more than one market)
+  within a SINGLE strategy — **implemented at the backend level**
+  (`strategy_engine.intermarket_definitions`/`intermarket_combinations`,
+  `strategy_sets.IntermarketStrategySetEntry`, scanner/`range_analytics`
+  integration). `StrategyDefinition.market_key` itself is still
+  singular — this works by an additive sibling model (`LegSpec`/
+  `IntermarketDefinition`), not a change to `StrategyDefinition`. **Not
+  yet implemented**: any Streamlit UI to author/edit an intermarket
+  Strategy Set entry (JSON-only today — hand-edit the file), and no
+  live UI button triggers the execution path that would actually scan
+  one (`strategy_sets/execution.py`, `template_scanner.scanner.
+  run_scan_on_instances()`) — see `test_intermarket.py` for a
+  standalone, non-pytest validation harness against real market data
+  instead.
 - **Explicit "Real Contract" mode** (scanning one specific, user-picked
   set of dated contracts rather than a rolled template) — not
-  implemented in the UI. The backend primitives it would need
-  (`StrategyInstance`, `build_history()`, `template_scanner.
-  analyze_histories()`, `core.futures_calendar.generate_contracts()`)
-  already exist, but `run_scan()` does not currently expose an
-  instances-in/`ScanReport`-out entry point with the skip-handling that
-  a UI for this would need without duplicating scanner.py's internal
-  loop.
+  implemented in the UI. The backend primitives it would need already
+  exist, including an instances-in/`ScanReport`-out entry point
+  (`template_scanner.scanner.run_scan_on_instances()`, added for the
+  intermarket work above) — but no UI surface calls it for this
+  purpose today.
 - **True Generic-vs-Real-contract mode distinction** — not implemented.
   Today's scanner is a single position-relative rolling-template mode
   (see [Templates](#templates-and-candidate-generation)); it is not a
@@ -602,7 +674,7 @@ pytest -q
 
 Current suite (snapshot as of this documentation pass — re-run the
 command above for the up-to-date count, do not trust this number
-blindly): **1270 tests** — 1267 passing, 1 known environment-specific
+blindly): **1293 tests** — 1290 passing, 1 known environment-specific
 failure (see below), 2 skipped. Unit tests, LSEG and QuantHub both
 mocked — no live session required for the pytest suite itself.
 `tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema`
@@ -638,33 +710,23 @@ strategy_engine/   StrategyDefinition, rolling contract combinations, historical
 range_analytics/   Range-bound (4A) and multi-lookback stability (4B) measurements
 template_scanner/  Dense-grid templates, candidate universe, scan orchestration, filtering/ranking (5A/5B)
 strategy_sets/     Named, JSON-persisted collections of StrategyDefinitions (7A)
-ui/                Streamlit UI (6A/6B) -- app.py, state.py, controls.py, scan_view.py,
-                   results_view.py, chart_view.py, formatting.py
+strategy_import/   Excel/CSV -> StrategySet import (parse/validate/preview/commit pipeline)
+ui/                Streamlit UI (6A/6B/7B) -- app.py, state.py, controls.py, scan_view.py,
+                   results_view.py, chart_view.py, formatting.py, error_formatting.py,
+                   strategy_set_view.py/state.py/formatting.py, strategy_import_view.py/state.py
 tests/             Unit tests for every module above (pytest, LSEG and QuantHub mocked)
 ```
 
 ## Current status
 
-Modules 1 through 9 (LSEG data layer through the Streamlit scanner UI,
-selected-strategy history chart, Strategy Set engine, the QuantHub
-secondary provider / provider-provenance / effective-request-end work,
-and the intermarket strategy engine) are complete and tested at the
-backend level. Module 9 (intermarket) has no Streamlit UI surface yet —
-see its entry above. See
-[Current limitations / deferred work](#current-limitations--deferred-work)
-for what is explicitly out of scope today.
-
-**Documentation scope note:** this README was last brought up to date
-specifically for the QuantHub/provider-provenance work (Module 8) and
-the market-metadata additions it depends on. A `git log` review during
-that pass surfaced several further merged commits — a Strategy Set UI
-panel wired into the scanner, configurable range-percentile bounds and
-Z-score/absolute-Z-score analytics, movement/oscillation tradability
-metrics, multi-market Strategy Set regression coverage, and a UI
-redesign — that are **not yet reflected in this document**. They were
-deliberately left out of this pass (scoped to QuantHub/provider work
-only, per explicit instruction) rather than documented speculatively.
-Treat any statement above about Module 7A/6A-6B scope, the default
-result-table columns, or the scanner's filter/rank options as
-potentially superseded by that later work until a follow-up
-documentation pass covers it.
+Modules 1 through 9 — LSEG data layer, the SQLite cache, the strategy
+engine, range-bound and multi-lookback analytics, the template scanner,
+the Streamlit scanner UI (including the Module 7B Strategy Set panel
+and Excel/CSV Strategy Set import), the selected-strategy history
+chart, the Strategy Set engine, the QuantHub secondary provider /
+provider-provenance / effective-request-end work, and the intermarket
+strategy engine — are complete and tested. Module 9 (intermarket) is
+backend-only: there is no Streamlit UI to author/edit an intermarket
+Strategy Set entry, and no live UI button triggers the scan-execution
+path for one (see [Current limitations / deferred
+work](#current-limitations--deferred-work)).

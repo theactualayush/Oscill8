@@ -312,14 +312,21 @@ tests/
 
 Key design points a future session needs:
 
-- **Robust range bounds are HARD-CODED at P5/P95**
-  (`series.quantile(0.05)` / `series.quantile(0.95)` in `location.py`) —
-  there is no configurable percentile parameter today. A future
-  "configurable percentile band" feature (5/95, 10/90, 25/75, ...) is
-  under consideration but **not implemented, not started, and not
-  approved** — it would touch `location.py`'s `range_low_robust`/
-  `range_high_robust`/`range_width_robust` plus `RangeAnalytics`/
-  `analyze_range()`'s signature.
+- **Robust range bounds are CONFIGURABLE, not hard-coded.**
+  `location.py`'s `range_low_robust(series, lower_percentile=5.0)`/
+  `range_high_robust(series, upper_percentile=95.0)`/
+  `range_width_robust(series, lower_percentile=5.0, upper_percentile=95.0)`
+  each take the percentile bound(s) as parameters (default 5.0/95.0,
+  preserving the original behavior when unspecified);
+  `location.validate_percentiles(lower, upper)` enforces
+  `0 <= lower_percentile < upper_percentile <= 100`.
+  `RangeAnalytics`/`analyze_range()` accept and store the same
+  `lower_percentile`/`upper_percentile` (also threaded through
+  `analyze_multi_lookback()` and `ScanRequest`, all the way to the UI's
+  own Lower/Upper %ile inputs — see Module 6A). This superseded an
+  earlier hard-coded-P5/P95 design; the note that a "configurable
+  percentile band" was merely under consideration is stale and no
+  longer applies.
 - `range_position` (full and robust) is deliberately **not clipped to
   [0, 1]** — a value outside `[low, high]` is itself meaningful (current
   sits below the historical low, or above the P95) and is surfaced as
@@ -514,34 +521,52 @@ Key design points a future session needs:
 
 ## Module 6A – Streamlit Range-Bound Scanner UI
 
-COMPLETED AND TESTED. Shipped in two passes: an initial minimal
-functional scanner, then a compact trader-facing redesign (grouped
-scan panel, curve-position strategy grid replacing free-text ratio
-entry, results made the dominant visual section, Ranking/Filters
-popovers, tooltips).
+COMPLETED AND TESTED. Shipped across several passes — an initial
+minimal functional scanner, a compact trader-facing redesign, a full
+dark "trading terminal" UI/UX redesign, the Module 7B Strategy Set
+panel and Strategy Set Import integration (documented separately
+above), and most recently the Range-Bound Opportunities Market
+filter/column selector/Strategy Label enhancement. This section
+describes the CURRENT state of the core scanner UI as the code reads
+today, not each historical pass individually.
 
 ui/
     __init__.py     (package docstring / file-responsibility map)
-    app.py           (entry point / page orchestration -- `streamlit run ui/app.py`)
+    app.py           (entry point -- `streamlit run ui/app.py`; loads
+                     `.env` via `python-dotenv` before any Oscill8
+                     import, see the Environment Configuration note
+                     under Module 8)
     state.py          (session-state keys: expensive scan result +
                      selected-candidate/history cache -- see Module 6B)
-    controls.py        (scan panel: market/interval/dates/lookbacks/Run Scan;
-                     strategy grid: curve positions as columns, one row
-                     per template)
-    scan_view.py         (Run Scan: builds ScanRequest, calls run_scan()
-                     exactly once per press, UI-boundary error handling)
-    results_view.py        ("Range-Bound Opportunities": status, ranking/
-                     filters popovers, ranked result grid, row ->
-                     ScanCandidateResult selection, Selected Strategy
-                     summary panel, skipped-candidates expander)
+    controls.py        (Strategy Workspace -- Strategy Set selector +
+                     ONE strategy grid, rendered ABOVE Scan
+                     Configuration -- Interval/Contracts/History/
+                     Analytics/Run Scan)
+    scan_view.py         (Run Scan: builds ScanRequest + a label-by-
+                     definition-id map, calls run_scan() exactly once
+                     per press, UI-boundary error handling)
+    results_view.py        ("Range-Bound Opportunities": status, Market
+                     filter, ranking/filters/columns popovers, ranked
+                     result grid, row -> ScanCandidateResult selection,
+                     Selected Strategy summary panel, skipped-candidates
+                     expander)
     formatting.py            (pure helpers: strategy-grid-row ->
                      StrategyDefinition translation, filter/sort-key
                      construction from template_scanner's own accessor
-                     factories, ranked-by/rank-column/selection formatting
-                     -- zero Streamlit import, fully unit-testable)
+                     factories, ranked-by/rank-column/column-selection/
+                     market-list formatting -- zero Streamlit import,
+                     fully unit-testable)
+
+See Module 7B and Strategy Set Import above for `ui/strategy_set_*.py`/
+`ui/strategy_import_*.py`, and `ui/error_formatting.py` for the pure
+exception -> trader-facing-headline translation `ui.scan_view` uses
+(never a traceback/vendor error code as the primary error message).
 
 tests/
-    test_ui_formatting.py, test_ui_controls.py
+    test_ui_formatting.py (65), test_ui_controls.py (17) -- 82 tests
+    for this section specifically; re-run `pytest -q tests/test_ui_
+    formatting.py tests/test_ui_controls.py` for the up-to-date count
+    rather than trusting a number recorded here.
 
 Key design points a future session needs:
 
@@ -551,13 +576,103 @@ Key design points a future session needs:
   design — every filter/sort accessor it builds is a closure over
   `template_scanner.filters.at_lookback()`/`stability()`, never a
   reimplementation.
-- **Pipeline order matters**: filter and rank the Python
-  `ScanCandidateResult` objects FIRST (`apply_filters` -> `rank_results`),
-  THEN build the display DataFrame (`results_to_dataframe` ->
-  `to_display_dataframe` -> `add_rank_column`) — row position in the
-  displayed grid must map back to the same-position entry in the ranked
-  candidate list, since row-selection in `st.dataframe` only gives back
-  a positional index.
+- **Render order: Strategy Workspace above Scan Configuration**
+  ("what am I scanning?" before "how should it be measured?") —
+  reversed from the module's original order. `_render_strategy_
+  templates()` (`ui/controls.py`) no longer needs a completed Scan
+  Configuration Interval selection to render first: it peeks the scan
+  bar's own Interval widget key as it stood after the PREVIOUS rerun
+  (`_peek_current_interval()`) purely to seed a brand-new blank row's
+  default Interval cell — cosmetic only, never authoritative; every
+  already-populated row keeps carrying its own persisted Interval
+  regardless of render order.
+- **No global Market selector; the grid's own per-row Market/Interval
+  are authoritative for WHAT gets priced.** Scan Configuration's ONE
+  Interval selector is a RUNTIME-ONLY override applied to every leg at
+  scan time (`ui.formatting.apply_interval_override()`, applied by
+  `ui.scan_view.handle_run_scan()`) — a row's own persisted Interval
+  cell (still shown/edited, still what a Strategy Set saves) can never
+  silently conflict with what a scan actually executes at. There is no
+  equivalent Market override: each row's own Market always determines
+  which market that leg prices against.
+- **Universe/Contracts is fully automatic, not a user-entered date
+  range.** `_default_universe_window(today)` (`ui/controls.py`) always
+  returns `(today, today + 730 days)` — Oscill8 scans the CURRENTLY
+  active contract curve, shown as a read-only "📈 Automatic" indicator,
+  never editable date inputs. "Today" is exactly the boundary
+  `core.futures_calendar.generate_contracts()` (the same function every
+  rolling scan already calls) uses to decide which contract-months are
+  still eligible, so no separate expiry calendar is needed to exclude
+  already-elapsed months. **Price History** (`price_start`/`price_end`
+  — what date range gets priced/analyzed) remains a completely separate,
+  still user-editable concept, defaulting to the last ~6 months
+  (`_default_history_window()`).
+- **The robust-range percentile band is a live UI control** — "Lower
+  %ile"/"Upper %ile" number inputs (default 5/95, `ui/controls.py`),
+  flowing into `ScanRequest.lower_percentile`/`upper_percentile` and
+  from there into every `range_analytics` call unchanged (see the
+  corrected Module 4A note above) — this is NOT hard-coded.
+- **Pipeline order matters**: filter (metric filters from the Filters
+  popover, AND the Market multiselect) and rank the Python
+  `ScanCandidateResult` objects FIRST (`apply_filters` -> market-key
+  filter -> `rank_results`), THEN build the display DataFrame
+  (`results_to_dataframe` -> `to_display_dataframe` -> `add_rank_column`
+  -> `apply_column_selection`) — row position in the displayed grid
+  must map back to the same-position entry in the ranked candidate
+  list, since row-selection in `st.dataframe` only gives back a
+  positional index. Column selection is the LAST step, purely display-
+  layer, after Rank is already assigned — hiding/showing a column never
+  affects Rank or row selection.
+- **Market filter** (`ui.results_view._render_market_filter()`,
+  `ui.formatting.available_markets()`): a `st.multiselect` whose options
+  are the distinct `market_key` values in the CURRENT scan's own
+  `report.results` — recomputed fresh every render, never a fixed/
+  global market list. Defaults to every market selected ("All
+  Markets"); the persisted selection is reset back to "all" only when
+  it would otherwise reference a market no longer present (Streamlit
+  raises if a multiselect's stored value isn't a subset of its current
+  options) — a selection that's still valid for a new scan's market set
+  is left alone, matching how Ranking/Filters already persist across
+  scans. Filtering here only changes which ROWS are displayed; it never
+  touches `strategy_engine`/`database`/provider/cache logic, and `Rank`
+  (assigned after this filter runs) stays contiguous over exactly
+  what's shown.
+- **Column selector ("Columns ▾" popover)**: `ui.formatting.
+  OPTIONAL_COLUMN_LABELS` is `RANK_COLUMN` plus every `DISPLAY_COLUMNS`
+  label, in table order — EVERY column, including `Rank` and
+  `Strategy`, is independently optional (nothing in row-selection
+  depends on any particular column being visible, since `st.dataframe`
+  selection is positional). `DEFAULT_VISIBLE_COLUMNS` is every label
+  except `"Strategy Label"` (see below) — i.e. the original 14 columns
+  stay visible by default, preserving the table's pre-existing
+  appearance exactly. `apply_column_selection(display_df,
+  selected_labels)` is a pure display-layer projection — it does NOT
+  force-keep any column — that preserves `display_df`'s existing column
+  order rather than the order columns were selected in (so toggling one
+  column never reshuffles the rest), and never removes the underlying
+  metric from `ScanCandidateResult`/`results_to_dataframe()`. Computed
+  fresh every rerun from the `"oscill8_visible_columns"` `st.multiselect`
+  widget state, with no separate persistence layer.
+- **Strategy Label column** (`STRATEGY_LABEL_COLUMN`, sourced from the
+  new `ScanCandidateResult.label` field): shows the ACTUAL originating
+  Strategy Set entry name / strategy-grid row Label — never re-derived
+  or reconstructed from RICs or weights. `ui.scan_view.handle_run_scan()`
+  builds a `{id(definition): row.label}` map right where grid rows are
+  translated into `StrategyDefinition`s, and passes it to `run_scan(
+  request, labels_by_definition_id=...)`; `template_scanner.scanner.
+  run_scan_on_instances()`/`analyze_histories()` thread it through by
+  `id(instance.definition)` (safe because one grid row's
+  `StrategyDefinition` object is reused BY REFERENCE across every
+  rolled candidate it produces — `strategy_engine.combinations.
+  generate_instances()`/`template_scanner.universe` never clone or
+  replace it) onto each surviving `ScanCandidateResult.label`. `None`
+  when no mapping is supplied (e.g. a direct `run_scan_on_instances()`/
+  `analyze_histories()` call, or a manually-typed row with a blank
+  Label — which itself gets an auto-generated `"Strategy {i+1}"` label
+  at grid-translation time, per `build_definitions_from_grid()`'s
+  existing convention). Available in the Columns popover; NOT in
+  `DEFAULT_VISIBLE_COLUMNS`, since it's a genuinely new column and the
+  spec calls for the table's default appearance to stay unchanged.
 - **Strategy grid is position-relative, not real-contract**: columns are
   bare curve-position numbers (`1, 2, 3, ...`), never real RIC codes —
   `template_from_dense_weights()` + `generate_instances()` roll a shape
@@ -574,48 +689,20 @@ Key design points a future session needs:
   correctly blank. `ui.formatting._cell_to_float()` parses the resulting
   strings, treating blank text and an incomplete mid-edit token (a lone
   `"-"` or `"."`) as 0 — same as an explicit 0 (skip this position).
-- **`Ranking ▾`/`Filters ▾` use `st.popover`**, not `st.expander` —
-  floating panels that don't push the results table down. The "Ranked
-  by: ..." label is built by reading the Ranking popover's persisted
-  `st.session_state` values BEFORE that popover's own widgets are
-  (re)created later in the same script pass (`_current_rank_state()` in
-  `results_view.py`) — safe because nothing changes state between that
-  read and the widgets' own creation in the same rerun.
-- No new backend capability was added to support this module — every
-  control maps onto an existing `template_scanner`/`strategy_engine`
-  public function.
-- **Column selector ("Columns ▾" popover, `ui/formatting.py` +
-  `ui/results_view.py`'s `_render_column_selector_popover()`)**: a
-  later, separate addition to this module, documented here from the
-  current code as-is — not modified as part of this documentation
-  pass. `ui.formatting.OPTIONAL_COLUMN_LABELS` is every `DISPLAY_COLUMNS`
-  label except `"Strategy"` (which, together with `RANK_COLUMN`,
-  identifies the row and is never offered as a choice).
-  `DEFAULT_VISIBLE_COLUMNS` is every optional column except `"Z"` (plain
-  Z-score) — `"|Z|"` (absolute Z-score) stays visible by default as the
-  more generally useful ranking measure, so `"Z"` alone starts hidden to
-  keep the table compact. `apply_column_selection(display_df,
-  selected_labels)` is a pure display-layer projection: it always keeps
-  `RANK_COLUMN` and `"Strategy"` regardless of `selected_labels` (even
-  an empty selection), and preserves `display_df`'s existing column
-  order rather than the order columns were selected in, so toggling one
-  column never reshuffles the rest. Hiding a column here never removes
-  the underlying metric from `ScanCandidateResult`/
-  `results_to_dataframe()` — it is display-only, computed fresh every
-  rerun from the `"oscill8_visible_columns"` `st.multiselect` widget
-  state, with no separate persistence layer.
-- Test suite (current file-level counts): `test_ui_formatting.py` 30,
-  `test_ui_controls.py` 3 — 33 tests total for this module (the pure
-  `_default_grid()` grid-construction helper in `controls.py` is the
-  only piece of that file that's directly unit-testable; the rest
-  renders Streamlit widgets directly and is exercised via manual/browser
-  smoke testing instead, not brittle Streamlit-rendering unit tests).
-  Note: at the time of this documentation pass, the column-selector
-  code in `ui/formatting.py`/`ui/results_view.py` exists in the working
-  tree as separate, uncommitted, in-progress work — this bullet
-  documents its current intended behaviour from that code as it reads
-  today, per explicit instruction not to modify or commit it as part of
-  this documentation task.
+- **`Ranking ▾`/`Filters ▾`/`Columns ▾` use `st.popover`**, not
+  `st.expander` — floating panels that don't push the results table
+  down. The "Ranked by: ..." label is built by reading the Ranking
+  popover's persisted `st.session_state` values BEFORE that popover's
+  own widgets are (re)created later in the same script pass
+  (`_current_rank_state()` in `results_view.py`) — safe because nothing
+  changes state between that read and the widgets' own creation in the
+  same rerun.
+- No new backend capability was needed for the Market filter/column
+  selector/Strategy Label work — the market filter reads
+  `ScanCandidateResult.market_key`, which already existed (populated via
+  `resolve_display_market_key()`, see Module 9); only `label` is a
+  genuinely new field, added because no existing structure carried a
+  caller-facing name through to the result at all.
 
 ## Module 6B – Selected-Strategy History Chart
 
@@ -880,13 +967,201 @@ Key design points a future session needs:
 
 **Deferred, not solved here** (see the Development Roadmap below):
 Streamlit UI, a strategy editor, wiring `StrategySet`/`expand_strategy_
-set()` output into a running scan, watchlists, alerts, deployment.
-True intermarket (cross-market-leg) strategies were deferred at the
-time this module was written but have SINCE been implemented as an
-additive sibling — see Module 9 below (`strategy_engine.intermarket_*`
-+ `strategy_sets.IntermarketStrategySetEntry`/`intermarket_entries`);
-the Streamlit UI/scanner-wiring gaps listed above still apply equally
-to intermarket entries today.
+set()` output into a running scan, watchlists, alerts, deployment. Most
+of this list is **superseded by Module 7B** below, which shipped a
+Streamlit UI (a Strategy Set selector integrated directly into the
+existing scanner grid) — but via a DIFFERENT, simplified mechanism than
+originally anticipated here: it never calls `expand_strategy_set()`/
+`StrategySetEntry` per-entry expansion at all (see Module 7B's own
+design-principle note). That richer per-entry execution path
+(`expand_strategy_set()` → `template_scanner.scanner.
+run_scan_on_instances()`, plus `strategy_sets/execution.py`) still
+exists and is still tested, but remains genuinely unreachable from any
+live UI button today. True intermarket (cross-market-leg) strategies
+were deferred at the time this module was written but have SINCE been
+implemented as an additive sibling — see Module 9 below
+(`strategy_engine.intermarket_*` + `strategy_sets.
+IntermarketStrategySetEntry`/`intermarket_entries`); an intermarket
+entry can ONLY be authored by hand-editing a Strategy Set's JSON file
+today — Module 7B's grid-based UI has no representation for it (see
+Module 7B's own note) — and, like the richer per-entry path in general,
+nothing in the live UI triggers a scan of one. Watchlists, alerts, and
+deployment remain unaddressed.
+
+---
+
+## Module 7B – Strategy Set UI Integration (Simplified)
+
+COMPLETED AND TESTED. The Streamlit UI's own name for this work — see
+`ui/__init__.py`, `ui/strategy_set_view.py`, `ui/strategy_set_state.py`,
+and `ui/strategy_set_formatting.py`'s module docstrings, all of which
+self-identify as "Module 7B" (a later simplification of an even
+earlier separate-panel version of this same module, which is not
+described here — only the current, simplified design is).
+
+Design principle: **"Strategy Templates is the working strategy grid; a
+Strategy Set is simply a saved named version of that grid."** There is
+no second grid, no separate "Run '<Strategy Set>'" button, and no
+Strategy-Set-specific pricing/execution path — a loaded Strategy Set
+becomes ordinary grid rows, and `ui.scan_view.handle_run_scan()` builds
+`StrategyDefinition`s from those rows via the exact same
+`ui.formatting.build_definitions_from_grid()` a manually-typed row goes
+through, with no idea (and no need to know) whether a given row was
+typed or loaded from a saved set. This is a deliberate simplification
+FROM an earlier, richer per-`StrategySetEntry` execution design (which
+still exists in `strategy_sets/expansion.py`/`execution.py` and
+`template_scanner.scanner.run_scan_on_instances()`, all still tested,
+but is not what this UI module calls — see Module 7A's closing note
+above).
+
+ui/
+    strategy_set_view.py         (selector + Save/"+ New"/Delete/render_
+                                 selector(), integrated into ui.controls'
+                                 Strategy Templates section header —
+                                 not a separate page section)
+    strategy_set_state.py          (session-state: which saved set (if
+                                 any) is currently loaded, the pending-
+                                 selection indirection a Save action
+                                 needs — see its own widget-lifecycle
+                                 note below — and a one-shot status
+                                 message; no separate "draft" state,
+                                 since the grid widget itself IS the
+                                 draft)
+    strategy_set_formatting.py       (pure translation between grid rows
+                                 <-> StrategySet/StrategySetEntry — the
+                                 layer that makes a per-row Market/
+                                 Interval round-trip losslessly)
+
+tests/
+    test_ui_strategy_set_formatting.py, test_ui_strategy_set_state.py,
+    test_ui_strategy_set_selector_lifecycle.py,
+    test_ui_strategy_set_multimarket_roundtrip.py
+
+Key design points a future session needs:
+
+- **Per-row Market/Interval, not a global selector.** The grid's own
+  `Label`/`Market`/`Interval` `SelectboxColumn`s (see `ui.controls`) are
+  what let a Strategy Set mix markets/intervals across its rows (e.g. a
+  SOFR + SONIA + CORRA set) and round-trip through load → edit → save →
+  reload without any row's market silently changing. `ui.controls` has
+  **no global Market selector at all** (removed as part of this
+  simplification) — a Strategy Set's markets are exactly whatever its
+  rows carry. The scan bar's one remaining **Interval** selector is a
+  RUNTIME-ONLY override (`ui.formatting.apply_interval_override()`,
+  applied by `handle_run_scan()`): every row's own persisted Interval
+  cell still round-trips through save/load unchanged, but every leg of
+  an actual scan runs at whatever the scan bar's Interval selector
+  currently shows.
+- **Widget-lifecycle fix**: Streamlit forbids writing to a widget's own
+  session-state key once that widget has already been instantiated in
+  the current script run. A Save/rename/duplicate/delete action runs
+  further down the same script pass than the selector widget, so it
+  cannot write to the selector's key directly — it sets `strategy_set_
+  state.set_pending_selection(name)` and calls `st.rerun()`; on the
+  FRESH rerun that follows, `render_selector()` applies that pending
+  value to the widget's key before the widget is (re)created — the one
+  point where doing so is legal.
+- **No intermarket representation.** This module composes ordinary,
+  single-market `StrategySetEntry`/`StrategyDefinition` rows only — a
+  `StrategySet.intermarket_entries` (Module 9) loaded through this UI
+  is simply not shown or editable in the grid (not corrupted or lost in
+  the underlying JSON file — just invisible here).
+- Test suite (current file-level counts): see the files listed above;
+  run `pytest -q tests/test_ui_strategy_set_formatting.py tests/
+  test_ui_strategy_set_state.py tests/test_ui_strategy_set_selector_
+  lifecycle.py tests/test_ui_strategy_set_multimarket_roundtrip.py` for
+  the up-to-date count rather than trusting a number recorded here.
+
+---
+
+## Strategy Set Import (Excel/CSV)
+
+COMPLETED AND TESTED. An additive IMPORT MECHANISM on top of the
+existing, unmodified `strategy_sets`/Module 7B UI — not a separate
+persisted model. Turns an uploaded Excel workbook or CSV file into
+ordinary `strategy_sets.StrategySet` objects; an imported set is
+byte-for-byte the same kind of object a hand-built one is and is
+immediately visible to/usable by the Module 7B selector.
+
+strategy_import/
+    __init__.py       (public re-exports; the pipeline overview lives
+                     here, mirrored below)
+    parsing.py          (parse_workbook()/parse_csv() -> list[SheetFrame]
+                     -- pure, no market-code resolution)
+    validation.py         (validate_row() -> ReadyRow | UnavailableRow |
+                     InvalidRow -- reuses template_scanner.templates.
+                     template_from_dense_weights() directly, never via
+                     ui.formatting, to avoid an inverted ui->domain
+                     dependency)
+    market_mapping.py       (resolve_market_code() -- trader-facing RIC-
+                     root-style codes, e.g. "SRA"/"SON"/"CRA", to
+                     core.config.MARKETS registry keys, e.g. "SOFR"/
+                     "SONIA"/"CORRA"; three-way: supported/unavailable/
+                     unrecognized)
+    naming.py                 (unique_strategy_set_name() -- "Name 2",
+                     "Name 3", ... suffixing, never "Name (2)": "(" is
+                     not in StrategySet's own name pattern)
+    preview.py                  (build_preview() -> ImportPreview; the
+                     ONE read against StrategySetRepository, only to
+                     compute a de-duplicated name -- never a write)
+    commit.py                     (commit_import() -- the ONLY write
+                     boundary, called only after explicit user
+                     confirmation of the preview)
+
+ui/
+    strategy_import_view.py    (upload -> preview -> "Import All" panel,
+                              rendered from an Import button inside the
+                              Strategy Templates section header)
+    strategy_import_state.py     (session-state: whether the panel is
+                              open, the current in-memory ImportPreview,
+                              which file it was built from, the one-shot
+                              post-import summary)
+
+tests/
+    test_strategy_import_parsing.py, test_strategy_import_validation.py,
+    test_strategy_import_market_mapping.py, test_strategy_import_naming.py,
+    test_strategy_import_preview.py, test_strategy_import_commit.py,
+    test_strategy_import_dedup.py, test_ui_strategy_import.py,
+    test_ui_strategy_import_formatting.py
+
+Key design points a future session needs:
+
+- **One worksheet (Excel) or one file (CSV) is exactly one Strategy
+  Set.** Expected column shape: a `Market` column, a `Label` column
+  (both matched case-insensitively), and one or more curve-position
+  columns holding a leg's weight (0/blank = "no leg at this position") —
+  the same dense-weight convention the manual grid uses. No interval
+  column is expected or read; every imported entry gets a fixed
+  `DEFAULT_IMPORT_INTERVAL` placeholder (the interval a trader actually
+  cares about is chosen at RUN time via Scan Configuration's Interval
+  selector, applied to every leg regardless of what's stored).
+- **Three-way row classification, never a two-way valid/invalid split.**
+  `ReadyRow` / `UnavailableRow` (a market Oscill8 recognizes by name but
+  has no configured `MarketDefinition` for — currently none, since
+  EURIBOR/SARON/YBA/ESTR_ICE all have entries today) / `InvalidRow` (bad
+  market code, or a position cell that's non-blank and not a valid
+  number — deliberately STRICTER than the manual grid's own `_cell_to_
+  float`, which silently treats an unparseable live-edit cell as 0; an
+  imported file has no "mid-edit" state, so an unparseable cell is a
+  genuine data problem, reported, never silently coerced to 0). A row
+  where every position column is blank/NaN is dropped silently — not an
+  error, matching the manual grid's own "an all-zero/blank row is
+  skipped" rule.
+- **Strategy identity for de-duplication is the resulting
+  `StrategyDefinition` (market_key/offsets/weights), never the Label** —
+  a trader's Label is a human-facing description, not an identifier, and
+  the same Label can legitimately recur across genuinely different
+  strategies.
+- **Nothing is written until explicit confirmation.** `parsing`/
+  `validation`/`preview` are pure and in-memory; `commit.commit_import()`
+  is the sole write boundary, called only from the "Import All" button,
+  and only `ImportPreview.importable_candidates` (a candidate with a
+  sheet-level error, or zero ready rows, is never saved even partially)
+  are persisted via the existing, unmodified `StrategySetRepository.
+  save()`.
+- Test suite: see the files listed above; run `pytest -q
+  tests/test_strategy_import_*.py tests/test_ui_strategy_import*.py`
+  for the up-to-date count rather than trusting a number recorded here.
 
 ---
 
@@ -1686,53 +1961,61 @@ Module 5A — Template / candidate universe engine — STATUS: COMPLETE
 Module 5B — Scanner orchestration, filtering, ranking (incl. 5B.1
 unavailable-market-data hardening and the canonical metric-resolution
 fix) — STATUS: COMPLETE
-Module 6A — Streamlit range-bound scanner UI — STATUS: COMPLETE
+Module 6A — Streamlit range-bound scanner UI (incl. the Range-Bound
+Opportunities Market filter, column selector, and Strategy Label
+enhancement) — STATUS: COMPLETE
 Module 6B — Selected-strategy history chart — STATUS: COMPLETE
 Module 7A — Strategy Set engine (domain model, JSON persistence,
-expansion to StrategyInstance[]; no scanner/UI integration) —
-STATUS: COMPLETE
+expansion to StrategyInstance[]) — STATUS: COMPLETE
+Module 7B — Strategy Set UI integration (selector built into the
+scanner grid, simplified single-grid design) — STATUS: COMPLETE
+Strategy Set Import — Excel/CSV -> StrategySet import pipeline and UI
+panel — STATUS: COMPLETE
 Module 8 — QuantHub secondary provider, provider provenance, and
 effective-request-end (currently-forming-bar exclusion) — STATUS:
 COMPLETE
 Module 9 — Intermarket strategy engine (domain model, Strategy Set
 integration, scanner wiring; cross-market legs within ONE strategy) —
 STATUS: COMPLETE (backend only — no Streamlit UI editor and no live
-UI button triggers the Strategy Set execution path yet; see Module 9's
-own "Not yet done" notes above)
+UI button triggers the richer per-entry Strategy Set execution path
+yet; see Module 9's own "Not yet done" notes above)
 
 Current suite: re-run `pytest -q` for the up-to-date count, do not
 trust any number written here blindly — see README.md's Testing
-section. As of this documentation pass: 1267 passed, 1 known
+section. As of this documentation pass: 1290 passed, 1 known
 pre-existing environment-specific failure
 (`tests/test_cache.py::test_read_bars_output_matches_downloader_
 canonical_schema`, a `datetime64[us]` vs `datetime64[ns]` pandas
 version mismatch, not a real bug), 2 skipped
 (`tests/test_ui_keyboard_browser.py` — no playwright installed;
 `tests/test_quanthub_live_smoke.py` — `RBS_QUANTHUB_TOKEN` not set) —
-1270 total.
+1293 total.
 
 Deferred / not yet implemented (do not assume any of these exist merely
 because they're listed here as being considered):
 
-- Configurable robust-range percentile bounds (today's 5th/95th
-  percentile bounds in `range_analytics/location.py` are hard-coded).
 - Z-score / current-dislocation analytics distinct from the existing
-  `RangeAnalytics.z_score` field — exact statistical definition not
-  approved.
+  `RangeAnalytics.z_score`/`abs_z_score` fields (both implemented and
+  shown in the UI's `Z`/`|Z|` columns today) — a SEPARATE robust
+  Z-score intended specifically to distinguish "quality of historical
+  range-boundedness" from "current distance from equilibrium" has no
+  approved statistical definition and is not implemented.
 - Streamlit UI support for authoring/editing intermarket Strategy Set
-  entries, and wiring the Strategy Set execution path
-  (`strategy_sets/execution.py`) into a live UI button — Module 9's
-  backend (domain model, persistence, scanner/analytics integration) is
+  entries, and wiring the richer per-entry Strategy Set execution path
+  (`strategy_sets/execution.py`, `expand_strategy_set()` ->
+  `run_scan_on_instances()`) into a live UI button — Module 9's backend
+  (domain model, persistence, scanner/analytics integration) is
   complete; only the UI surface remains (see Module 9 above). Cross-
   market legs within a single strategy are otherwise implemented, not
-  a still-open design question.
+  a still-open design question. This is distinct from Module 7B's
+  single-market Strategy Set UI, which IS wired into the live scanner
+  today (via the simplified grid mechanism, not this richer path).
 - An explicit "Real Contract" scanning mode (pick one specific set of
   dated contracts rather than a rolled template) — the backend
-  primitives it would need already exist (`StrategyInstance`,
-  `build_history()`, `analyze_histories()`,
-  `core.futures_calendar.generate_contracts()`), but `run_scan()` has no
-  instances-in/`ScanReport`-out entry point with skip-handling exposed
-  for a UI to call without duplicating `scanner.py`'s internal loop.
+  primitives it would need already exist, including an instances-in/
+  `ScanReport`-out entry point (`template_scanner.scanner.
+  run_scan_on_instances()`, added for Module 9), but no UI surface
+  calls it for this purpose today.
 - A true Generic-vs-Real-contract mode distinction — today's scanner is
   a single position-relative rolling-template mode; it is not a
   continuous, contract-independent "generic curve" series.
@@ -1744,9 +2027,6 @@ because they're listed here as being considered):
 - Saved scans / export workflow (distinct from Module 7A's Strategy
   Sets — a Strategy Set is a named collection of strategy definitions
   only; it does not capture a price window, lookbacks, or results).
-- Wiring Strategy Set / `expand_strategy_set()` output into a running
-  scan, a Strategy Set editor UI, and any Streamlit surface for Module
-  7A — the scanner remains unaware `strategy_sets` exists.
 - Cloud/server deployment and any non-desktop LSEG authentication.
 - ~~EURIBOR market metadata not yet supplied~~ — **RESOLVED, no longer
   deferred.** `core.config.MARKETS["EURIBOR"]` now has a complete,
