@@ -77,9 +77,19 @@ def handle_run_scan(setup: ScanSetup) -> None:
         setup.grid_rows, setup.position_columns, _FALLBACK_MARKET_KEY, setup.interval
     )
     errors = [r for r in row_results if r.error is not None]
+    valid_row_results = [r for r in row_results if r.definition is not None]
     definitions = apply_interval_override(
-        [r.definition for r in row_results if r.definition is not None], setup.interval
+        [r.definition for r in valid_row_results], setup.interval
     )
+    # Each grid row's Label (the Strategy Set entry name when the row was
+    # loaded from a saved Strategy Set -- see ui.strategy_set_formatting)
+    # is kept keyed by the resulting StrategyDefinition object's identity,
+    # not re-derived from RICs/weights, so run_scan() can attach the
+    # actual originating label to every candidate that definition rolls
+    # into -- never a new name invented here.
+    labels_by_definition_id = {
+        id(definition): row.label for row, definition in zip(valid_row_results, definitions)
+    }
 
     if errors:
         for err in errors:
@@ -107,7 +117,7 @@ def handle_run_scan(setup: ScanSetup) -> None:
 
     try:
         with st.spinner("Scanning market data..."):
-            report = run_scan(request)
+            report = run_scan(request, labels_by_definition_id=labels_by_definition_id)
     except Exception as exc:  # noqa: BLE001 -- UI boundary: surface, don't classify
         presentation = classify_scan_error(type(exc).__name__, str(exc))
         technical = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"

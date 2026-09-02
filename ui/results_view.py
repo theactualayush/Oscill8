@@ -11,11 +11,18 @@ recompute on every rerun: only the scan itself is expensive and gated
 behind Run Scan in ui.scan_view. (The Selected Strategy chart's own,
 separate history fetch is a cache-only call -- see ui.chart_view.)
 
-Pipeline order matters: filter and rank the Python ScanCandidateResult
-objects FIRST, then build the DataFrame, so row position in the
-displayed grid maps back to the same-position entry in the ranked
-candidate list -- the Rank column and the click-to-select mapping both
-depend on this order being preserved end to end.
+Pipeline order matters: filter (metric filters AND the Market
+multiselect) and rank the Python ScanCandidateResult objects FIRST,
+then build the DataFrame, so row position in the displayed grid maps
+back to the same-position entry in the ranked candidate list -- the
+Rank column and the click-to-select mapping both depend on this order
+being preserved end to end. The Market filter's options come from
+whichever markets are actually represented in the current scan's
+results (ui.formatting.available_markets); the Columns popover then
+projects the already-built display DataFrame down to the user's chosen
+columns (ui.formatting.apply_column_selection) -- purely a display-
+layer step, after Rank is already assigned, so hiding/showing a column
+never affects Rank or row selection.
 """
 
 from __future__ import annotations
@@ -31,10 +38,14 @@ from ui import state
 from ui.chart_view import render_chart
 from ui.formatting import (
     ALL_FILTER_SPECS,
+    DEFAULT_VISIBLE_COLUMNS,
     NO_SECONDARY_RANK,
+    OPTIONAL_COLUMN_LABELS,
     RANK_METRIC_OPTIONS,
     RESULT_COLUMN_HELP,
     add_rank_column,
+    apply_column_selection,
+    available_markets,
     build_filter_criteria,
     build_sort_keys,
     format_ranked_by,
@@ -43,6 +54,8 @@ from ui.formatting import (
 )
 
 _TABLE_HEIGHT = 460
+_MARKET_FILTER_KEY = "oscill8_market_filter"
+_VISIBLE_COLUMNS_KEY = "oscill8_visible_columns"
 
 
 def _current_rank_state() -> dict:
@@ -118,6 +131,43 @@ def _render_filters_popover() -> dict[str, dict]:
     return filter_state
 
 
+def _render_market_filter(markets: list[str]) -> list[str]:
+    """Multiselect of markets represented in the CURRENT scan's results
+    -- options are recomputed from `report.results` on every render, so
+    a different scan's different market mix is always reflected.
+    Defaults to every market selected ("All Markets"); reset back to
+    "all" only when the persisted selection would otherwise reference a
+    market no longer present (e.g. a genuinely different scan) --
+    Streamlit raises if a multiselect's stored value isn't a subset of
+    its current options. A selection that's still valid for the new
+    market set (e.g. re-running the same universe) is left alone,
+    matching how the Ranking/Filters popovers already persist across
+    scans.
+    """
+    stored = st.session_state.get(_MARKET_FILTER_KEY)
+    if stored is None or not set(stored) <= set(markets):
+        st.session_state[_MARKET_FILTER_KEY] = markets
+    return st.multiselect(
+        "Market",
+        options=markets,
+        key=_MARKET_FILTER_KEY,
+        help="Filter which markets' results are shown. Does not affect "
+        "strategy expansion, pricing, provider, cache, or calculations.",
+    )
+
+
+def _render_columns_popover() -> list[str]:
+    with st.popover("Columns ▾"):
+        selected = st.multiselect(
+            "Visible columns",
+            options=list(OPTIONAL_COLUMN_LABELS),
+            default=list(DEFAULT_VISIBLE_COLUMNS),
+            key=_VISIBLE_COLUMNS_KEY,
+            label_visibility="collapsed",
+        )
+    return selected
+
+
 def _render_skipped_expander(report: ScanReport) -> None:
     if not report.skipped:
         return
@@ -139,17 +189,23 @@ def render_results(report: ScanReport, display_lookback: int, scan_request: Scan
             _render_skipped_expander(report)
             return
 
+        markets = available_markets(report.results)
+        selected_markets = _render_market_filter(markets)
+
         left, right = st.columns([2, 1])
         with right:
             st.caption(format_ranked_by(_current_rank_state()))
-            ranking_col, filters_col = st.columns(2)
+            ranking_col, filters_col, columns_col = st.columns(3)
             with ranking_col:
                 rank_state = _render_ranking_popover()
             with filters_col:
                 filter_state = _render_filters_popover()
+            with columns_col:
+                visible_columns = _render_columns_popover()
 
         criteria = build_filter_criteria(filter_state, display_lookback)
         filtered = apply_filters(report.results, criteria)
+        filtered = [r for r in filtered if r.market_key in selected_markets]
 
         with left:
             st.subheader("Range-Bound Opportunities")
@@ -171,6 +227,7 @@ def render_results(report: ScanReport, display_lookback: int, scan_request: Scan
 
         results_df = results_to_dataframe(ranked, display_lookback)
         display_df = add_rank_column(to_display_dataframe(results_df))
+        display_df = apply_column_selection(display_df, visible_columns)
 
         column_config = {
             label: st.column_config.Column(label, help=help_text)

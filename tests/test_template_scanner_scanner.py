@@ -495,6 +495,141 @@ def test_mixed_scan_unrelated_corra_exception_still_aborts_and_loses_sofr_result
         )
 
 
+# ---------------------------------------------------------------------
+# Optional caller-facing label (Range Bound Opportunities UI enhancement):
+# analyze_histories()/run_scan_on_instances()/run_scan() can attach a
+# ScanCandidateResult.label without changing pricing/skip/dedup behavior.
+# ---------------------------------------------------------------------
+
+def _no_io_history(ric: str) -> StrategyHistory:
+    definition = StrategyDefinition(
+        market_key="SOFR", offsets=(0,), weights=(1.0,), interval=BarInterval.DAILY,
+    )
+    instance = StrategyInstance(definition=definition, rics=(ric,))
+    return StrategyHistory(
+        instance=instance,
+        price_field="Close",
+        history=pd.DataFrame(
+            {"Date": pd.to_datetime(_DATES), "Leg_1": _VALUES, "Strategy": _VALUES}
+        ),
+    )
+
+
+def test_analyze_histories_defaults_every_label_to_none_when_omitted():
+    report = analyze_histories([_no_io_history("SRAH26")], lookbacks=(20,))
+
+    assert report.results[0].label is None
+
+
+def test_analyze_histories_zips_labels_positionally_onto_results():
+    history_a = _no_io_history("SRAH26")
+    history_b = _no_io_history("SRAM26")
+
+    report = analyze_histories(
+        [history_a, history_b], lookbacks=(20,), labels=["Fly A", None],
+    )
+
+    assert report.results[0].label == "Fly A"
+    assert report.results[1].label is None
+
+
+def test_analyze_histories_mismatched_labels_length_raises():
+    with pytest.raises(ValueError, match="labels length"):
+        analyze_histories([], lookbacks=(20,), labels=["stray label"])
+
+
+def test_run_scan_on_instances_labels_every_candidate_rolled_from_the_same_definition(mocker):
+    # One definition object rolled into TWO instances (two outright RICs)
+    # -- both must receive the SAME label via id(instance.definition),
+    # since strategy_engine never clones the definition per rolled
+    # instance (see run_scan_on_instances' own docstring note).
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+    definition = template_from_dense_weights("SOFR", (1,), BarInterval.DAILY)
+    instance_a = StrategyInstance(definition=definition, rics=("SRAH26",))
+    instance_b = StrategyInstance(definition=definition, rics=("SRAM26",))
+
+    report = run_scan_on_instances(
+        [instance_a, instance_b],
+        price_start="2020-01-01", price_end="2020-06-30", lookbacks=(20,),
+        labels_by_definition_id={id(definition): "My Outright"},
+    )
+
+    assert {r.rics: r.label for r in report.results} == {
+        ("SRAH26",): "My Outright",
+        ("SRAM26",): "My Outright",
+    }
+
+
+def test_run_scan_on_instances_unmapped_definition_gets_none_label(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+    instance = _sofr_outright_instance()
+
+    report = run_scan_on_instances(
+        [instance],
+        price_start="2020-01-01", price_end="2020-06-30", lookbacks=(20,),
+        labels_by_definition_id={},  # given, but doesn't cover this definition
+    )
+
+    assert report.results[0].label is None
+
+
+def test_run_scan_on_instances_skipped_candidate_does_not_consume_a_label(mocker):
+    # A label is only ever attached to a SURVIVING history -- a skipped
+    # (unavailable) candidate must not shift subsequent labels out of
+    # position.
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_omitting("CRAH6"))
+    mocker.patch(
+        "strategy_engine.pricing.get_history",
+        side_effect=MarketDataUnavailableError("CRAH6", "User does not have permission for this universe"),
+    )
+    sofr_definition = template_from_dense_weights("SOFR", (1,), BarInterval.DAILY)
+    corra_instance = _corra_outright_instance()
+    sofr_instance = StrategyInstance(definition=sofr_definition, rics=("SRAH26",))
+
+    report = run_scan_on_instances(
+        [corra_instance, sofr_instance],
+        price_start="2020-01-01", price_end="2020-06-30", lookbacks=(20,),
+        labels_by_definition_id={
+            id(corra_instance.definition): "CORRA Row",
+            id(sofr_definition): "SOFR Row",
+        },
+    )
+
+    assert len(report.results) == 1
+    assert report.results[0].rics == ("SRAH26",)
+    assert report.results[0].label == "SOFR Row"
+
+
+def test_run_scan_passes_labels_by_definition_id_through_to_results(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+    definition = _spread()
+
+    request = ScanRequest(
+        definitions=(definition,),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request, labels_by_definition_id={id(definition): "My Spread"})
+
+    assert report.results
+    assert all(r.label == "My Spread" for r in report.results)
+
+
+def test_run_scan_defaults_to_none_labels_when_not_given(mocker):
+    mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
+
+    request = ScanRequest(
+        definitions=(_spread(),),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20,),
+    )
+    report = run_scan(request)
+
+    assert all(r.label is None for r in report.results)
+
+
 def test_run_scan_carries_configured_percentiles_through_to_results(mocker):
     mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch_leg_df)
 

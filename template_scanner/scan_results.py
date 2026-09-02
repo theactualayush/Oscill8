@@ -53,6 +53,7 @@ _IDENTITY_COLUMNS = [
     "interval",
     "price_field",
     "display_lookback",
+    "label",
 ]
 
 # Curated, scalar subset of the display lookback's RangeAnalytics --
@@ -122,6 +123,15 @@ class ScanCandidateResult:
     pricing/provider/cache/market-registry/bp purposes -- `instance`
     itself (its `.rics` and `.definition`) remains the sole source of
     truth for that.
+
+    `label` is the originating caller-facing name for this candidate
+    (e.g. a UI strategy-grid row's Label, which is the Strategy Set
+    entry name when that row was loaded from a saved Strategy Set --
+    see ui.scan_view.handle_run_scan()) -- optional, `None` when the
+    caller (e.g. a direct run_scan_on_instances()/analyze_histories()
+    call) doesn't supply one. Purely descriptive metadata, never used
+    for pricing/dedup/identity -- StrategyInstance/StrategyDefinition
+    remain the sole source of truth for what a candidate actually is.
     """
 
     market_key: str
@@ -132,6 +142,7 @@ class ScanCandidateResult:
     price_field: str
     instance: StrategyInstance | IntermarketStrategyInstance
     multi_lookback: MultiLookbackAnalytics
+    label: str | None = None
 
 
 def results_to_dataframe(
@@ -177,6 +188,7 @@ def results_to_dataframe(
             "interval": result.interval.value,
             "price_field": result.price_field,
             "display_lookback": display_lookback,
+            "label": result.label,
             "observation_count": headline.observation_count,
             "current_price": headline.current_price,
             "mean": headline.mean,
