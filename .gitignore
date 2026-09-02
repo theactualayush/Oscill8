@@ -39,3 +39,6 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Development harness run artifacts (dev.ps1)
+.dev/
