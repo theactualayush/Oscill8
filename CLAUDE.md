@@ -422,10 +422,15 @@ Key design points a future session needs:
 - `dedupe_candidates()` treats two candidates as identical iff market,
   RICs, weights (exact, unscaled), interval, and price_field all match —
   `(1,-2,1)` and `(2,-4,2)` on the same RICs are NOT duplicates.
-- Same-market templates only — an intermarket template (legs spanning
-  multiple markets) is deferred as a materially different combinatorial
-  problem, expected to be an additive sibling module, not a
-  modification of this one.
+- Same-market templates only — this module's own dense-grid template
+  generator (`template_from_dense_weights()`/`generate_candidates()`)
+  has no intermarket (cross-market-leg) equivalent and was not modified
+  to add one. Cross-market legs within a single strategy are instead
+  handled by the separate, additive `strategy_engine.intermarket_*`
+  domain model + `strategy_sets.IntermarketStrategySetEntry` (see
+  Module 9) — a materially different combinatorial problem, addressed
+  as a sibling module rather than a modification of this one, exactly
+  as anticipated here.
 - Test suite (current file-level counts):
   `test_template_scanner_templates.py` 14,
   `test_template_scanner_universe.py` 15 — 29 tests total for this
@@ -875,8 +880,13 @@ Key design points a future session needs:
 
 **Deferred, not solved here** (see the Development Roadmap below):
 Streamlit UI, a strategy editor, wiring `StrategySet`/`expand_strategy_
-set()` output into a running scan, true intermarket (cross-market-leg)
-strategies, watchlists, alerts, deployment.
+set()` output into a running scan, watchlists, alerts, deployment.
+True intermarket (cross-market-leg) strategies were deferred at the
+time this module was written but have SINCE been implemented as an
+additive sibling — see Module 9 below (`strategy_engine.intermarket_*`
++ `strategy_sets.IntermarketStrategySetEntry`/`intermarket_entries`);
+the Streamlit UI/scanner-wiring gaps listed above still apply equally
+to intermarket entries today.
 
 ---
 
@@ -1126,7 +1136,7 @@ a plain `pd.DataFrame`, or an unrecognized exception that propagates:
 | Successful call, 0 bars | Returns an EMPTY DataFrame (correct columns), NOT an exception — logged as a warning | n/a |
 | `TS.Interday.UserRequestError.70005` ("The universe is not found") | Raises `MarketDataUnavailableError` | No — excluded from retry before the predicate ever sees it |
 | `TS.Interday.UserNotPermission.70112` ("User does not have permission for this universe") | Raises `MarketDataUnavailableError` | No |
-| `TS.Intraday.UserNotPermission.92000` (LSEG's own wording for this ONE code has been observed to vary in production — `"User has no permission"` is what a real request actually returned, not the phrase originally assumed; the classifier matches on the error CODE alone for this reason, deliberately NOT also requiring a specific trailing phrase the way the other two classifiers do) | Raises `MarketDataUnavailableError` | No |
+| `*.UserNotPermission.92000` (any service/product prefix — live-confirmed in production as BOTH `TS.Intraday.UserNotPermission.92000` and `TSCC.QS.UserNotPermission.92000` for the same underlying condition, on top of LSEG's own wording for this code also varying — `"User has no permission"` is what a real request actually returned, not the phrase originally assumed) | Raises `MarketDataUnavailableError` | No |
 | Any other `LDError`, or any other exception (network/auth/an unrecognized LSEG error, a programming bug) | Propagates UNCHANGED, as whatever type it originally was | Yes — ordinary retry-with-backoff behavior, unaffected |
 
 Three narrow, exact-match, duck-typed classifiers do this work —
@@ -1217,6 +1227,44 @@ module (`strategy_engine/`) never imports `core.downloader`/
 provider or a provenance decision exists — all of that lives entirely
 inside `database.service`.
 
+### Debugging gotcha: LSEG RIC vs. QuantHub instrument identifier are DIFFERENT cache keys
+
+`database.cache.get_established_provider()`/`get_sync_ranges()` are
+keyed EXCLUSIVELY on the LSEG RIC string (e.g. `CRAU6` — CORRA's
+1-digit-year convention), the same string `strategy_engine`/
+`template_scanner` pass into `database.get_history()` everywhere. The
+QuantHub instrument identifier built for the actual HTTP call (e.g.
+`CRAU26` — QuantHub's own, independent 2-digit-year convention, see
+`core.quanthub.build_instrument()`) is NEVER used as a cache/sync_ranges
+key anywhere — it only ever appears inside the outbound QuantHub
+request itself. Querying `sync_ranges`/provenance by the QuantHub
+instrument string (e.g. filtering on `ric='CRAU26'`) will always show
+"no coverage," regardless of what is actually cached under the real key
+(`CRAU6`) — this cost real debugging time investigating an apparent
+QuantHub `count=` discrepancy that turned out to be a cache lookup
+against the wrong identifier. Always use the LSEG RIC when inspecting
+`sync_ranges`/provider provenance directly (e.g. via SQL or
+`database.cache`), never the QuantHub instrument string.
+
+### Debugging gotcha: a QuantHub `count=` observed at different times can legitimately differ
+
+For a LEGACY/UNKNOWN-provider `(ric, interval)` (see above), `count=`
+is computed by `core.quanthub._estimate_count()` from whatever
+`sync_ranges` coverage's trailing edge actually is AT THE MOMENT OF THAT
+CALL — not from the strategy's originally-configured price window, and
+not remembered across calls (`record_sync_range()` merges coverage
+forward; it does not retain history of where the edge used to be). A
+long-requested window (e.g. `2026-01-01 -> 2027-08-01`) that is mostly
+already cached will correctly compute a SMALL `count` sized to just the
+narrow, genuinely-missing trailing gap — a `count` far smaller than the
+window's own nominal span is expected, correct behavior for this path,
+not a bug, a hardcoded cap, or a sign the date-window logic is broken.
+Live-investigated end-to-end (empty cache -> full-window count;
+today's-actual partial cache -> tail-only count) with no code defect
+found; see `tests/test_service_provider_fallback.py`'s
+`test_m_a_legacy_cache_missing_tail_fetches_only_the_gap_provider_stays_null`
+for the same class of scenario under test.
+
 ### Test invariants (guarantees the current suite locks in, not exhaustive)
 
 - A genuinely new QuantHub-mapped `(ric, interval)` tries LSEG first;
@@ -1231,10 +1279,14 @@ inside `database.service`.
   QuantHub, regardless of which provider actually serves a given
   missing sub-range, and regardless of what other RICs in the same
   batch call are doing.
-- `TS.Intraday.UserNotPermission.92000` (in its real, live-confirmed
-  wording) is classified as `MarketDataUnavailableError` and is NOT
-  retried by tenacity (`call_count == 1`, no retry storm) — proven both
-  at the `core.downloader` classifier level and at the `database.service`
+- `*.UserNotPermission.92000` — in either live-confirmed real-world form,
+  `TS.Intraday.UserNotPermission.92000` OR `TSCC.QS.UserNotPermission.92000`
+  (prefix-agnostic; the classifier matches on the stable
+  `"UserNotPermission.92000"` substring with a trailing-digit boundary
+  guard, never a hardcoded prefix) — is classified as
+  `MarketDataUnavailableError` and is NOT retried by tenacity
+  (`call_count == 1`, no retry storm) — proven both at the
+  `core.downloader` classifier level and at the `database.service`
   legacy-fallback level.
 - An unrelated or unrecognized `LDError` is never silently converted
   into a QuantHub fallback, at any layer.
@@ -1273,6 +1325,265 @@ See `tests/test_downloader.py`, `tests/test_service_provider_fallback.py`,
   carried over from the universal futures-industry convention, not
   independently confirmed against the live API (see `core/quanthub.py`'s
   own module docstring).
+
+### Environment configuration: `.env` loading (`ui/app.py` fix)
+
+`ui/app.py` (`streamlit run ui/app.py`) previously never loaded a
+`.env` file — every `RBS_*` setting (`RBS_QUANTHUB_TOKEN`,
+`RBS_LSEG_APP_KEY`, etc.) was visible to `core.config` only if already
+present as a real OS/session environment variable at Streamlit startup.
+`python-dotenv` was already a pinned `requirements.txt` dependency but
+was wired into nothing in the actual application entry point — a real,
+live-observed gap: a user with `RBS_QUANTHUB_TOKEN` set only in a local
+`.env` file saw a working `python` script that called `load_dotenv()`
+itself, but got `QuantHubCredentialsMissingError` from the live
+Streamlit app for the exact same market. Fixed with two lines
+(`from dotenv import load_dotenv` / `load_dotenv()`) placed immediately
+after `ui/app.py`'s existing `sys.path` bootstrap and before any
+`from ui...`/`from core...` import that transitively imports
+`core.config` (which reads `RBS_*` vars at module-import time, so
+`load_dotenv()` must run first). No other file changed — `core.config`/
+`core.quanthub` already read `RBS_*` via plain `os.environ.get()`;
+they simply needed the environment populated before their first import.
+
+---
+
+## Module 9 – Intermarket Strategy Engine (Domain Model, Strategy Set Integration, Scanner Wiring)
+
+COMPLETED AND TESTED (backend only — see "Not yet done" below). Adds
+the ability for a SINGLE strategy to combine legs from DIFFERENT
+markets (e.g. a SOFR leg + a SONIA leg priced into one series), as an
+**additive sibling** to the existing single-market
+`StrategyDefinition`/`StrategyInstance` — that path is completely
+unmodified, and `strategy_engine/combinations.py`/`pricing.py` are
+untouched. This is distinct from Module 7A's existing "multi-market"
+support (several separate single-market `StrategySetEntry`s grouped in
+one `StrategySet`) — that groups independent single-market strategies;
+this module lets ONE strategy's own legs span multiple markets.
+
+Built and reviewed in two phases; a third hardening pass fixed one real
+bug before the combined work was committed.
+
+strategy_engine/
+    intermarket_definitions.py    (LegSpec, IntermarketDefinition,
+                                   resolve_display_market_key(),
+                                   resolve_display_offsets())
+    intermarket_combinations.py   (IntermarketStrategyInstance,
+                                   generate_intermarket_instances())
+
+range_analytics/
+    units.py       (+ BpConversionUnavailable, resolve_bp_per_point())
+    results.py     (+ RangeAnalytics.bp_per_point field)
+    multi_lookback.py (uses result.bp_per_point, not a market_key re-lookup)
+
+template_scanner/
+    scanner.py     (analyze_histories()/run_scan_on_instances() use the
+                    display resolvers; zero new market-specific logic)
+    scan_results.py (ScanCandidateResult.instance type hint widened only)
+    universe.py    (+ dedupe_intermarket_candidates(), a sibling to the
+                    existing, untouched dedupe_candidates())
+
+strategy_sets/
+    model.py         (+ IntermarketStrategySetEntry,
+                      StrategySet.intermarket_entries)
+    serialization.py (+ leg_to_dict/_from_dict,
+                      intermarket_entry_to_dict/_from_dict; entries are
+                      routed by "legs" key presence, never a type tag)
+    expansion.py     (expand_strategy_set() gained a second loop over
+                      intermarket_entries -> generate_intermarket_instances())
+    execution.py     (with_interval_override() fixed to also rebuild
+                      intermarket_entries — see the bug note below)
+
+test_intermarket.py (repository root — see its own section below)
+
+tests/
+    test_intermarket_definitions.py, test_intermarket_combinations.py,
+    test_intermarket_pricing_compatibility.py,
+    test_intermarket_strategy_set_end_to_end.py,
+    test_intermarket_strategy_set_provider_routing.py, plus extensions
+    to test_range_units.py, test_range_analytics.py,
+    test_range_multi_lookback.py, test_strategy_sets_model.py,
+    test_strategy_sets_serialization.py, test_strategy_sets_expansion.py,
+    test_strategy_sets_execution.py, test_template_scanner_universe.py,
+    test_template_scanner_scanner.py.
+
+Key design points a future session needs:
+
+- **Zero market-specific logic, anywhere.** No file in this module
+  contains an `if market_key == "..."` (or strategy-shape) branch —
+  every dispatch between single-market and intermarket is by TYPE
+  (`isinstance(definition, IntermarketDefinition)`), never by value.
+  SOFR/SONIA/CORRA in any docstring or test are illustrative example
+  data only, never special-cased.
+- **`LegSpec(market_key, offset, weight)`** bundles a leg's three
+  fields together (not three parallel tuples the way
+  `StrategyDefinition` does) — a mismatched-array-length failure mode
+  is structurally impossible here. `IntermarketDefinition(legs,
+  interval, price_field="Close", bp_per_point=None)` validates: ≥1 leg,
+  all elements are `LegSpec`, `min(offsets) == 0` (at least one leg
+  anchors the window), not all weights zero, valid interval/price_field,
+  `bp_per_point > 0` if given. Unlike `StrategyDefinition.offsets`,
+  `LegSpec.offset` values MAY repeat across legs (two different
+  markets' legs both at `offset=0` is the ordinary intermarket-spread
+  case).
+- **Offset semantics (design-reviewed — "interpretation A → C"):** a
+  `LegSpec.offset` is ALWAYS a position on THAT LEG'S OWN contract
+  curve, exactly like `StrategyDefinition.offsets`'s existing meaning
+  for a single-market strategy — NEVER a position on a curve shared/
+  intersected across all legs. `generate_intermarket_instances()`:
+  (1) splits legs into anchor legs (`offset == 0`) and non-anchor legs;
+  (2) intersects ONLY the anchor legs' own independently-generated
+  `(year, month)` curves (via `core.futures_calendar.generate_contracts()`
+  + `core.ric.parse_ric()`, both unmodified) to find valid anchor
+  periods; (3) for each non-anchor leg, generates its OWN full curve
+  independently (never intersected with anything), finds the first
+  position at or after the anchor period via `bisect_left`, then steps
+  forward `offset` MORE positions on that SAME curve. If a non-anchor
+  leg's own curve doesn't reach that far, that anchor period simply
+  produces no instance (mirrors `combinations.generate_instances()`'s
+  own "too few contracts" behavior) — never an error. An earlier draft
+  intersected ALL legs' calendars before applying offsets, which
+  silently discarded real contracts on a finer-grained market's own
+  curve whenever paired with a coarser one; this was corrected before
+  Phase 1 was committed. Internally always sorts/compares `(year,
+  month)` tuples (not `(month, year)`) so ordering is correct across a
+  year boundary; `core.ric.build_ric()`'s own `(market_key, month,
+  year)` argument order is only reconstructed at the point of RIC
+  construction.
+- **`IntermarketStrategyInstance(definition, rics)`** deliberately
+  mirrors `StrategyInstance`'s exact field names/shapes — this is what
+  lets `strategy_engine.pricing.build_history()`/`prewarm_leg_cache()`
+  consume it with ZERO code change: neither function reads
+  `market_key` anywhere, only `instance.rics` and
+  `instance.definition.{interval, price_field, weights}`, and
+  `IntermarketDefinition` exposes `weights`/`market_keys` as computed
+  properties for exactly this reason.
+- **Display-only vs. authoritative identity.**
+  `resolve_display_market_key()`/`resolve_display_offsets()`
+  (`strategy_engine/intermarket_definitions.py`) produce cosmetic
+  composite labels (e.g. `"SOFR/CORRA"`, offsets in leg order) for
+  scanner result tables/summaries ONLY — dispatched purely by type.
+  These values must NEVER be used for provider resolution
+  (`core.providers.resolve_provider`), cache/database lookup, QuantHub/
+  LSEG instrument mapping, or bp conversion — all of those still
+  operate strictly per-RIC or per-`LegSpec.market_key`, never via a
+  composite label. `template_scanner.scanner`'s own
+  `test_scanner_module_remains_unaware_of_strategy_sets` design-
+  principle test (the string `"strategy_sets"` must never appear in
+  that module's source) was preserved throughout this work.
+- **bp-conversion: explicit, never guessed.**
+  `range_analytics.units.resolve_bp_per_point(definition)` dispatches
+  by type: a single-market `StrategyDefinition` resolves via the
+  existing per-market registry lookup (unchanged); an
+  `IntermarketDefinition` uses its own explicit `bp_per_point` override
+  if set, otherwise raises `BpConversionUnavailable` — there is no
+  principled way to pick "the" market whose bp convention applies to a
+  genuinely cross-market series, so it is never inferred from any one
+  leg. `RangeAnalytics.analyze_range()` catches this specific exception
+  and leaves `vol_bp` (and other bp-derived fields) as `NaN` rather than
+  aborting the whole scan — a deliberate, disclosed design decision:
+  unavailable-bp-conversion degrades that one metric, never the scan.
+  `range_to_volatility_ratio()` (Module 4B) reads `result.bp_per_point`
+  directly rather than re-deriving it from a (possibly composite)
+  display market key, which would silently break for an intermarket
+  result.
+- **Candidate identity = the REALIZED instance.** `dedupe_intermarket_
+  candidates()` (`template_scanner/universe.py`, a sibling to the
+  existing, untouched `dedupe_candidates()`) treats two candidates as
+  identical iff their RICs, weights, interval, and price_field all
+  match — never the abstract legs/offsets that generated them — same
+  philosophy as the single-market dedup.
+- **Strategy Set schema: discriminated by key presence, never a type
+  tag.** A single-market entry's JSON is flat
+  (`market_key`/`offsets`/`weights`/...); an intermarket entry has a
+  `"legs"` array instead. `strategy_set_from_dict()` routes each raw
+  entry purely by `"legs" in raw_entry` — never an explicit
+  `"type"`/`"kind"` field, never inferred from the entry's name.
+  `IntermarketStrategySetEntry` mirrors `StrategySetEntry` (`name`,
+  `definition`, `enabled`) but rejects `expansion.max_curve_position`
+  at construction (that field is single-market-curve-specific and has
+  no intermarket analogue today). `StrategySet.intermarket_entries:
+  tuple[IntermarketStrategySetEntry, ...] = ()` is an additive,
+  default-empty field alongside the existing `entries` — a `StrategySet`
+  may contain only single-market entries, only intermarket entries, or
+  a genuine mix; entry names must be unique across BOTH collections
+  combined, validated in one `__post_init__` pass.
+- **The contract-selection window is call-time-only** — same
+  precedent as Module 7A's own `entries`: `expand_strategy_set()`
+  takes `contract_start`/`contract_end` as call-time arguments shared
+  across every entry (single-market AND intermarket), never baked into
+  the saved JSON, so a saved set never goes stale as "today" moves.
+- **Ordering note (documented, not "fixed"):** `expand_strategy_set()`'s
+  raw/unranked output is always single-market instances first, then
+  intermarket instances — never JSON interleave order — because it
+  runs two separate loops (one per collection) and concatenates. This
+  is inconsequential in practice: the live UI's `ui.results_view.
+  _current_rank_state()` always applies a default rank key before
+  display, so raw expansion order is never what a user actually sees.
+- **Real bug found and fixed during the hardening pass:**
+  `strategy_sets/execution.py`'s `with_interval_override()` originally
+  rebuilt only `strategy_set.entries` under the new interval, silently
+  leaving `intermarket_entries` at their ORIGINAL interval. Fixed to
+  rebuild both collections. Verified via `git stash` that the added
+  regression test genuinely failed without the fix and passed with it.
+- **`strategy_sets/execution.py` is not reachable from any live UI
+  button today** — confirmed by tracing the two separate scan entry
+  points that exist: "MANUAL GRID" (`ui` → `template_scanner.
+  run_scan()`) and "STRATEGY SET" (`expand_strategy_set()` →
+  `run_scan_on_instances()`, which is what `execution.py` wraps). This
+  was true before this module's work and remains true after it — this
+  module did not change UI wiring at all (see "Not yet done" below).
+
+**Not yet done / explicitly out of scope for this module:**
+- **No Streamlit UI support for creating or editing intermarket
+  entries.** A `StrategySet` containing `intermarket_entries` can only
+  be authored by hand-editing its JSON file directly (or a script) —
+  there is no editor panel. If such a JSON is loaded through the
+  existing Strategy Set UI panel, its intermarket entries are silently
+  not represented in that panel's single-market-only editing grid (they
+  are not corrupted or lost in the file — simply not shown/editable
+  there).
+- No UI button currently triggers `expand_strategy_set()` →
+  `run_scan_on_instances()` end-to-end for a live user — see the
+  `execution.py` note above. Wiring this in is a distinct, unstarted
+  follow-up.
+- Real-time provider/data behavior (LSEG vs. QuantHub per leg, caching,
+  provenance) is entirely Module 8's existing, unmodified concern —
+  this module never imports `core.downloader`/`core.quanthub`/
+  `core.providers`/`database` directly; every leg still goes through
+  `strategy_engine.pricing.build_history()` → `database.get_history()`
+  exactly like a single-market leg.
+
+### `test_intermarket.py` — standalone manual validation harness
+
+A TEMPORARY, standalone script at the repository root (NOT a pytest
+file, despite its `test_` prefix — run directly via `python
+test_intermarket.py`) that independently verifies, against real LSEG/
+QuantHub data, that (a) each generated leg RIC corresponds exactly to
+the `IntermarketDefinition` leg that produced it (via `core.ric.
+parse_ric()`, by position, never inferred from the strategy's name or
+shape), and (b) `Strategy = sum(leg_price_i * leg_weight_i)` matches
+Oscill8's own computed `Strategy` column exactly (1e-10 tolerance).
+
+Loads a named `StrategySet` via `StrategySetRepository().load(name)`
+and iterates `strategy_set.intermarket_entries` INDIVIDUALLY — it
+deliberately never calls `expand_strategy_set()` on the whole set
+(which would flatten and dedupe every entry's instances together,
+losing which entry produced which instance) and never goes through
+`template_scanner`/`ScanReport` (it calls `strategy_engine.pricing.
+build_history()` directly, validating the lower-level pricing
+calculation, not the scanner pipeline built on top of it). Calls
+`load_dotenv()` before any Oscill8 import, same requirement as
+`ui/app.py` above. Test parameters (`STRATEGY_SET_NAME`,
+`CONTRACT_START`/`CONTRACT_END`, `PRICE_START`/`PRICE_END`,
+`TOLERANCE`) are declared as plain module-level constants at the top of
+the file. Prints per-leg RIC/mapping tables, a contribution table, the
+manual calculation expression, and a final PASS/FAIL summary; handles a
+missing StrategySet file or an empty/unbuildable history gracefully
+(no crash). Does not modify production code or the StrategySet JSON,
+and never prints credential/token values. Not part of the pytest suite
+and not intended to become a permanent module — a genuinely temporary
+developer tool, kept in the repo for now at explicit request.
 
 ---
 
@@ -1383,17 +1694,22 @@ STATUS: COMPLETE
 Module 8 — QuantHub secondary provider, provider provenance, and
 effective-request-end (currently-forming-bar exclusion) — STATUS:
 COMPLETE
+Module 9 — Intermarket strategy engine (domain model, Strategy Set
+integration, scanner wiring; cross-market legs within ONE strategy) —
+STATUS: COMPLETE (backend only — no Streamlit UI editor and no live
+UI button triggers the Strategy Set execution path yet; see Module 9's
+own "Not yet done" notes above)
 
 Current suite: re-run `pytest -q` for the up-to-date count, do not
 trust any number written here blindly — see README.md's Testing
-section. As of this documentation pass: 1172 passed, 1 known
+section. As of this documentation pass: 1267 passed, 1 known
 pre-existing environment-specific failure
 (`tests/test_cache.py::test_read_bars_output_matches_downloader_
 canonical_schema`, a `datetime64[us]` vs `datetime64[ns]` pandas
 version mismatch, not a real bug), 2 skipped
 (`tests/test_ui_keyboard_browser.py` — no playwright installed;
 `tests/test_quanthub_live_smoke.py` — `RBS_QUANTHUB_TOKEN` not set) —
-1175 total.
+1270 total.
 
 Deferred / not yet implemented (do not assume any of these exist merely
 because they're listed here as being considered):
@@ -1403,7 +1719,13 @@ because they're listed here as being considered):
 - Z-score / current-dislocation analytics distinct from the existing
   `RangeAnalytics.z_score` field — exact statistical definition not
   approved.
-- Intermarket strategies (legs spanning more than one market).
+- Streamlit UI support for authoring/editing intermarket Strategy Set
+  entries, and wiring the Strategy Set execution path
+  (`strategy_sets/execution.py`) into a live UI button — Module 9's
+  backend (domain model, persistence, scanner/analytics integration) is
+  complete; only the UI surface remains (see Module 9 above). Cross-
+  market legs within a single strategy are otherwise implemented, not
+  a still-open design question.
 - An explicit "Real Contract" scanning mode (pick one specific set of
   dated contracts rather than a rolled template) — the backend
   primitives it would need already exist (`StrategyInstance`,
