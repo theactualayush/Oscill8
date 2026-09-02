@@ -410,15 +410,25 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
         {"success": st.success, "error": st.error, "info": st.info}.get(level, st.info)(text)
 
     position_columns = tuple(position_column(i) for i in range(1, n_positions + 1))
+    # Read the selected set's JSON exactly ONCE per script pass and
+    # share it: the grid seed, the read-only intermarket panel, and the
+    # save path's intermarket preservation all need the same object.
+    loaded_set = strategy_set_view.load_selected_set(repo, selected_name)
     seed_df = strategy_set_view.resolve_grid_seed(
-        selected_name, repo, position_columns, default_market_key, default_interval
+        selected_name, repo, position_columns, default_market_key, default_interval,
+        strategy_set=loaded_set,
     )
 
     st.caption("STRATEGY")
     grid_rows = _render_strategy_grid(seed_df, position_columns, selected_name, n_positions)
+    # Read-only, and only when the loaded set actually has intermarket
+    # entries -- a single-market set renders exactly as it did before
+    # this panel existed. See ui.strategy_set_view.render_intermarket_
+    # entries / ui.intermarket_formatting.
+    strategy_set_view.render_intermarket_entries(loaded_set)
     strategy_set_view.process_save(
         repo, selected_name, save_clicked, grid_rows, position_columns,
-        default_market_key, default_interval,
+        default_market_key, default_interval, loaded_set=loaded_set,
     )
 
     return grid_rows, position_columns

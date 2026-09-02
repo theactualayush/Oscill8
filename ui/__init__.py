@@ -52,5 +52,12 @@ strategy_set_view.py         The Strategy Set selector + Save/"+ New"/
                              section, no second table, no second Run
                              button. Delete requires an explicit confirm
                              dialog naming the set before it removes
-                             anything.
+                             anything. Also renders the READ-ONLY
+                             intermarket-entries panel below the grid.
+intermarket_formatting.py    Pure helpers -- a StrategySet's Module 9
+                             intermarket_entries -> read-only display
+                             rows (per-leg market/offset/weight). Display
+                             only: never an editor, never an inverse
+                             translation, and its composite market label
+                             never reaches provider/cache/bp resolution.
 """

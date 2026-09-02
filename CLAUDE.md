@@ -1061,11 +1061,27 @@ Key design points a future session needs:
   FRESH rerun that follows, `render_selector()` applies that pending
   value to the widget's key before the widget is (re)created — the one
   point where doing so is legal.
-- **No intermarket representation.** This module composes ordinary,
-  single-market `StrategySetEntry`/`StrategyDefinition` rows only — a
-  `StrategySet.intermarket_entries` (Module 9) loaded through this UI
-  is simply not shown or editable in the grid (not corrupted or lost in
-  the underlying JSON file — just invisible here).
+- **No intermarket EDITING; read-only visibility only (TASK-001).**
+  The grid itself composes ordinary, single-market `StrategySetEntry`/
+  `StrategyDefinition` rows only — a `StrategySet.intermarket_entries`
+  (Module 9) is never shown or editable *in the grid*. It is no longer
+  invisible, though: `ui.strategy_set_view.render_intermarket_entries()`
+  renders a READ-ONLY `st.dataframe` panel below the grid (entry name,
+  enabled flag, interval, price field, optional `bp_per_point`, one row
+  per `LegSpec` with that leg's own market/offset/weight), rendered only
+  when the loaded set actually has such entries — a single-market set's
+  appearance is unchanged. Translation lives in the new, Streamlit-free
+  `ui/intermarket_formatting.py`; its composite market label is Module
+  9's `resolve_display_market_key()` and stays display-only (never
+  provider resolution, cache lookup, or bp conversion). Nothing in `ui/`
+  can create/edit/delete one — hand-editing the JSON is still the only
+  authoring route. Saving preserves them verbatim: `build_strategy_set_
+  from_grid()` takes an `intermarket_entries` parameter (supplied by
+  `process_save()`/`_save()` from the set loaded earlier in the same
+  script pass) and writes them back unchanged through the same single
+  `repo.save()` — previously a save silently dropped them. An
+  intermarket-only set (blank grid) is saveable; a wholly empty set is
+  still rejected.
 - Test suite (current file-level counts): see the files listed above;
   run `pytest -q tests/test_ui_strategy_set_formatting.py tests/
   test_ui_strategy_set_state.py tests/test_ui_strategy_set_selector_

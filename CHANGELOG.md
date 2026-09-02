@@ -536,6 +536,44 @@
 
 ---
 
+## v0.18.0
+
+### Added
+- **Intermarket Strategy Set entries are now visible (read-only) in the
+  Strategy Set panel** (TASK-001 — Module 9 visibility slice; no
+  backend change, `ui/` and `tests/` only).
+  - `ui/intermarket_formatting.py` (new, Streamlit-free and
+    unit-tested): pure translation of a `StrategySet`'s
+    `intermarket_entries` into display rows — entry name, enabled flag,
+    interval, price field, optional `bp_per_point`, plus one row per
+    `LegSpec` (leg number, that leg's OWN market key, offset, weight).
+    The composite market label comes from Module 9's
+    `resolve_display_market_key()` and stays display-only: it never
+    reaches provider resolution, a cache key, or a bp conversion.
+  - `ui.strategy_set_view.render_intermarket_entries()` renders that as
+    a read-only `st.dataframe` panel below the editable grid, ONLY when
+    the loaded set actually has intermarket entries, with a notice
+    explaining why they are not in the single-market grid. A set with
+    none renders exactly as before.
+  - No authoring: nothing in `ui/` can create, edit, reorder or delete
+    an intermarket entry — hand-editing the set's JSON remains the only
+    route, exactly as Module 9 documents.
+
+### Fixed
+- **Saving a Strategy Set no longer drops its intermarket entries.**
+  `ui.strategy_set_formatting.build_strategy_set_from_grid()` gained an
+  `intermarket_entries` parameter (default `()`), supplied by
+  `ui.strategy_set_view.process_save()`/`_save()` from the set loaded at
+  the top of the same script pass, so load → save → reload of a mixed
+  set leaves its `intermarket_entries` byte-identical in the JSON file
+  instead of silently discarding what the single-market grid cannot
+  represent. An intermarket-only set (which loads a blank grid) is now
+  saveable rather than rejected as "empty"; a wholly empty set is still
+  rejected. Same single `repo.save()` path as before — no new save
+  mechanism.
+
+---
+
 ## v0.17.0
 
 ### Added

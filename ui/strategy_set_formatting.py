@@ -26,6 +26,15 @@ round-trip losslessly through load -> edit -> save -> reload, whether
 the set is single- or multi-market. There is no more "mixed markets
 can't be represented" case to warn about.
 
+Intermarket entries (Module 9): a StrategySet may ALSO carry
+`intermarket_entries` -- entries whose legs span different markets --
+which this grid has no representation for and never will (that is
+ui.intermarket_formatting's read-only display concern). They are not
+translated into rows here, but build_strategy_set_from_grid() accepts
+and preserves them verbatim so that loading a mixed set and saving it
+again cannot silently drop them. Nothing in ui/ constructs or edits
+one.
+
 No Streamlit import here -- unit-testable directly against plain data,
 the same convention ui.formatting follows for Module 6A. No shape/
 weight validation is duplicated: row translation routes through the
@@ -44,7 +53,7 @@ from core.config import BarInterval
 
 from strategy_engine.definitions import StrategyDefinition
 
-from strategy_sets.model import StrategySet, StrategySetEntry
+from strategy_sets.model import IntermarketStrategySetEntry, StrategySet, StrategySetEntry
 
 from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN, build_definitions_from_grid
 
@@ -109,6 +118,7 @@ def build_strategy_set_from_grid(
     position_columns: Sequence[str],
     market_key: str,
     interval: BarInterval,
+    intermarket_entries: Sequence[IntermarketStrategySetEntry] = (),
 ) -> StrategySet:
     """Snapshot the grid's current rows into a new StrategySet named
     `name`. Each entry's market_key/interval comes from that ROW's own
@@ -119,11 +129,23 @@ def build_strategy_set_from_grid(
     is entirely build_definitions_from_grid()'s (offsets/weights,
     market, interval, price_field) -- never duplicated here.
 
+    `intermarket_entries` (Module 9) are carried through UNCHANGED, by
+    reference, from the currently-loaded set -- the grid has no
+    representation for a cross-market-leg entry (see ui.
+    intermarket_formatting, which displays them read-only), so a save
+    must preserve exactly what was loaded rather than silently dropping
+    it. Nothing in ui/ ever constructs or edits one; these objects only
+    ever travel load -> display -> save untouched. Defaults to () so a
+    brand-new set, and every pre-existing caller, is unaffected.
+
     Raises:
         ValueError: a row's shape is rejected by StrategyDefinition's
-            own validation (surfaced with that row's label), no row had
-            a nonzero weight at all, or StrategySet's own validation
-            rejects the result (invalid name, duplicate row labels).
+            own validation (surfaced with that row's label), the
+            resulting set would have no entries of EITHER kind, or
+            StrategySet's own validation rejects the result (invalid
+            name, or a name duplicated across the grid rows and the
+            preserved intermarket entries -- one shared namespace, see
+            StrategySet).
     """
     results = build_definitions_from_grid(grid_rows, position_columns, market_key, interval)
     errors = [r for r in results if r.error is not None]
@@ -131,11 +153,12 @@ def build_strategy_set_from_grid(
         raise ValueError("; ".join(f"{r.label}: {r.error}" for r in errors))
 
     definitions = [(r.label, r.definition) for r in results if r.definition is not None]
-    if not definitions:
+    preserved = tuple(intermarket_entries)
+    if not definitions and not preserved:
         raise ValueError("Add at least one strategy row with a nonzero ratio before saving.")
 
     entries = tuple(StrategySetEntry(name=label, definition=definition) for label, definition in definitions)
-    return StrategySet(name=name, entries=entries)
+    return StrategySet(name=name, entries=entries, intermarket_entries=preserved)
 
 
 __all__ = [

@@ -24,6 +24,19 @@ Interval selectors when a set loads, and there is no more "mixed
 markets can't be represented" warning -- both were needed only while
 the grid was bound to a single global market/interval.
 
+Intermarket entries (Module 9 visibility slice): a saved set may also
+carry `intermarket_entries` (legs spanning different markets), which the
+single-market grid has no representation for. render_intermarket_
+entries() shows them READ-ONLY beneath the grid whenever the loaded set
+has any -- st.dataframe, no editor, no lifecycle control, no scan
+button; hand-editing the set's JSON remains the only way to author one.
+A save carries them through untouched (see process_save/_save's
+`loaded_set` argument and ui.strategy_set_formatting.build_strategy_set_
+from_grid's `intermarket_entries`), so load -> save -> reload of a mixed
+set is lossless rather than silently dropping the half the grid can't
+show. A set with no intermarket entries renders exactly as before --
+the panel is not rendered at all.
+
 Scanner integration: unchanged from before this simplification and
 unchanged by it. A loaded Strategy Set becomes ordinary grid rows;
 ui.scan_view.handle_run_scan() builds StrategyDefinition[] from
@@ -95,6 +108,16 @@ from strategy_sets.repository import StrategySetRepository
 
 from ui import strategy_set_state as ss_state
 from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN
+from ui.intermarket_formatting import (
+    LEG_COLUMNS,
+    LEG_OFFSET_HELP,
+    SECTION_CAPTION,
+    entry_displays,
+    entry_status_label,
+    entry_summary_line,
+    intermarket_notice,
+    panel_title,
+)
 from ui.strategy_set_formatting import build_strategy_set_from_grid, grid_rows_from_strategy_set
 
 NEW_SET_OPTION = "+ New Strategy Set"
@@ -138,12 +161,24 @@ def blank_grid_row(
     return pd.DataFrame([row])
 
 
+def load_selected_set(repo: StrategySetRepository, selected_name: str | None) -> StrategySet | None:
+    """The currently selected saved StrategySet, or None for "+ New
+    Strategy Set". Exists so one script pass reads a set's JSON file
+    exactly ONCE and shares that object across everything that needs it
+    (the grid seed, the read-only intermarket panel, and the save path's
+    intermarket preservation) rather than each re-loading it."""
+    if selected_name is None:
+        return None
+    return repo.load(selected_name)
+
+
 def resolve_grid_seed(
     selected_name: str | None,
     repo: StrategySetRepository,
     position_columns: tuple[str, ...],
     default_market_key: str,
     default_interval: BarInterval,
+    strategy_set: StrategySet | None = None,
 ) -> pd.DataFrame:
     """The grid rows to show for the currently selected Strategy Set --
     each carrying its OWN Market/Interval, so a set mixing markets (see
@@ -151,15 +186,64 @@ def resolve_grid_seed(
     override the scan bar's Market/Interval selectors and no "mixed
     markets" warning. `default_market_key`/`default_interval` seed only
     a genuinely blank "+ New Strategy Set" row's Market/Interval cells.
+
+    `strategy_set` is the already-loaded set for `selected_name` when
+    the caller has one (see load_selected_set) -- purely an I/O
+    optimization; it is loaded from `repo` when omitted, exactly as
+    before. Only the set's single-market `entries` seed the grid; its
+    `intermarket_entries` have no grid representation and are shown
+    read-only elsewhere (see render_intermarket_entries).
     """
     if selected_name is None:
         return blank_grid_row(position_columns, default_market_key, default_interval)
 
-    strategy_set = repo.load(selected_name)
+    if strategy_set is None:
+        strategy_set = repo.load(selected_name)
     rows = grid_rows_from_strategy_set(strategy_set, position_columns)
     if not rows:
         return blank_grid_row(position_columns, default_market_key, default_interval)
     return pd.DataFrame(rows, columns=[LABEL_COLUMN, MARKET_COLUMN, INTERVAL_COLUMN, *position_columns])
+
+
+def render_intermarket_entries(strategy_set: StrategySet | None) -> None:
+    """The read-only Intermarket Strategies panel (Module 9 visibility
+    slice) -- rendered ONLY when the loaded set actually carries
+    intermarket entries, so a set with none (the ordinary case) looks
+    and behaves exactly as it did before this panel existed.
+
+    Read-only in the strongest available sense: st.dataframe (not
+    st.data_editor), no widget writes back into the set, and no
+    lifecycle control of any kind. Creating/editing/deleting an
+    intermarket entry still means hand-editing the set's JSON file --
+    this panel exists so a trader can SEE that those entries exist and
+    what they contain, rather than inferring it from their silent
+    absence in the grid above.
+
+    Every value shown here comes from ui.intermarket_formatting's pure
+    translation; the composite market label it produces is cosmetic
+    only and never reaches provider resolution, a cache key, or a bp
+    conversion (Module 9's display-only rule).
+    """
+    displays = entry_displays(strategy_set)
+    if not displays:
+        return
+
+    with st.container(border=True):
+        st.caption(SECTION_CAPTION)
+        st.markdown(f"**{panel_title(displays)}**")
+        notice = intermarket_notice(strategy_set)
+        if notice is not None:
+            st.info(notice)
+
+        for display in displays:
+            st.markdown(f"**{display.name}** · {entry_status_label(display)}")
+            st.caption(entry_summary_line(display))
+            st.dataframe(
+                pd.DataFrame(display.leg_rows, columns=list(LEG_COLUMNS)),
+                hide_index=True,
+                key=f"oscill8_ss_intermarket_legs_{display.name}",
+            )
+        st.caption(LEG_OFFSET_HELP)
 
 
 _SHOW_DIALOG_KEY = "oscill8_ss_show_save_dialog"
@@ -235,15 +319,28 @@ def process_save(
     position_columns: tuple[str, ...],
     market_key: str,
     interval: BarInterval,
+    loaded_set: StrategySet | None = None,
 ) -> None:
     """Acts on the Save click captured by render_controls_row(), now
     that the grid's current rows are known. Overwrites in place when a
     saved set is loaded; opens a small name prompt when "+ New Strategy
     Set" is active -- identical behavior to the original single-button
-    Save control, just split across the grid's render point."""
+    Save control, just split across the grid's render point.
+
+    `loaded_set` is the currently selected set as it was read at the top
+    of this same script pass (see load_selected_set) -- its
+    `intermarket_entries` are the ones a save must carry through
+    untouched, since the grid cannot represent them (see
+    render_intermarket_entries). Omitted/None means "nothing loaded",
+    which is also correct for the "+ New Strategy Set" path: a
+    brand-new set has no intermarket entries to preserve.
+    """
     if selected_name is not None:
         if save_clicked:
-            _save(repo, selected_name, grid_rows, position_columns, market_key, interval, new_name=None)
+            _save(
+                repo, selected_name, grid_rows, position_columns, market_key, interval,
+                new_name=None, loaded_set=loaded_set,
+            )
         return
 
     if save_clicked:
@@ -280,13 +377,23 @@ def _save(
     market_key: str,
     interval: BarInterval,
     new_name: str | None,
+    loaded_set: StrategySet | None = None,
 ) -> None:
     """Shared save logic for both the overwrite-existing and create-new
     paths. On success, clears the dialog-open flag (a no-op for the
     overwrite path, which never sets it), records the pending selection,
     and reruns -- st.rerun() never returns, so a validation error is the
     only way this function returns normally (leaving the dialog, if
-    any, open with the error visible for the user to correct)."""
+    any, open with the error visible for the user to correct).
+
+    `loaded_set`'s intermarket entries (if any) are passed straight
+    through to build_strategy_set_from_grid(), which writes them back
+    unchanged -- this is what makes load -> save -> reload of a mixed
+    set lossless despite the grid being single-market only. It is NOT a
+    second save path: the same, single repo.save() below persists both
+    kinds of entry together, exactly as strategy_sets.serialization
+    already writes them.
+    """
     if selected_name is None:
         name = (new_name or "").strip()
         if not name:
@@ -298,9 +405,11 @@ def _save(
     else:
         name = selected_name
 
+    intermarket_entries = () if loaded_set is None else loaded_set.intermarket_entries
     try:
         strategy_set: StrategySet = build_strategy_set_from_grid(
-            name, grid_rows, position_columns, market_key, interval
+            name, grid_rows, position_columns, market_key, interval,
+            intermarket_entries=intermarket_entries,
         )
     except ValueError as exc:
         st.error(str(exc))
