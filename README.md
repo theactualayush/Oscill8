@@ -133,6 +133,25 @@ for display.
   currently-forming bar from every fetch/cache/return path. See
   [Data providers: LSEG and QuantHub](#data-providers-lseg-and-quanthub)
   below.
+- **Module 9 — Intermarket Strategy Engine** (`strategy_engine/
+  intermarket_definitions.py`, `intermarket_combinations.py`;
+  `strategy_sets/` additions): lets a SINGLE strategy combine legs from
+  DIFFERENT markets (e.g. a SOFR leg + a SONIA leg priced into one
+  series) as an additive sibling to the existing single-market
+  `StrategyDefinition`/`StrategyInstance` path, which is unmodified.
+  `IntermarketDefinition`/`LegSpec` model each leg's own market/offset/
+  weight; `generate_intermarket_instances()` intersects only the
+  `offset=0` "anchor" legs' calendars to find valid anchor periods, then
+  steps each other leg forward on ITS OWN market's contract curve.
+  Wired into `strategy_sets` (`IntermarketStrategySetEntry`,
+  `StrategySet.intermarket_entries`, JSON-authorable) and into
+  `template_scanner`/`range_analytics` for pricing, filtering, ranking,
+  and range/volatility diagnostics (bp-conversion is explicit-or-`NaN`,
+  never guessed from one leg's market). **Backend only** — there is no
+  Streamlit UI for authoring/editing intermarket entries (hand-edit the
+  JSON), and no live UI button yet triggers the Strategy Set execution
+  path (`strategy_sets/execution.py`) for either single-market or
+  intermarket entries.
 
 ## Supported intervals
 
@@ -315,7 +334,7 @@ retry logic (a genuine outage/auth/network error still retries):
 | Empty response (valid RIC, no bars in range) | Returned as empty, not an exception — flows into the same "incomplete" branch as a confirmed-unavailable error during establishment/legacy fallback |
 | `TS.Interday.UserRequestError.70005` ("The universe is not found") | `MarketDataUnavailableError` — confirmed invalid RIC |
 | `TS.Interday.UserNotPermission.70112` | `MarketDataUnavailableError` — confirmed missing Interday entitlement (CORRA's known LSEG account limitation) |
-| `TS.Intraday.UserNotPermission.92000` | `MarketDataUnavailableError` — confirmed missing Intraday entitlement, matched on **error code alone** (the English wording after the code has been observed to vary — `"User does not have permission for this universe"` vs. the real production wording `"User has no permission"` — so only the code is authoritative for this one classifier) |
+| `*.UserNotPermission.92000` (any service/product prefix) | `MarketDataUnavailableError` — confirmed missing Intraday entitlement, matched on **error code alone**, prefix-agnostic: live-confirmed in production as both `TS.Intraday.UserNotPermission.92000` and `TSCC.QS.UserNotPermission.92000`. The English wording after the code has also been observed to vary — `"User does not have permission for this universe"` vs. the real production wording `"User has no permission"` — so only the `UserNotPermission.92000` code substring is authoritative for this classifier, never a specific prefix or trailing phrase |
 | Any other LSEG error | Not caught here — propagates and aborts the caller (network/session/auth/vendor errors, programming bugs) |
 
 ### Currently-forming bars are never fetched, cached, or returned
@@ -568,6 +587,13 @@ an already-selected candidate's chart never touch LSEG (see
 [Current UI](#current-ui)). `core.config.LSEG_SESSION_TYPE` defaults to
 `"desktop.workspace"`.
 
+`ui/app.py` calls `load_dotenv()` before importing anything that
+transitively imports `core.config`, so an `RBS_*` setting (e.g.
+`RBS_QUANTHUB_TOKEN`) placed in a `.env` file at the repository root is
+picked up automatically — no need to export it as a real OS/session
+environment variable first. `python-dotenv` is already a pinned
+`requirements.txt` dependency.
+
 ## Testing
 
 ```
@@ -576,7 +602,7 @@ pytest -q
 
 Current suite (snapshot as of this documentation pass — re-run the
 command above for the up-to-date count, do not trust this number
-blindly): **1175 tests** — 1172 passing, 1 known environment-specific
+blindly): **1270 tests** — 1267 passing, 1 known environment-specific
 failure (see below), 2 skipped. Unit tests, LSEG and QuantHub both
 mocked — no live session required for the pytest suite itself.
 `tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema`
@@ -588,7 +614,11 @@ market-data change, not fixed here. The 2 skips are
 
 `test_live_connection.py` is a manual smoke test, not part of the pytest
 suite — run it directly (`python test_live_connection.py`) on a machine
-with LSEG Workspace open. Only the `SOFR` market is currently marked
+with LSEG Workspace open. `test_intermarket.py` (repository root) is a
+second, similarly standalone/temporary script — it independently
+verifies an intermarket Strategy Set's leg-RIC mapping and pricing
+arithmetic against real LSEG/QuantHub data (see Module 9 above); run it
+directly (`python test_intermarket.py`), not via pytest. Only the `SOFR` market is currently marked
 `verified=True` in `core/config.py`; SONIA/CORRA/ESTR/FED_FUNDS RIC roots
 have since been confirmed via live LSEG data pulls (see [Market RIC
 conventions](#market-ric-conventions--data-field-differences) above), but
@@ -602,7 +632,9 @@ core/              LSEG + QuantHub downloaders, RIC build/parse, futures calenda
                    provider routing (providers.py), market-instrument mapping table
 database/          SQLite cache (get_history/get_history_batch) + provider provenance,
                    sitting between core and everything above it
-strategy_engine/   StrategyDefinition, rolling contract combinations, historical pricing
+strategy_engine/   StrategyDefinition, rolling contract combinations, historical pricing;
+                   intermarket_definitions.py/intermarket_combinations.py (Module 9,
+                   cross-market legs within one strategy)
 range_analytics/   Range-bound (4A) and multi-lookback stability (4B) measurements
 template_scanner/  Dense-grid templates, candidate universe, scan orchestration, filtering/ranking (5A/5B)
 strategy_sets/     Named, JSON-persisted collections of StrategyDefinitions (7A)
@@ -613,10 +645,12 @@ tests/             Unit tests for every module above (pytest, LSEG and QuantHub 
 
 ## Current status
 
-Modules 1 through 8 (LSEG data layer through the Streamlit scanner UI,
-selected-strategy history chart, Strategy Set engine, and the QuantHub
-secondary provider / provider-provenance / effective-request-end work)
-are complete and tested. See
+Modules 1 through 9 (LSEG data layer through the Streamlit scanner UI,
+selected-strategy history chart, Strategy Set engine, the QuantHub
+secondary provider / provider-provenance / effective-request-end work,
+and the intermarket strategy engine) are complete and tested at the
+backend level. Module 9 (intermarket) has no Streamlit UI surface yet —
+see its entry above. See
 [Current limitations / deferred work](#current-limitations--deferred-work)
 for what is explicitly out of scope today.
 
