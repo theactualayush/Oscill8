@@ -16,6 +16,7 @@ forbidden_paths:
   - range_analytics/
 test_command: "pytest -q tests/"
 requires_new_tests: true
+expects_diff: true
 allow_doc_updates: [CLAUDE.md, CHANGELOG.md]
 ---
 

@@ -24,6 +24,26 @@ Interval selectors when a set loads, and there is no more "mixed
 markets can't be represented" warning -- both were needed only while
 the grid was bound to a single global market/interval.
 
+Composite groups: a saved set may also carry `groups` (the Group A /
+Group B configuration, strategy_sets/model.py). Authoring it lives in
+ui.composite_view, rendered by ui.controls beneath the grid; this
+module only PERSISTS what that panel hands to process_save(). Omitting
+the `groups` argument entirely still falls back to the loaded set's own
+configuration, so nothing that does not author groups is affected.
+
+Intermarket entries (Module 9 visibility slice): a saved set may also
+carry `intermarket_entries` (legs spanning different markets), which the
+single-market grid has no representation for. render_intermarket_
+entries() shows them READ-ONLY beneath the grid whenever the loaded set
+has any -- st.dataframe, no editor, no lifecycle control, no scan
+button; hand-editing the set's JSON remains the only way to author one.
+A save carries them through untouched (see process_save/_save's
+`loaded_set` argument and ui.strategy_set_formatting.build_strategy_set_
+from_grid's `intermarket_entries`), so load -> save -> reload of a mixed
+set is lossless rather than silently dropping the half the grid can't
+show. A set with no intermarket entries renders exactly as before --
+the panel is not rendered at all.
+
 Scanner integration: unchanged from before this simplification and
 unchanged by it. A loaded Strategy Set becomes ordinary grid rows;
 ui.scan_view.handle_run_scan() builds StrategyDefinition[] from
@@ -90,15 +110,46 @@ import streamlit as st
 
 from core.config import BarInterval
 
-from strategy_sets.model import StrategySet
+from strategy_sets.model import StrategyGroupPair, StrategySet
 from strategy_sets.repository import StrategySetRepository
 
 from ui import strategy_set_state as ss_state
 from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN
+from ui.intermarket_formatting import (
+    LEG_COLUMNS,
+    LEG_OFFSET_HELP,
+    SECTION_CAPTION,
+    entry_displays,
+    entry_status_label,
+    entry_summary_line,
+    intermarket_notice,
+    panel_title,
+)
 from ui.strategy_set_formatting import build_strategy_set_from_grid, grid_rows_from_strategy_set
 
 NEW_SET_OPTION = "+ New Strategy Set"
 _SELECTOR_KEY = "oscill8_ss_selector"
+
+# process_save()'s "the caller does not author groups" default. Needed
+# because None is itself a meaningful value there (ui.composite_view
+# returns None to say "this is not a composite Strategy Set"), so it
+# cannot double as "argument omitted". A caller that omits `groups`
+# keeps the pre-panel behaviour: whatever the loaded set already had is
+# preserved verbatim.
+_PRESERVE_LOADED_GROUPS = object()
+
+
+def _resolve_groups(
+    groups: StrategyGroupPair | None | object, loaded_set: StrategySet | None
+) -> StrategyGroupPair | None:
+    """The composite configuration a save should persist: the caller's
+    explicit value (including an explicit None, which turns a composite
+    back into an ordinary Strategy Set), or the loaded set's own when
+    the caller supplied none at all -- see process_save()'s docstring
+    for why those two cases must stay distinguishable."""
+    if groups is _PRESERVE_LOADED_GROUPS:
+        return None if loaded_set is None else loaded_set.groups
+    return groups  # type: ignore[return-value]
 
 
 def render_selector(repo: StrategySetRepository) -> str | None:
@@ -138,12 +189,24 @@ def blank_grid_row(
     return pd.DataFrame([row])
 
 
+def load_selected_set(repo: StrategySetRepository, selected_name: str | None) -> StrategySet | None:
+    """The currently selected saved StrategySet, or None for "+ New
+    Strategy Set". Exists so one script pass reads a set's JSON file
+    exactly ONCE and shares that object across everything that needs it
+    (the grid seed, the read-only intermarket panel, and the save path's
+    intermarket preservation) rather than each re-loading it."""
+    if selected_name is None:
+        return None
+    return repo.load(selected_name)
+
+
 def resolve_grid_seed(
     selected_name: str | None,
     repo: StrategySetRepository,
     position_columns: tuple[str, ...],
     default_market_key: str,
     default_interval: BarInterval,
+    strategy_set: StrategySet | None = None,
 ) -> pd.DataFrame:
     """The grid rows to show for the currently selected Strategy Set --
     each carrying its OWN Market/Interval, so a set mixing markets (see
@@ -151,15 +214,64 @@ def resolve_grid_seed(
     override the scan bar's Market/Interval selectors and no "mixed
     markets" warning. `default_market_key`/`default_interval` seed only
     a genuinely blank "+ New Strategy Set" row's Market/Interval cells.
+
+    `strategy_set` is the already-loaded set for `selected_name` when
+    the caller has one (see load_selected_set) -- purely an I/O
+    optimization; it is loaded from `repo` when omitted, exactly as
+    before. Only the set's single-market `entries` seed the grid; its
+    `intermarket_entries` have no grid representation and are shown
+    read-only elsewhere (see render_intermarket_entries).
     """
     if selected_name is None:
         return blank_grid_row(position_columns, default_market_key, default_interval)
 
-    strategy_set = repo.load(selected_name)
+    if strategy_set is None:
+        strategy_set = repo.load(selected_name)
     rows = grid_rows_from_strategy_set(strategy_set, position_columns)
     if not rows:
         return blank_grid_row(position_columns, default_market_key, default_interval)
     return pd.DataFrame(rows, columns=[LABEL_COLUMN, MARKET_COLUMN, INTERVAL_COLUMN, *position_columns])
+
+
+def render_intermarket_entries(strategy_set: StrategySet | None) -> None:
+    """The read-only Intermarket Strategies panel (Module 9 visibility
+    slice) -- rendered ONLY when the loaded set actually carries
+    intermarket entries, so a set with none (the ordinary case) looks
+    and behaves exactly as it did before this panel existed.
+
+    Read-only in the strongest available sense: st.dataframe (not
+    st.data_editor), no widget writes back into the set, and no
+    lifecycle control of any kind. Creating/editing/deleting an
+    intermarket entry still means hand-editing the set's JSON file --
+    this panel exists so a trader can SEE that those entries exist and
+    what they contain, rather than inferring it from their silent
+    absence in the grid above.
+
+    Every value shown here comes from ui.intermarket_formatting's pure
+    translation; the composite market label it produces is cosmetic
+    only and never reaches provider resolution, a cache key, or a bp
+    conversion (Module 9's display-only rule).
+    """
+    displays = entry_displays(strategy_set)
+    if not displays:
+        return
+
+    with st.container(border=True):
+        st.caption(SECTION_CAPTION)
+        st.markdown(f"**{panel_title(displays)}**")
+        notice = intermarket_notice(strategy_set)
+        if notice is not None:
+            st.info(notice)
+
+        for display in displays:
+            st.markdown(f"**{display.name}** · {entry_status_label(display)}")
+            st.caption(entry_summary_line(display))
+            st.dataframe(
+                pd.DataFrame(display.leg_rows, columns=list(LEG_COLUMNS)),
+                hide_index=True,
+                key=f"oscill8_ss_intermarket_legs_{display.name}",
+            )
+        st.caption(LEG_OFFSET_HELP)
 
 
 _SHOW_DIALOG_KEY = "oscill8_ss_show_save_dialog"
@@ -235,22 +347,50 @@ def process_save(
     position_columns: tuple[str, ...],
     market_key: str,
     interval: BarInterval,
+    loaded_set: StrategySet | None = None,
+    groups: StrategyGroupPair | None | object = _PRESERVE_LOADED_GROUPS,
 ) -> None:
     """Acts on the Save click captured by render_controls_row(), now
     that the grid's current rows are known. Overwrites in place when a
     saved set is loaded; opens a small name prompt when "+ New Strategy
     Set" is active -- identical behavior to the original single-button
-    Save control, just split across the grid's render point."""
+    Save control, just split across the grid's render point.
+
+    `loaded_set` is the currently selected set as it was read at the top
+    of this same script pass (see load_selected_set) -- its
+    `intermarket_entries` are the ones a save must carry through
+    untouched, since the grid cannot represent them (see
+    render_intermarket_entries). Omitted/None means "nothing loaded",
+    which is also correct for the "+ New Strategy Set" path: a
+    brand-new set has no intermarket entries to preserve.
+
+    `groups` is the composite (Group A x Group B) configuration to
+    persist -- the LIVE value from ui.composite_view's authoring panel,
+    which seeds itself from `loaded_set.groups` and therefore returns
+    that same object unchanged when nothing was edited. Explicitly
+    passing None is meaningful and is honoured: it is how the panel
+    says the trader turned a composite back into an ordinary Strategy
+    Set. OMITTING the argument entirely is different again -- it falls
+    back to `loaded_set.groups`, preserving the pre-panel behaviour for
+    any caller that does not author groups at all.
+    """
+    resolved_groups = _resolve_groups(groups, loaded_set)
+
     if selected_name is not None:
         if save_clicked:
-            _save(repo, selected_name, grid_rows, position_columns, market_key, interval, new_name=None)
+            _save(
+                repo, selected_name, grid_rows, position_columns, market_key, interval,
+                new_name=None, loaded_set=loaded_set, groups=resolved_groups,
+            )
         return
 
     if save_clicked:
         st.session_state[_SHOW_DIALOG_KEY] = True
 
     if st.session_state.get(_SHOW_DIALOG_KEY):
-        _save_new_dialog(repo, grid_rows, position_columns, market_key, interval)
+        _save_new_dialog(
+            repo, grid_rows, position_columns, market_key, interval, groups=resolved_groups
+        )
 
 
 @st.dialog("Save Strategy Set")
@@ -260,6 +400,7 @@ def _save_new_dialog(
     position_columns: tuple[str, ...],
     market_key: str,
     interval: BarInterval,
+    groups: StrategyGroupPair | None = None,
 ) -> None:
     name = st.text_input("Strategy Set Name")
     col_cancel, col_save = st.columns(2)
@@ -269,7 +410,10 @@ def _save_new_dialog(
             st.rerun()
     with col_save:
         if st.button("Save", type="primary", width="stretch"):
-            _save(repo, None, grid_rows, position_columns, market_key, interval, new_name=name)
+            _save(
+                repo, None, grid_rows, position_columns, market_key, interval, new_name=name,
+                groups=groups,
+            )
 
 
 def _save(
@@ -280,13 +424,28 @@ def _save(
     market_key: str,
     interval: BarInterval,
     new_name: str | None,
+    loaded_set: StrategySet | None = None,
+    groups: StrategyGroupPair | None = None,
 ) -> None:
     """Shared save logic for both the overwrite-existing and create-new
     paths. On success, clears the dialog-open flag (a no-op for the
     overwrite path, which never sets it), records the pending selection,
     and reruns -- st.rerun() never returns, so a validation error is the
     only way this function returns normally (leaving the dialog, if
-    any, open with the error visible for the user to correct)."""
+    any, open with the error visible for the user to correct).
+
+    `loaded_set`'s intermarket entries are passed straight through to
+    build_strategy_set_from_grid(), which writes them back unchanged --
+    this is what makes load -> save -> reload of a mixed set lossless
+    despite the grid being single-market only. It is NOT a
+    second save path: the same, single repo.save() below persists both
+    kinds of entry together, exactly as strategy_sets.serialization
+    already writes them.
+
+    `groups` is already resolved by process_save() (the panel's live
+    value, or the loaded set's own when no caller authors one) and is
+    likewise written back by reference -- never rebuilt here.
+    """
     if selected_name is None:
         name = (new_name or "").strip()
         if not name:
@@ -298,9 +457,12 @@ def _save(
     else:
         name = selected_name
 
+    intermarket_entries = () if loaded_set is None else loaded_set.intermarket_entries
     try:
         strategy_set: StrategySet = build_strategy_set_from_grid(
-            name, grid_rows, position_columns, market_key, interval
+            name, grid_rows, position_columns, market_key, interval,
+            intermarket_entries=intermarket_entries,
+            groups=groups,
         )
     except ValueError as exc:
         st.error(str(exc))

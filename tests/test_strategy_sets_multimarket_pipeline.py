@@ -342,15 +342,30 @@ def test_mismatched_scan_setup_style_market_interval_never_overrides_entries(fak
     corra_entry = StrategySetEntry(name="CORRA Daily", definition=_outright("CORRA", BarInterval.DAILY))
     strategy_set = StrategySet(name="Mismatch Guard", entries=(sofr_entry, corra_entry))
 
-    # expand_strategy_set has no market/interval parameter at all --
-    # only a contract window -- so there is structurally no argument
-    # position where a "scan setup" market/interval could even be
-    # threaded through. Confirmed once, explicitly, here.
+    # expand_strategy_set has no market parameter at all, so there is
+    # structurally no argument position where a "scan setup" market
+    # could even be threaded through.
     import inspect
     params = inspect.signature(expand_strategy_set).parameters
-    assert "market_key" not in params and "interval" not in params
+    assert "market_key" not in params
 
-    instances = expand_strategy_set(strategy_set, _START, _END)
+    # It DOES take an `interval` (Phase 4), but that argument reaches
+    # only a COMPOSITE group's source definitions -- which live in other
+    # saved files and are loaded during resolution, so nothing else can
+    # reach them. It must never touch an ordinary entry's own interval;
+    # overriding those remains strategy_sets.execution.
+    # with_interval_override()'s job, applied by the caller BEFORE this
+    # call. Asserted behaviourally below, which is stronger evidence
+    # than the absence of a parameter: pass the mismatched scan-bar
+    # interval explicitly and prove the entries are unaffected.
+    assert "interval" in params
+    instances = expand_strategy_set(
+        strategy_set, _START, _END, interval=_MISMATCHED_SCAN_SETUP_INTERVAL
+    )
+    assert {i.definition.interval for i in instances} == {BarInterval.DAILY}
+    assert sofr_entry.definition.interval is BarInterval.DAILY
+    assert corra_entry.definition.interval is BarInterval.DAILY
+
     front_instances = [i for i in instances if i.rics in (("SRAH26",), ("CRAH6",))]
     assert len(front_instances) == 2
 

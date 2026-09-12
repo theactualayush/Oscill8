@@ -12,6 +12,7 @@ forbidden_paths:
   - database/
 test_command: "pytest -q tests/"
 requires_new_tests: true
+expects_diff: true
 allow_doc_updates: [CLAUDE.md, CHANGELOG.md, README.md]
 ---
 
@@ -28,6 +29,12 @@ allow_doc_updates: [CLAUDE.md, CHANGELOG.md, README.md]
     - branch must match ^task/TASK-\d{3}-[a-z0-9-]+$
     - test_command must scope pytest to tests/ (never a bare 'pytest -q').
     - allowed_paths must be non-empty.
+
+  expects_diff (optional, default true) tells -RunClaude whether producing no
+  working-tree change is a legitimate outcome. Leave it true for any task that
+  should result in code changes: with it true, a silent no-op FAILS the run
+  instead of quietly passing. Set it to false only for a genuinely
+  investigative task whose deliverable is not a diff.
 
   Section headings below are checked by name. Missing ones are warnings,
   not errors, but write them anyway -- they are the whole contract.

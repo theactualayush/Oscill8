@@ -8,10 +8,11 @@ show a short, trader-facing headline/message as the PRIMARY error --
 never the raw exception type, message, or traceback -- with the full
 technical detail confined to a collapsed "Technical details" expander.
 
-Does not touch run_scan()/the scanner itself -- template_scanner.
-scanner.run_scan is mocked to raise, exactly as the existing
+Does not touch the scanner itself -- strategy_sets.execution.
+run_strategy_set (the single execution entry point ui.scan_view calls
+since Phase 4) is mocked to raise, exactly as the existing
 "test_run_scan_uses_the_loaded_sets_exact_weights..." style tests mock
-it to return a canned ScanReport. Only ui.scan_view's exception handling
+it to return a canned result. Only ui.scan_view's exception handling
 and ui.error_formatting's classification are under test here.
 """
 
@@ -69,7 +70,7 @@ def _run_scan_and_fail(repo, mocker, exc: Exception) -> AppTest:
     at.run()
     _selector(at).select("6M Strategies").run()
 
-    mocker.patch.object(scan_view, "run_scan", side_effect=exc)
+    mocker.patch.object(scan_view, "run_strategy_set", side_effect=exc)
     _button(at, "▶ Run Scan").click().run()
     _assert_no_exception(at)
     return at
