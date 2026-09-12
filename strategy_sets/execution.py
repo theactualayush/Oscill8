@@ -17,8 +17,27 @@ without editing every row.
 Architecture (see the design discussion this module implements):
     StrategySet
         -> with_interval_override()   -- transient copy, interval only
-        -> strategy_sets.expansion.expand_strategy_set()
+        -> strategy_sets.expansion.expand_strategy_set_with_labels()
         -> template_scanner.scanner.run_scan_on_instances()
+
+Phase 4 made this the ONE downstream execution path the live UI uses
+(ui/scan_view.py builds a transient StrategySet from the grid + the
+loaded set's intermarket_entries/groups and calls run_strategy_set()),
+so ordinary entries, hand-authored Module 9 intermarket entries, and
+composite Group A x Group B combinations all reach
+run_scan_on_instances() through this single function. There is no
+composite scanner, no intermarket scanner, and no second provider/
+cache/analytics path -- expand_strategy_set_with_labels() simply
+returns one mixed instance list.
+
+Composite support (Phase 4): `repository` is now an explicit, call-time
+argument, forwarded to expand_strategy_set_with_labels() so a composite
+StrategySet's groups can resolve their source sets by name. It is
+deliberately NOT defaulted to a StrategySetRepository() constructed
+here: that would introduce hidden filesystem I/O into this layer and
+would read the real data/strategy_sets/ directory in tests. A composite
+expanded without one still fails clearly and deterministically, exactly
+as it did before (CompositeResolutionError from expansion.py).
 
 Intermarket note (Phase 2): expand_strategy_set() and
 run_scan_on_instances() both already handle a StrategySet's
@@ -63,9 +82,18 @@ returns a ScanRequest -- constructed from the overridden entries'
 definitions and the same call-time window/lookback/percentile
 arguments -- purely so the existing results/chart UI keeps working
 unmodified. Its `.definitions` field does not literally drive candidate
-generation (expand_strategy_set() does that, per-entry) but nothing
-downstream reads it for that purpose; only price_start/price_end/
-lookbacks are ever read off a stored ScanRequest by the UI.
+generation (expand_strategy_set_with_labels() does that, per-entry) but
+nothing downstream reads it for that purpose; only price_start/
+price_end/lookbacks are ever read off a stored ScanRequest by the UI.
+
+A COMPOSITE-ONLY StrategySet has `entries == ()`, so that tuple is
+legitimately empty -- a composite's strategies are referenced through
+`groups`, and there is no StrategyDefinition to put there. Phase 4
+moved template_scanner.scanner's "definitions must be non-empty" rule
+out of ScanRequest.__post_init__ and into run_scan(), its only
+consumer, precisely so this metadata-only use stays honest instead of
+requiring a fabricated placeholder definition. run_scan() still refuses
+an empty definition list; see ScanRequest's own docstring.
 """
 
 from __future__ import annotations
@@ -75,8 +103,9 @@ from dataclasses import replace
 from core.config import BarInterval
 from core.utils import DateLike, get_logger
 
-from strategy_sets.expansion import expand_strategy_set
+from strategy_sets.expansion import expand_strategy_set_with_labels
 from strategy_sets.model import StrategySet
+from strategy_sets.repository import StrategySetRepository
 
 from template_scanner.scanner import ScanReport, ScanRequest, run_scan_on_instances
 
@@ -137,11 +166,36 @@ def run_strategy_set(
     upper_percentile: float = 95.0,
     only_enabled: bool = True,
     dedupe: bool = True,
+    repository: StrategySetRepository | None = None,
 ) -> tuple[ScanRequest, ScanReport]:
     """Run `strategy_set` at a single, call-time-chosen `interval`,
     applied uniformly to every entry for THIS run only -- `strategy_set`
     itself (and whatever's saved under its name in the repository, if
     anything) is never modified.
+
+    Handles all three entry kinds in ONE scan and ONE ScanReport:
+    ordinary `entries`, hand-authored Module 9 `intermarket_entries`,
+    and composite `groups` -- see expand_strategy_set_with_labels().
+
+    `repository` is required only when `strategy_set` is a composite
+    (it resolves each group's source Strategy Set by name) and is
+    ignored otherwise. Omitting it for a composite raises
+    CompositeResolutionError from expansion.py, unchanged. Source
+    Strategy Sets are only ever READ: nothing here (or below) writes,
+    renames, or otherwise modifies them.
+
+    Interval handling: `interval` is applied to this set's own entries
+    up front via with_interval_override(), AND forwarded to composite
+    resolution so each group's source definitions -- which live in other
+    saved files and are only loaded during resolution -- carry it too,
+    before composition. Every leg of every candidate therefore prices at
+    `interval`, never at a source file's persisted interval.
+
+    Labels: every candidate's caller-facing name (a StrategySetEntry's
+    own `name`, or a composite combination's "Group A - Group B" name)
+    is threaded through to ScanCandidateResult.label. The label map
+    comes from the SAME expansion call that produced the instances, so
+    composites are resolved exactly once and every id() matches.
 
     Returns (request, report): `report` is the real ScanReport from
     run_scan_on_instances() (results + skipped candidates, unchanged
@@ -151,8 +205,14 @@ def run_strategy_set(
     """
     overridden = with_interval_override(strategy_set, interval)
 
-    instances = expand_strategy_set(
-        overridden, contract_start, contract_end, only_enabled=only_enabled, dedupe=dedupe
+    instances, labels_by_definition_id = expand_strategy_set_with_labels(
+        overridden,
+        contract_start,
+        contract_end,
+        only_enabled=only_enabled,
+        dedupe=dedupe,
+        repository=repository,
+        interval=interval,
     )
 
     report = run_scan_on_instances(
@@ -164,6 +224,7 @@ def run_strategy_set(
         crossing_threshold=crossing_threshold,
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
+        labels_by_definition_id=labels_by_definition_id,
     )
 
     request = ScanRequest(

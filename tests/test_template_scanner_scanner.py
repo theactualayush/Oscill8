@@ -95,12 +95,56 @@ def _fields_equal(a, b) -> bool:
 # ScanRequest validation
 # ---------------------------------------------------------------------
 
-def test_scan_request_rejects_empty_definitions():
+def test_run_scan_rejects_empty_definitions():
+    """The real protection: run_scan() rolls `definitions` into the
+    candidate universe, so an empty tuple could only ever produce a
+    silent zero-candidate scan. Phase 4 moved this check out of
+    ScanRequest.__post_init__ into run_scan() -- its only consumer --
+    so a ScanRequest can also serve as descriptive session metadata for
+    a caller that builds candidates another way (see the test below and
+    ScanRequest's own docstring). The rule itself is unchanged."""
+    request = ScanRequest(
+        definitions=(),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+    )
     with pytest.raises(ValueError, match="definitions"):
+        run_scan(request)
+
+
+def test_scan_request_allows_empty_definitions_as_session_metadata():
+    """A composite-only StrategySet has no StrategyDefinition to put in
+    `definitions` at all, and strategy_sets.execution.run_strategy_set()
+    still needs a ScanRequest for the UI's results/chart session state
+    (which reads only price_start/price_end/lookbacks). Constructing one
+    with an empty `definitions` is therefore deliberate and allowed --
+    inventing a placeholder definition would be worse."""
+    request = ScanRequest(
+        definitions=(),
+        contract_start="2026-01-01", contract_end="2026-12-31",
+        price_start="2020-01-01", price_end="2020-06-30",
+        lookbacks=(20, 40),
+    )
+    assert request.definitions == ()
+    assert request.price_start == "2020-01-01"
+    assert request.price_end == "2020-06-30"
+    assert request.lookbacks == (20, 40)
+
+
+def test_scan_request_still_validates_everything_else_on_construction():
+    """Relaxing the definitions check must not have relaxed the others."""
+    with pytest.raises(ValueError, match="price_start"):
+        ScanRequest(
+            definitions=(),
+            contract_start="2026-01-01", contract_end="2026-12-31",
+            price_start="2020-06-30", price_end="2020-01-01",
+        )
+    with pytest.raises(ValueError, match="percentile"):
         ScanRequest(
             definitions=(),
             contract_start="2026-01-01", contract_end="2026-12-31",
             price_start="2020-01-01", price_end="2020-06-30",
+            lower_percentile=95.0, upper_percentile=5.0,
         )
 
 

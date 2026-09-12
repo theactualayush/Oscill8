@@ -75,6 +75,48 @@ two Python collections are always kept separate internally -- see
 strategy_sets/model.py -- so exact original interleaving order across
 the two shapes is not preserved on a save/load round-trip; order WITHIN
 each shape is).
+
+COMPOSITE GROUPS (additive, Phase 1 of the Group A/Group B design): a
+StrategySet carrying a StrategyGroupPair (model.py) gains ONE further
+OPTIONAL top-level key, alongside -- never instead of -- `entries`:
+
+    {
+      "schema_version": 1,
+      "name": "STIR Combos",
+      "description": "",
+      "entries": [],
+      "groups": {
+        "group_a": {
+          "source_set_name": "STIR Flys",
+          "selected_entry_names": ["SR3 Fly", "SON Fly"]
+        },
+        "group_b": {
+          "source_set_name": "Other Flys",
+          "selected_entry_names": ["SR3 Fly", "CRA Fly"]
+        }
+      }
+    }
+
+`"groups"` is written ONLY when a set actually has one, so a
+non-composite set's JSON is byte-for-byte what it was before this
+addition, and a missing `"groups"` key reads back as
+StrategySet.groups=None -- existing saved files are never
+reinterpreted as the new model. `"group_b"` inside a groups object IS
+always written (as null when absent), matching this file's existing
+convention of emitting optional scalar keys explicitly rather than
+omitting them (cf. `bp_per_point`, `max_curve_position`); an absent or
+null `"group_b"` reads back as None. SCHEMA_VERSION is deliberately NOT
+bumped -- this is a purely additive optional key that older-shaped
+files remain valid under, exactly like the intermarket-entry addition
+above.
+
+`selected_entry_names` is persisted as the literal, ordered list of
+selected names -- never a "select all" flag to be re-resolved against
+the source set at load time. See StrategyGroup's own docstring in
+model.py for why. Nothing here resolves a `source_set_name` against
+StrategySetRepository, or a selected name against the source set's
+actual entries: serialization stays pure dict/JSON conversion, and the
+combination engine that will do that resolution is a later phase.
 """
 
 from __future__ import annotations
@@ -87,6 +129,8 @@ from strategy_engine.intermarket_definitions import IntermarketDefinition, LegSp
 from strategy_sets.model import (
     ExpansionSettings,
     IntermarketStrategySetEntry,
+    StrategyGroup,
+    StrategyGroupPair,
     StrategySet,
     StrategySetEntry,
 )
@@ -244,6 +288,85 @@ def intermarket_entry_from_dict(data: dict) -> IntermarketStrategySetEntry:
     )
 
 
+def group_to_dict(group: StrategyGroup) -> dict:
+    """StrategyGroup -> a plain, JSON-serializable dict.
+
+    `selected_entry_names` is emitted in its stored order, which IS
+    meaningful (it is the trader's own selection order) and is
+    preserved exactly on a round trip.
+    """
+    return {
+        "source_set_name": group.source_set_name,
+        "selected_entry_names": list(group.selected_entry_names),
+    }
+
+
+def group_from_dict(data: dict) -> StrategyGroup:
+    """dict -> StrategyGroup, running its own validation unchanged.
+
+    `selected_entry_names` is optional in the JSON -- a group whose
+    selection has been cleared (or not made yet) may omit the key
+    entirely, defaulting to an empty selection.
+
+    Raises:
+        ValueError: `data` is missing the required `source_set_name`
+            key, or StrategyGroup's own validation rejects the values
+            given (e.g. an invalid source set name, or a duplicated
+            selected entry name).
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"StrategyGroup JSON must be an object, got {type(data).__name__}")
+    try:
+        (source_set_name,) = _require(data, "source_set_name")
+    except ValueError as exc:
+        raise ValueError(f"StrategyGroup JSON is {exc}") from exc
+
+    selected = data.get("selected_entry_names")
+    return StrategyGroup(
+        source_set_name=source_set_name,
+        selected_entry_names=tuple(selected) if selected else (),
+    )
+
+
+def group_pair_to_dict(groups: StrategyGroupPair) -> dict:
+    """StrategyGroupPair -> a plain, JSON-serializable dict.
+
+    `group_b` is always emitted, as null when absent -- see the module
+    docstring's "Composite groups" section.
+    """
+    return {
+        "group_a": group_to_dict(groups.group_a),
+        "group_b": group_to_dict(groups.group_b) if groups.group_b is not None else None,
+    }
+
+
+def group_pair_from_dict(data: dict) -> StrategyGroupPair:
+    """dict -> StrategyGroupPair, running StrategyGroup's/
+    StrategyGroupPair's own validation unchanged.
+
+    `group_b` is optional: an absent key and an explicit null both mean
+    "no Group B". `group_a` is required -- "Group B but no Group A" has
+    no meaning under the Group A x Group B definition.
+
+    Raises:
+        ValueError: `data` is missing the required `group_a` key, or
+            either nested group dict is itself malformed (see
+            group_from_dict).
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"StrategyGroupPair JSON must be an object, got {type(data).__name__}")
+    try:
+        (raw_group_a,) = _require(data, "group_a")
+    except ValueError as exc:
+        raise ValueError(f"StrategyGroupPair JSON is {exc}") from exc
+
+    raw_group_b = data.get("group_b")
+    return StrategyGroupPair(
+        group_a=group_from_dict(raw_group_a),
+        group_b=group_from_dict(raw_group_b) if raw_group_b is not None else None,
+    )
+
+
 def strategy_set_to_dict(strategy_set: StrategySet) -> dict:
     """StrategySet -> a plain, JSON-serializable dict.
 
@@ -251,8 +374,12 @@ def strategy_set_to_dict(strategy_set: StrategySet) -> dict:
     the SAME `entries` array -- see the module docstring's "Intermarket
     entries" section for the exact discriminated shape and the resulting
     interleaving-order caveat.
+
+    A `"groups"` key is emitted ONLY for a StrategySet that actually
+    carries a StrategyGroupPair, so a non-composite set's dict/JSON is
+    exactly what it was before composite groups existed.
     """
-    return {
+    data = {
         "schema_version": SCHEMA_VERSION,
         "name": strategy_set.name,
         "description": strategy_set.description,
@@ -261,6 +388,9 @@ def strategy_set_to_dict(strategy_set: StrategySet) -> dict:
             + [intermarket_entry_to_dict(e) for e in strategy_set.intermarket_entries]
         ),
     }
+    if strategy_set.groups is not None:
+        data["groups"] = group_pair_to_dict(strategy_set.groups)
+    return data
 
 
 def strategy_set_from_dict(data: dict) -> StrategySet:
@@ -272,11 +402,18 @@ def strategy_set_from_dict(data: dict) -> StrategySet:
     intermarket_entries; absent -> entry_from_dict() (completely
     unmodified) -> StrategySet.entries. See the module docstring.
 
+    `"groups"` is optional: absent (or explicitly null) -> StrategySet.
+    groups=None, which is exactly how every file saved before composite
+    groups existed reads back. A malformed `"groups"` object raises
+    rather than being partially/silently accepted.
+
     Raises:
         ValueError: `data`'s schema_version is missing or not the one
             this function knows how to read; a required top-level key
-            (name, entries) is missing; or any nested entry dict is
-            itself malformed (see entry_from_dict/intermarket_entry_from_dict).
+            (name, entries) is missing; any nested entry dict is
+            itself malformed (see entry_from_dict/intermarket_entry_from_dict);
+            or `"groups"` is present but malformed (see
+            group_pair_from_dict).
     """
     version = data.get("schema_version")
     if version != SCHEMA_VERSION:
@@ -296,11 +433,13 @@ def strategy_set_from_dict(data: dict) -> StrategySet:
         else:
             entries.append(entry_from_dict(raw_entry))
 
+    raw_groups = data.get("groups")
     return StrategySet(
         name=name,
         description=data.get("description", ""),
         entries=tuple(entries),
         intermarket_entries=tuple(intermarket_entries),
+        groups=group_pair_from_dict(raw_groups) if raw_groups is not None else None,
     )
 
 

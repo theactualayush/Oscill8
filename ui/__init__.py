@@ -6,8 +6,11 @@ Module 7B -- Strategy Set integration (simplified): "Strategy Templates
 is the working strategy grid; a Strategy Set is simply a saved named
 version of that grid." One strategy grid, one Run Scan button -- a
 loaded Strategy Set becomes ordinary grid rows and is run exactly like
-manual entry. A thin Streamlit layer over the existing, unmodified
-backend (strategy_engine, range_analytics, template_scanner,
+manual entry. Composite Strategy Sets (Group A x Group B) add ONE
+authoring panel inside that same section -- still one grid, still one
+Run Scan button; it only authors the group CONFIGURATION and hands it
+to the existing composite/execution backend. A thin Streamlit layer
+over the existing, unmodified backend (strategy_engine, range_analytics, template_scanner,
 strategy_sets). This package never computes analytics, never
 duplicates filtering/ranking/derived-metric formulas or Strategy Set
 persistence logic, and never talks to LSEG directly -- it only parses
@@ -60,4 +63,20 @@ intermarket_formatting.py    Pure helpers -- a StrategySet's Module 9
                              only: never an editor, never an inverse
                              translation, and its composite market label
                              never reaches provider/cache/bp resolution.
+composite_formatting.py      Pure helpers -- the composite (Group A x
+                             Group B) panel's widget values <->
+                             StrategyGroup/StrategyGroupPair. Enforces
+                             the two UI-side rules: no composite set can
+                             be chosen as a group source (no nested
+                             composites), and a saved selection is never
+                             silently rewritten.
+composite_view.py            The composite authoring panel rendered
+                             beneath the grid: one source Strategy Set
+                             per group, Select all/Clear all, and the
+                             ordered strategy selection. Authors the
+                             CONFIGURATION only -- pairing, composition,
+                             structural-zero filtering and expansion all
+                             stay in strategy_sets.composite, reached
+                             only through the existing execution path
+                             plus one read-only combination preview.
 """

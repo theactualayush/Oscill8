@@ -35,6 +35,18 @@ and preserves them verbatim so that loading a mixed set and saving it
 again cannot silently drop them. Nothing in ui/ constructs or edits
 one.
 
+Composite groups (StrategySet.groups -- StrategyGroup/StrategyGroupPair,
+strategy_sets/model.py): the GRID still has no representation for a
+"Group A x Group B" selection, and this module still never constructs,
+edits, or inspects one -- build_strategy_set_from_grid() simply accepts
+a `groups` object and writes it back by reference. What changed when
+the composite authoring panel shipped is only WHERE that object comes
+from: ui.composite_view now builds it from its own widgets (seeded from
+the loaded set, so an untouched composite still round-trips by
+reference), where previously the only possible source was the loaded
+set itself. Nothing about this module's contract moved: it preserves
+whatever it is handed and never authors, validates, or rebuilds it.
+
 No Streamlit import here -- unit-testable directly against plain data,
 the same convention ui.formatting follows for Module 6A. No shape/
 weight validation is duplicated: row translation routes through the
@@ -53,7 +65,12 @@ from core.config import BarInterval
 
 from strategy_engine.definitions import StrategyDefinition
 
-from strategy_sets.model import IntermarketStrategySetEntry, StrategySet, StrategySetEntry
+from strategy_sets.model import (
+    IntermarketStrategySetEntry,
+    StrategyGroupPair,
+    StrategySet,
+    StrategySetEntry,
+)
 
 from ui.formatting import INTERVAL_COLUMN, LABEL_COLUMN, MARKET_COLUMN, build_definitions_from_grid
 
@@ -119,6 +136,7 @@ def build_strategy_set_from_grid(
     market_key: str,
     interval: BarInterval,
     intermarket_entries: Sequence[IntermarketStrategySetEntry] = (),
+    groups: StrategyGroupPair | None = None,
 ) -> StrategySet:
     """Snapshot the grid's current rows into a new StrategySet named
     `name`. Each entry's market_key/interval comes from that ROW's own
@@ -138,10 +156,19 @@ def build_strategy_set_from_grid(
     ever travel load -> display -> save untouched. Defaults to () so a
     brand-new set, and every pre-existing caller, is unaffected.
 
+    `groups` (the composite Group A/Group B selection) is carried
+    through the same way: the object passed in is stored on the result
+    BY REFERENCE, never rebuilt, re-validated, or partially copied.
+    Authoring it belongs to ui.composite_view, which hands its current
+    configuration to ui.strategy_set_view.process_save(); the grid
+    itself still cannot represent one. Defaults to None so a brand-new
+    set, and every pre-existing caller, is unaffected.
+
     Raises:
         ValueError: a row's shape is rejected by StrategyDefinition's
             own validation (surfaced with that row's label), the
-            resulting set would have no entries of EITHER kind, or
+            resulting set would have no entries of EITHER kind and no
+            `groups` to preserve either, or
             StrategySet's own validation rejects the result (invalid
             name, or a name duplicated across the grid rows and the
             preserved intermarket entries -- one shared namespace, see
@@ -154,11 +181,13 @@ def build_strategy_set_from_grid(
 
     definitions = [(r.label, r.definition) for r in results if r.definition is not None]
     preserved = tuple(intermarket_entries)
-    if not definitions and not preserved:
+    if not definitions and not preserved and groups is None:
         raise ValueError("Add at least one strategy row with a nonzero ratio before saving.")
 
     entries = tuple(StrategySetEntry(name=label, definition=definition) for label, definition in definitions)
-    return StrategySet(name=name, entries=entries, intermarket_entries=preserved)
+    return StrategySet(
+        name=name, entries=entries, intermarket_entries=preserved, groups=groups,
+    )
 
 
 __all__ = [

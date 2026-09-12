@@ -105,8 +105,10 @@ import streamlit as st
 from core import futures_calendar
 from core.config import MARKETS, BarInterval
 
+from strategy_sets.model import StrategyGroupPair, StrategySet
 from strategy_sets.repository import StrategySetRepository
 
+from ui import composite_view
 from ui import state
 from ui import strategy_import_view
 from ui import strategy_set_state as ss_state
@@ -160,9 +162,33 @@ class ScanSetup:
     No market_key field: Scan Configuration has no global Market
     selector (removed -- see the module docstring's "Single Run Scan
     path" note). `interval` is the one runtime interval every leg of
-    the scan is forced to via ui.formatting.apply_interval_override(),
-    regardless of what the grid's own per-row Interval column (or a
-    loaded Strategy Set's persisted interval) says.
+    the scan is forced to, regardless of what the grid's own per-row
+    Interval column (or a loaded Strategy Set's persisted interval)
+    says.
+
+    `loaded_set`/`repository` (Phase 4) are the Strategy Set context the
+    scan needs beyond the grid. The grid can only represent ordinary
+    single-market rows, so a loaded set's `intermarket_entries` (Module
+    9) and `groups` (composite Group A x Group B) would otherwise be
+    invisible to the scan -- they are carried here so
+    ui.scan_view.handle_run_scan() can assemble ONE transient
+    StrategySet covering all three kinds. `loaded_set` is the exact
+    object ui.strategy_set_view.load_selected_set() already read once
+    this script pass (shared with the grid seed, the read-only
+    intermarket panel, and the save path), never a second repository
+    load. `repository` is passed explicitly because composite group
+    resolution needs to load each group's SOURCE Strategy Set by name;
+    execution never discovers a repository from global/UI state.
+
+    `groups` is the composite configuration the composite authoring
+    panel (ui.composite_view) currently holds -- the LIVE value, not
+    `loaded_set.groups`. They are identical for a set whose panel was
+    not touched this pass, and deliberately differ while a composite is
+    being edited but not yet saved: a scan must run exactly what the
+    panel shows, the same rule the strategy grid itself already
+    follows (an unsaved grid row scans too). It is None for every
+    non-composite Strategy Set, which is every set that existed before
+    that panel.
     """
 
     interval: BarInterval
@@ -177,6 +203,9 @@ class ScanSetup:
     grid_rows: list[dict]
     position_columns: tuple[str, ...]
     run_clicked: bool
+    loaded_set: StrategySet | None = None
+    repository: StrategySetRepository | None = None
+    groups: StrategyGroupPair | None = None
 
 
 def _clamp_session_value(key: str, valid_options: tuple, fallback) -> None:
@@ -236,12 +265,19 @@ def render_scan_setup() -> ScanSetup:
         st.subheader("Oscill8 — Range-Bound Scanner")
 
         with st.container(border=True):
-            grid_rows, position_columns = _render_strategy_templates()
+            grid_rows, position_columns, loaded_set, repo, groups = _render_strategy_templates()
 
         with st.container(border=True):
             setup_values = _render_scan_bar()
 
-    return ScanSetup(grid_rows=grid_rows, position_columns=position_columns, **setup_values)
+    return ScanSetup(
+        grid_rows=grid_rows,
+        position_columns=position_columns,
+        loaded_set=loaded_set,
+        repository=repo,
+        groups=groups,
+        **setup_values,
+    )
 
 
 def _peek_current_interval() -> BarInterval:
@@ -354,7 +390,9 @@ def _render_scan_bar() -> dict:
     }
 
 
-def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
+def _render_strategy_templates() -> tuple[
+    list[dict], tuple[str, ...], StrategySet | None, StrategySetRepository, StrategyGroupPair | None
+]:
     repo = StrategySetRepository()
     default_market_key = next(iter(MARKETS))
     default_interval = _peek_current_interval()
@@ -426,12 +464,24 @@ def _render_strategy_templates() -> tuple[list[dict], tuple[str, ...]]:
     # this panel existed. See ui.strategy_set_view.render_intermarket_
     # entries / ui.intermarket_formatting.
     strategy_set_view.render_intermarket_entries(loaded_set)
+    # The composite (Group A x Group B) authoring panel -- rendered
+    # BEFORE process_save() because its returned configuration is what
+    # a save must persist. It seeds itself from `loaded_set.groups`, so
+    # a set nobody has edited this pass returns that same object
+    # unchanged (see ui.composite_view).
+    groups = composite_view.render_composite_panel(
+        repo, loaded_set, selected_name, default_interval
+    )
     strategy_set_view.process_save(
         repo, selected_name, save_clicked, grid_rows, position_columns,
-        default_market_key, default_interval, loaded_set=loaded_set,
+        default_market_key, default_interval, loaded_set=loaded_set, groups=groups,
     )
 
-    return grid_rows, position_columns
+    # `loaded_set`/`repo`/`groups` travel on to ScanSetup so the scan can
+    # include what the grid cannot represent (a loaded set's
+    # intermarket_entries, and the composite groups the panel above
+    # currently holds) without re-reading the JSON -- see ScanSetup.
+    return grid_rows, position_columns, loaded_set, repo, groups
 
 
 def _render_strategy_grid(

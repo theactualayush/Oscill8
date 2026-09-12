@@ -60,6 +60,24 @@ class ScanRequest:
     select the historical pricing window fetched for each of them
     (Module 3) -- independent windows, matching strategy_engine's own
     contract-selection-vs-price-history separation.
+
+    `definitions` drives candidate generation for run_scan() ONLY, and
+    run_scan() is its only reader anywhere in the codebase. A
+    ScanRequest also serves a second, purely descriptive role: the UI
+    stores one in session state alongside a ScanReport so the results/
+    chart views can recover the scan's own price window and lookbacks
+    (ui/state.py, ui/chart_view.py -- neither reads `definitions`). A
+    caller whose candidates did NOT come from rolling definitions --
+    i.e. any caller that builds its own instance list and calls
+    run_scan_on_instances() directly -- may therefore construct one
+    with an empty `definitions`. Such a caller may genuinely have no
+    StrategyDefinition to put there at all, and inventing a placeholder
+    would be worse than an honest empty tuple. This module stays
+    entirely unaware of who those callers are and what they expanded.
+    The "must not scan an empty definition list" rule is
+    unchanged and still enforced -- it now lives in run_scan() (see
+    below), the one place it actually protects anything, rather than
+    forbidding a metadata-only ScanRequest from existing.
     """
 
     definitions: tuple[StrategyDefinition, ...]
@@ -76,8 +94,6 @@ class ScanRequest:
     upper_percentile: float = 95.0
 
     def __post_init__(self) -> None:
-        if not self.definitions:
-            raise ValueError("definitions must be non-empty")
         start = pd.Timestamp(self.price_start)
         end = pd.Timestamp(self.price_end)
         if start > end:
@@ -305,7 +321,20 @@ def run_scan(
     run_scan_on_instances() -- see that function's own docstring. Purely
     optional, caller-facing metadata; does not affect candidate
     generation, pricing, or deduplication.
+
+    Raises:
+        ValueError: `request.definitions` is empty. This function rolls
+            those definitions into the candidate universe, so an empty
+            tuple could only ever produce a silent, zero-candidate scan
+            -- refusing it is the real protection the rule exists for,
+            and it is enforced here (its only consumer) rather than on
+            ScanRequest itself, which is also used as descriptive
+            session metadata by callers that build candidates another
+            way. See ScanRequest's own docstring.
     """
+    if not request.definitions:
+        raise ValueError("definitions must be non-empty")
+
     candidates = generate_candidate_universe(
         list(request.definitions),
         request.contract_start,

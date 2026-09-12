@@ -43,6 +43,17 @@ different curve-position/eligibility filters even under the same
 shared scan window) -- not a calendar concept, so staleness doesn't
 apply to them the same way.
 
+Composite Strategy Sets (additive, Phase 1 of the Group A/Group B
+design): StrategyGroup and StrategyGroupPair below add the ability for
+one StrategySet to describe a "Group A x Group B" pairing -- each group
+REFERENCING one existing source StrategySet by name plus the explicit,
+ordered selection of that set's entry names. This is a pure
+data-model/persistence foundation: nothing here (or anywhere else in
+this package) generates the A x B combinations, which are the future
+combination engine's job and are never stored. `StrategySet.groups`
+defaults to None, so every StrategySet that existed before this field
+is completely unaffected.
+
 A StrategySet knows nothing about StrategyInstance, ScanRequest, LSEG,
 or the database -- expansion.py is the only bridge to
 strategy_engine/template_scanner, and the scanner itself never imports
@@ -193,6 +204,122 @@ class IntermarketStrategySetEntry:
 
 
 @dataclass(frozen=True)
+class StrategyGroup:
+    """ONE side of a composite StrategySet's "Group A x Group B" pairing:
+    a reference to exactly one source StrategySet, plus the explicit,
+    ordered list of that set's entry names the trader actually selected.
+
+    Reference, not a copy: `source_set_name` names an existing saved
+    StrategySet (StrategySetRepository's own identity -- one JSON file
+    per name, see repository.py), rather than duplicating that set's
+    full StrategyDefinition shapes here. The selected strategies are
+    likewise identified by their entry `name`, which StrategySet
+    already guarantees is unique within one set across `entries` AND
+    `intermarket_entries` together -- so a name unambiguously
+    identifies at most one strategy in the source set, of either type.
+
+    `selected_entry_names` is the persisted SELECTION ITSELF, never a
+    "select all" flag: selecting every strategy in a source set stores
+    every one of those names explicitly. This is deliberate and is the
+    whole point of the field -- a saved composite set must keep meaning
+    what it meant when it was saved, so a strategy later ADDED to the
+    source set never silently joins an already-saved selection. (A
+    strategy later REMOVED from, or renamed in, the source set leaves a
+    selected name that no longer resolves; detecting/reporting that is
+    a resolution-time concern for the future combination engine, not a
+    model-level one -- this model layer never reads the filesystem, so
+    it cannot and must not check whether a referenced set or entry
+    actually exists. Compare ExpansionSettings.eligible_rics, which is
+    likewise validated structurally here and only ever resolved against
+    real data further down the pipeline.)
+
+    An EMPTY `selected_entry_names` is valid -- "this group's source is
+    chosen, but nothing in it is selected yet" is a real, representable
+    state (the design brief's "clear the selection"), not an error.
+    """
+
+    source_set_name: str
+    selected_entry_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_set_name, str) or not _SET_NAME_PATTERN.match(
+            self.source_set_name
+        ):
+            raise ValueError(
+                "StrategyGroup source_set_name must be a valid StrategySet name "
+                "(1-80 characters, starting with a letter or digit, containing "
+                "only letters, digits, spaces, '-', or '_') -- got "
+                f"{self.source_set_name!r}"
+            )
+
+        if isinstance(self.selected_entry_names, str):
+            raise TypeError(
+                "StrategyGroup selected_entry_names must be a collection of entry "
+                "names, not a single string -- got "
+                f"{self.selected_entry_names!r}"
+            )
+
+        selected = tuple(self.selected_entry_names)
+        if not all(isinstance(n, str) and n.strip() for n in selected):
+            raise ValueError(
+                "StrategyGroup selected_entry_names must all be non-empty strings, "
+                f"got {list(selected)!r}"
+            )
+
+        duplicates = sorted({n for n in selected if selected.count(n) > 1})
+        if duplicates:
+            raise ValueError(
+                "StrategyGroup selected_entry_names must be unique within a group "
+                f"(an entry name identifies at most one strategy), duplicated: {duplicates}"
+            )
+
+        object.__setattr__(self, "selected_entry_names", selected)
+
+
+@dataclass(frozen=True)
+class StrategyGroupPair:
+    """The composite ("grouped") configuration of a StrategySet: Group A,
+    and OPTIONALLY Group B.
+
+    Order is meaningful and is part of the model, not a presentation
+    detail: the future combination engine is defined as
+
+        Group A x Group B
+
+    so `group_a` and `group_b` are separate, individually-named fields
+    rather than a positional list -- the two sides stay distinguishable
+    no matter how they are stored, read, or displayed.
+
+    `group_b` is optional (None). A pair with only `group_a` is the
+    ordinary, single-sided case; it is NOT a degenerate or invalid
+    state. `group_a`, in contrast, is mandatory: "Group B but no Group
+    A" has no meaning under an A x B definition, so it is rejected
+    structurally (group_a is simply required) rather than by a
+    cross-field check.
+
+    Deliberately holds NO combination results: the A x B expansion is
+    generated dynamically by a later phase's combination engine and is
+    never stored here (same principle as the contract window, which is
+    an expand_strategy_set() call-time argument rather than saved
+    state -- see the module docstring's "Design correction" note).
+    """
+
+    group_a: StrategyGroup
+    group_b: StrategyGroup | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_a, StrategyGroup):
+            raise TypeError(
+                f"StrategyGroupPair.group_a must be a StrategyGroup, got {type(self.group_a)}"
+            )
+        if self.group_b is not None and not isinstance(self.group_b, StrategyGroup):
+            raise TypeError(
+                "StrategyGroupPair.group_b must be a StrategyGroup or None, "
+                f"got {type(self.group_b)}"
+            )
+
+
+@dataclass(frozen=True)
 class StrategySet:
     """A named, ordered collection of StrategySetEntry objects
     representing one trading workflow -- e.g. "Churning", "6M
@@ -220,12 +347,31 @@ class StrategySet:
     `intermarket_entries` only, or a genuine mix of both -- there is no
     requirement to keep single-market and intermarket strategies in
     separate sets.
+
+    `groups` (optional, defaults to None) is the COMPOSITE
+    configuration: Group A, and optionally Group B, each referencing
+    one source StrategySet plus the strategies selected from it (see
+    StrategyGroupPair/StrategyGroup above). It is purely additive and
+    entirely orthogonal to `entries`/`intermarket_entries` -- a
+    StrategySet may have neither (every set that existed before this
+    field did, unchanged), only entries, only groups, or both. Nothing
+    in this package expands or combines `groups`: the "Group A x Group
+    B" combination engine is a later phase, and expand_strategy_set()
+    (expansion.py) deliberately still rolls only `entries`/
+    `intermarket_entries`, exactly as it did before this field existed.
+
+    The at-least-one-entry rule is relaxed accordingly: a set carrying
+    ONLY a `groups` configuration (no entries of either kind) is valid,
+    since its content genuinely is the grouped selection. A set with
+    neither entries nor groups is still rejected -- that is empty, not
+    composite.
     """
 
     name: str
     entries: tuple[StrategySetEntry, ...]
     intermarket_entries: tuple[IntermarketStrategySetEntry, ...] = ()
     description: str = ""
+    groups: StrategyGroupPair | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _SET_NAME_PATTERN.match(self.name):
@@ -238,10 +384,15 @@ class StrategySet:
         entries = tuple(self.entries)
         intermarket_entries = tuple(self.intermarket_entries)
 
-        if len(entries) + len(intermarket_entries) < 1:
+        if self.groups is not None and not isinstance(self.groups, StrategyGroupPair):
+            raise TypeError(
+                f"StrategySet.groups must be a StrategyGroupPair or None, got {type(self.groups)}"
+            )
+
+        if len(entries) + len(intermarket_entries) < 1 and self.groups is None:
             raise ValueError(
                 "A StrategySet needs at least 1 entry (StrategySetEntry or "
-                "IntermarketStrategySetEntry)"
+                "IntermarketStrategySetEntry), or a `groups` configuration"
             )
         if not all(isinstance(e, StrategySetEntry) for e in entries):
             raise TypeError("StrategySet.entries must contain only StrategySetEntry instances")
