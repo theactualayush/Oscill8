@@ -976,8 +976,12 @@ originally anticipated here: it never calls `expand_strategy_set()`/
 design-principle note). That richer per-entry execution path
 (`expand_strategy_set()` → `template_scanner.scanner.
 run_scan_on_instances()`, plus `strategy_sets/execution.py`) still
-exists and is still tested, but remains genuinely unreachable from any
-live UI button today. True intermarket (cross-market-leg) strategies
+exists and is still tested; it was unreachable from any live UI button
+when this was written, but is now **the single live execution path** —
+see Module 10 below, where `ui.scan_view.handle_run_scan()` assembles
+one transient StrategySet and runs it via
+`strategy_sets.execution.run_strategy_set()`. True intermarket
+(cross-market-leg) strategies
 were deferred at the time this module was written but have SINCE been
 implemented as an additive sibling — see Module 9 below
 (`strategy_engine.intermarket_*` + `strategy_sets.
@@ -1834,10 +1838,14 @@ Key design points a future session needs:
   not represented in that panel's single-market-only editing grid (they
   are not corrupted or lost in the file — simply not shown/editable
   there).
-- No UI button currently triggers `expand_strategy_set()` →
-  `run_scan_on_instances()` end-to-end for a live user — see the
-  `execution.py` note above. Wiring this in is a distinct, unstarted
-  follow-up.
+- ~~No UI button currently triggers `expand_strategy_set()` →
+  `run_scan_on_instances()` end-to-end for a live user~~ — **RESOLVED
+  by Module 10 below**: Run Scan now assembles one transient
+  StrategySet (grid rows + the loaded set's `intermarket_entries` +
+  its composite `groups`) and runs it through
+  `strategy_sets.execution.run_strategy_set()`, so a hand-authored
+  intermarket entry does scan today. Only the AUTHORING UI for such an
+  entry remains missing (previous bullet).
 - Real-time provider/data behavior (LSEG vs. QuantHub per leg, caching,
   provenance) is entirely Module 8's existing, unmodified concern —
   this module never imports `core.downloader`/`core.quanthub`/
@@ -1875,6 +1883,206 @@ missing StrategySet file or an empty/unbuildable history gracefully
 and never prints credential/token values. Not part of the pytest suite
 and not intended to become a permanent module — a genuinely temporary
 developer tool, kept in the repo for now at explicit request.
+
+---
+
+## Module 10 – Composite Strategy Sets (Group A × Group B)
+
+COMPLETED AND TESTED (backend AND Streamlit authoring UI), built in
+five phases: groups model/persistence, composition, structural-zero
+filtering, execution integration, and the authoring UI.
+
+Lets ONE Strategy Set describe a PAIRING of two other, already-saved
+Strategy Sets: every selected Group A strategy against every selected
+Group B strategy, each pair priced as "Group A strategy − Group B
+strategy". Additive throughout — `strategy_engine/`, `range_analytics/`,
+`core/`, `database/`, and `strategy_import/` are completely untouched
+by it, and `template_scanner/` gained no composite awareness at all
+(its own "the scanner never imports `strategy_sets`" design-principle
+test is preserved).
+
+strategy_sets/
+    model.py          (+ StrategyGroup, StrategyGroupPair,
+                       StrategySet.groups)
+    serialization.py   (+ group_to_dict/_from_dict, group_pair_to_dict/
+                       _from_dict — a `groups` key, omitted entirely
+                       when None)
+    composite.py        (the whole composite engine: group resolution,
+                       A×B pairing + unordered-pair dedup, composition
+                       to an IntermarketDefinition, structural-zero
+                       filtering, combination labels)
+    expansion.py         (+ expand_strategy_set_with_labels(); a second
+                       loop turning resolved combinations into
+                       instances)
+    execution.py          (run_strategy_set() gained an explicit
+                       `repository` argument)
+
+ui/
+    composite_formatting.py  (pure widget-value <-> StrategyGroup/
+                             StrategyGroupPair translation; no Streamlit
+                             import)
+    composite_view.py         (the Group A/Group B authoring panel)
+    controls.py, scan_view.py, strategy_set_view.py  (wiring only)
+
+tests/
+    test_strategy_sets_groups.py, test_strategy_sets_composite.py,
+    test_strategy_sets_composite_structural_zero.py,
+    test_composite_execution.py,
+    test_composite_strategy_set_end_to_end.py,
+    test_ui_composite_scan.py, test_ui_composite_authoring.py,
+    test_ui_strategy_set_groups_preservation.py
+
+Key design points a future session needs:
+
+- **Model (`strategy_sets/model.py`).** `StrategyGroup(source_set_name,
+  selected_entry_names)` is a REFERENCE, never a copy: it names one
+  existing saved Strategy Set plus the explicit, ORDERED entry names
+  selected from it. `StrategyGroupPair(group_a, group_b=None)` holds the
+  two sides as separately-named fields, not a positional list, so A and
+  B stay distinguishable however they are stored or displayed.
+  `StrategySet.groups: StrategyGroupPair | None = None` is additive —
+  every set that existed before it is unaffected. A set carrying ONLY
+  `groups` (no entries of either kind) is valid; a set with neither
+  entries nor groups is still rejected. The contract-selection window
+  stays a call-time argument, exactly as for `entries` (see Module 7A).
+- **One source Strategy Set per group, and the selection is the
+  persisted thing** — never a "select all" flag. Selecting every
+  strategy stores every name explicitly, so a strategy later ADDED to a
+  source set never silently joins an already-saved selection. Selection
+  ORDER is the trader's and is preserved end to end (widget → JSON →
+  resolution → pairing); nothing sorts it, and Group A / Group B are
+  never swapped or alphabetically reordered. An empty selection with a
+  chosen source is a real, representable state, not an error.
+- **Group B is optional.** `group_b is None` (or either selection
+  empty) means `resolve_composite_combinations()` returns `[]` and the
+  set behaves EXACTLY like an ordinary Strategy Set — its own entries
+  scan, nothing is combined. "Group B without Group A" is structurally
+  unrepresentable (`group_a` is simply required).
+- **Composition = ONE `IntermarketDefinition`** (Module 9's existing,
+  unmodified type): Group A's legs at their own weights, followed by
+  Group B's legs with NEGATED weights, in that order. Both ordinary
+  `entries` and Module 9 `intermarket_entries` are legal group members
+  — both flatten to a flat `LegSpec` tuple, so no nesting can arise.
+  `interval` and `price_field` must AGREE between the two sources and
+  are never reconciled, defaulted, or taken from one side — a mismatch
+  raises `CompositeResolutionError`. `bp_per_point` is resolved ONLY
+  when every leg of the composed definition belongs to one market
+  (then that market's registered convention applies unambiguously);
+  the moment two markets are involved it is `None`, preserving Module
+  9's rule that a cross-market series' bp convention is never guessed
+  from one leg (`range_analytics` then leaves the bp-denominated
+  metrics NaN rather than aborting the scan).
+- **Unordered-pair dedup.** If both (X, Y) and (Y, X) occur in the
+  product, only the FIRST generated survives, keeping its own real A/B
+  orientation — the canonical key is used for detection only, never to
+  reorder or rename what survives.
+- **Structural-zero filtering.** After composition and BEFORE any
+  instance generation, provider call, cache prewarm, history build, or
+  analytics, a combination whose per-`(market_key, offset)` aggregated
+  weights are ALL zero is dropped: its series would be identically 0.0
+  for every contract and every date. "SR3 Fly − SR3 Fly" is the
+  canonical case. Exact arithmetic, no tolerance (a tolerance could
+  drop a real strategy with genuinely small weights). Automatic and not
+  configurable — it is a derivation rule, not a trader-facing filter,
+  and is a completely different thing from a historically FLAT series,
+  which is real data and still scans. Selecting the same strategy on
+  both sides remains valid: the pair is still generated and still
+  consumes its slot in the unordered-pair dedup, it is simply not
+  returned. One summary log line, never one per dropped pair.
+- **Runtime interval is applied BEFORE composition.**
+  `strategy_sets.execution.run_strategy_set()` applies the scan's one
+  interval to the set's own entries via `with_interval_override()`, AND
+  forwards it into composite resolution so each group's SOURCE
+  definitions — which live in OTHER saved files and are only loaded
+  during resolution, so `with_interval_override()` can never reach them
+  — carry it too, before pairing/composition. This is what makes the
+  agree-on-interval rule above a non-issue in practice, and it means a
+  composite can never silently run at a source file's persisted
+  interval. The override produces transient copies only; no source
+  Strategy Set or file is ever modified (they are opened READ-only).
+- **Execution goes through the NORMAL scanner pipeline.**
+  `expand_strategy_set_with_labels()` → `generate_intermarket_instances()`
+  → `dedupe_intermarket_candidates()` → `template_scanner.scanner.
+  run_scan_on_instances()`. There is no composite scanner, no composite
+  pricing path, and no composite provider/cache/analytics path: ordinary
+  entries, intermarket entries, and composite combinations all arrive
+  as ONE mixed instance list and one `ScanReport`. Each candidate's
+  `ScanCandidateResult.label` carries its `"Group A entry - Group B
+  entry"` name (separator `" - "`) via
+  `composite_labels_by_definition_id()`.
+- **Nothing combinatorial is ever persisted.** A saved composite file
+  contains only the two source set names and the two ordered selections.
+  Combinations, composed definitions, generated instances, and results
+  are derived on every call and written nowhere — the same principle
+  that keeps the contract window out of a saved set.
+- **No nested composites**, enforced at two independent points: a
+  source Strategy Set that itself carries `groups` is rejected by
+  `composite.resolve_group_entries()` with a `CompositeResolutionError`,
+  and `ui.composite_formatting.is_eligible_source()` never offers one
+  (nor the set being edited) in the panel's source dropdown.
+- **Authoring UI** (`ui/composite_view.py`, rendered by `ui.controls`
+  beneath the strategy grid, inside the existing Strategy Workspace —
+  no second grid and no second Run button). Per group: one source
+  Strategy Set selectbox, Select all / Clear all, and an ordered
+  strategy multiselect. It authors the CONFIGURATION only and reaches
+  `strategy_sets.composite` in exactly one read-only place: a
+  combination-count preview that calls the existing
+  `resolve_composite_combinations()` (so the count shown is already
+  structural-zero-filtered, and a `CompositeResolutionError`'s own
+  trader-facing text appears at authoring time rather than only at Run
+  Scan). Persistence reuses the existing single `repo.save()` via
+  `build_strategy_set_from_grid(groups=...)`; execution reuses
+  `ScanSetup.groups` → `ui.scan_view.handle_run_scan()`. The panel's
+  LIVE value (not `loaded_set.groups`) is what both a save and a scan
+  use, so an unsaved composite edit scans exactly what the panel shows
+  — the same rule an unsaved grid row already follows.
+
+**Architectural constraints a future session must respect here:**
+
+- `repository` is an explicit, call-time argument on
+  `expand_strategy_set()`/`expand_strategy_set_with_labels()`/
+  `run_strategy_set()` and must stay that way — never construct a
+  `StrategySetRepository()` inside those layers (hidden filesystem I/O,
+  and tests would read the real `data/strategy_sets/`). A composite
+  expanded without one raises `CompositeResolutionError`, deliberately.
+- **Resolve a composite ONCE per scan.** Every
+  `resolve_composite_combinations()` call builds FRESH
+  `IntermarketDefinition` objects, so
+  `composite_labels_by_definition_id()`'s `id()` keys only match
+  instances rolled from that same resolution. That is precisely why
+  `expand_strategy_set_with_labels()` exists — a caller that wants
+  labels must not resolve a second time.
+- A composed definition's display market key (e.g. `"SOFR/CORRA"`) is
+  Module 9's COSMETIC label and must never reach provider resolution,
+  a cache/database key, an instrument mapping, or a bp conversion.
+  Every leg still resolves per-RIC / per-`LegSpec.market_key`.
+- No market-specific or strategy-shape branching anywhere: single-market
+  vs. intermarket vs. composite dispatch is by TYPE / by key presence
+  (`"legs"` for an intermarket entry, `groups` for a composite), never
+  by a `type`/`kind` tag and never by a value or a name.
+- The UI must not re-implement pairing, composition, structural-zero
+  filtering, or expansion. `ui/composite_formatting.py` stays
+  Streamlit-free and `ui/composite_view.py` stays an authoring surface.
+- **A saved selection is never silently repaired.** An unresolvable
+  SOURCE (deleted, or since made composite) renders read-only and is
+  returned by reference; a stale selected NAME stays selected and stays
+  offered by the widget. Clamping either one would rewrite a saved
+  configuration the trader never changed AND would turn the scan's
+  actionable "selected strategy 'X' was not found" error into a quietly
+  smaller scan. The trader is told; nothing is corrected for them.
+- Group-member `enabled` flags are deliberately NOT consulted: naming a
+  strategy in a group's selection IS the decision to include it, and a
+  flag set in a different, source Strategy Set must not silently halve
+  a Cartesian product. (`only_enabled` still applies to a set's OWN
+  `entries`/`intermarket_entries`.)
+
+**Deferred / not solved here:** no UI for authoring Module 9
+`intermarket_entries` themselves (hand-edited JSON remains the only
+route — see Module 9); no three-or-more-group composites; no
+per-combination enable/disable; and a composite's source sets are
+resolved by NAME, so renaming a source set outside the app leaves a
+dangling reference that is reported (never guessed at or auto-repaired)
+the next time the composite is opened or scanned.
 
 ---
 
@@ -1992,20 +2200,23 @@ effective-request-end (currently-forming-bar exclusion) — STATUS:
 COMPLETE
 Module 9 — Intermarket strategy engine (domain model, Strategy Set
 integration, scanner wiring; cross-market legs within ONE strategy) —
-STATUS: COMPLETE (backend only — no Streamlit UI editor and no live
-UI button triggers the richer per-entry Strategy Set execution path
-yet; see Module 9's own "Not yet done" notes above)
+STATUS: COMPLETE (backend only — no Streamlit UI editor for authoring
+an intermarket entry; the per-entry Strategy Set execution path IS now
+live, see Module 10)
+Module 10 — Composite Strategy Sets (Group A × Group B: groups model/
+persistence, composition, structural-zero filtering, execution
+integration, and the authoring UI) — STATUS: COMPLETE
 
-Current suite: re-run `pytest -q` for the up-to-date count, do not
-trust any number written here blindly — see README.md's Testing
-section. As of this documentation pass: 1290 passed, 1 known
-pre-existing environment-specific failure
-(`tests/test_cache.py::test_read_bars_output_matches_downloader_
-canonical_schema`, a `datetime64[us]` vs `datetime64[ns]` pandas
-version mismatch, not a real bug), 2 skipped
+Current suite: re-run `pytest -q tests/` for the up-to-date count, do
+not trust any number written here blindly — see README.md's Testing
+section. As of this documentation pass: 1589 passed, 2 skipped
 (`tests/test_ui_keyboard_browser.py` — no playwright installed;
 `tests/test_quanthub_live_smoke.py` — `RBS_QUANTHUB_TOKEN` not set) —
-1293 total.
+1591 total. (An earlier pass recorded a `datetime64[us]` vs
+`datetime64[ns]` pandas-version failure in
+`tests/test_cache.py::test_read_bars_output_matches_downloader_
+canonical_schema`; it does not reproduce in the current environment.
+It was never a real bug.)
 
 Deferred / not yet implemented (do not assume any of these exist merely
 because they're listed here as being considered):
@@ -2017,15 +2228,14 @@ because they're listed here as being considered):
   range-boundedness" from "current distance from equilibrium" has no
   approved statistical definition and is not implemented.
 - Streamlit UI support for authoring/editing intermarket Strategy Set
-  entries, and wiring the richer per-entry Strategy Set execution path
-  (`strategy_sets/execution.py`, `expand_strategy_set()` ->
-  `run_scan_on_instances()`) into a live UI button — Module 9's backend
-  (domain model, persistence, scanner/analytics integration) is
-  complete; only the UI surface remains (see Module 9 above). Cross-
-  market legs within a single strategy are otherwise implemented, not
-  a still-open design question. This is distinct from Module 7B's
-  single-market Strategy Set UI, which IS wired into the live scanner
-  today (via the simplified grid mechanism, not this richer path).
+  entries (Module 9) — hand-editing a Strategy Set's JSON is still the
+  only way to CREATE one; the read-only panel (Module 7B) shows them
+  and a scan does run them. Cross-market legs within a single strategy
+  are otherwise implemented, not a still-open design question. The
+  related "wire the richer per-entry execution path into a live UI
+  button" item is no longer deferred — Module 10 made
+  `strategy_sets/execution.py` → `run_scan_on_instances()` the single
+  live scan path for every Strategy Set.
 - An explicit "Real Contract" scanning mode (pick one specific set of
   dated contracts rather than a rolled template) — the backend
   primitives it would need already exist, including an instances-in/
