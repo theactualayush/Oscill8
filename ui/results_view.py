@@ -43,6 +43,7 @@ from ui.formatting import (
     OPTIONAL_COLUMN_LABELS,
     RANK_METRIC_OPTIONS,
     RESULT_COLUMN_HELP,
+    RESULT_COLUMN_WIDTHS,
     add_rank_column,
     apply_column_selection,
     available_markets,
@@ -229,10 +230,17 @@ def render_results(report: ScanReport, display_lookback: int, scan_request: Scan
         display_df = add_rank_column(to_display_dataframe(results_df))
         display_df = apply_column_selection(display_df, visible_columns)
 
+        # Header tooltips and explicit widths are independent, optional
+        # per-column display hints -- a column may have either, both, or
+        # neither, so the two dicts are merged rather than nested.
         column_config = {
             label: st.column_config.Column(label, help=help_text)
             for label, help_text in RESULT_COLUMN_HELP.items()
         }
+        for label, width in RESULT_COLUMN_WIDTHS.items():
+            column_config[label] = st.column_config.Column(
+                label, help=RESULT_COLUMN_HELP.get(label), width=width
+            )
 
         event = st.dataframe(
             display_df,

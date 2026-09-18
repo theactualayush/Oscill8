@@ -3,8 +3,30 @@ quanthub.py
 
 Responsible for ONE thing: getting clean OHLCV bars out of QuantHub
 (the in-house secondary market-data provider, GET
-https://qh-api.corp.hertshtengroup.com/api/v2/ohlc/) for a given QH
+https://qh-api.corp.hertshtengroup.com/apis/ohlc/) for a given QH
 instrument identifier / interval / date range.
+
+BACKEND MIGRATION (/api/v2/ohlc/ -> /apis/ohlc/): QuantHub retired its
+old /api/ backend. The old OHLC path now returns HTTP 403 Forbidden for
+every instrument, at every interval and count -- reproduced against
+CRAM28, CRAU28 and SONU28, all of which had previously returned real
+data through this same code path, which is what identified the cause as
+a retired endpoint rather than an instrument entitlement, a rate limit,
+or an Oscill8 defect. Only the URL changed here: the request shape
+(instruments=/interval=/count=), the Bearer header, the response record
+shape, batching, count estimation, interval mapping, normalization and
+the retry policy are all unchanged and were re-verified against the new
+endpoint (see the response-shape note on _fetch_quanthub_records).
+
+AUTHENTICATION IS MANUAL AND STAYS THAT WAY. The new backend documents
+a /apis/auth/ endpoint, but Oscill8 NEVER calls it and has no auth
+client, no Microsoft sign-in, no token acquisition, and no refresh. The
+operator signs in through QuantHub's own web auth page, copies the
+resulting access_token into RBS_QUANTHUB_TOKEN, and this module sends
+it verbatim as `Authorization: Bearer <token>` (see _auth_headers) --
+exactly as it did before the migration. An expired token surfaces as
+whatever HTTP status QuantHub returns for one; nothing here detects,
+classifies, or renews it.
 
 Mirrors core.downloader's structure and public-API shape deliberately,
 so database/service.py's provider dispatch can treat both providers
@@ -99,6 +121,40 @@ from core.config import BarInterval, FUTURES_MONTH_CODES
 from core.utils import CANONICAL_OHLCV_COLUMNS, DateLike, get_logger, resample_to_4h, to_date
 
 logger = get_logger(__name__)
+
+
+# The retired QuantHub OHLC path (see the backend-migration note in this
+# module's docstring). Kept ONLY to recognise a stale configured URL --
+# never used to build a request, and never rewritten on the operator's
+# behalf: RBS_QUANTHUB_BASE_URL is their setting, and silently
+# "correcting" it would hide a real configuration problem rather than
+# surface it.
+RETIRED_QUANTHUB_OHLC_PATH = "/api/v2/ohlc/"
+
+
+def _warn_if_retired_endpoint_configured() -> None:
+    """Log ONCE at import if RBS_QUANTHUB_BASE_URL still points at the
+    retired /api/v2/ohlc/ backend.
+
+    Why this exists: the migrated default in core.config only applies
+    when RBS_QUANTHUB_BASE_URL is UNSET. An existing .env that pins the
+    old URL shadows it completely, so the app would keep calling the
+    retired endpoint and keep getting HTTP 403 -- with no signal
+    distinguishing that from a genuine provider problem. This turns
+    that silent, easily-misdiagnosed configuration state into one
+    obvious log line. It changes no request and blocks nothing.
+    """
+    if RETIRED_QUANTHUB_OHLC_PATH in (config.QUANTHUB_BASE_URL or ""):
+        logger.warning(
+            "RBS_QUANTHUB_BASE_URL points at the RETIRED QuantHub backend "
+            "(%s). That endpoint returns HTTP 403 for every request. Update "
+            "the variable in your .env to the migrated endpoint (.../apis/ohlc/), "
+            "or remove it entirely to use core.config's own migrated default.",
+            RETIRED_QUANTHUB_OHLC_PATH,
+        )
+
+
+_warn_if_retired_endpoint_configured()
 
 
 class QuantHubCredentialsMissingError(Exception):
@@ -242,8 +298,21 @@ def _estimate_count(native_interval: str, start: datetime, end: datetime) -> int
     apply min(this estimate, _max_count_for_batch(batch_size)) once the
     actual batch is known.
 
-    CONFIRMED LIMITATION (live-tested against the real API, a controlled
-    parameter-by-parameter investigation -- no longer an open question):
+    CONFIRMED LIMITATION -- ESTABLISHED AGAINST THE RETIRED /api/v2/ohlc/
+    BACKEND, CARRIED OVER UNVERIFIED. Everything in this paragraph was
+    live-tested, parameter by parameter, against the OLD endpoint. The
+    backend migration changed only the URL in this module, so the
+    `count=`-only strategy below is preserved exactly -- but the new
+    /apis/ohlc/ Swagger DOES document `start`, `end`, `extraFields` and
+    `hg_instrument_ids` parameters, which directly contradicts the "only
+    three parameters have any effect" finding below. Whether they are
+    now genuinely honoured has NOT been tested and must not be assumed
+    either way; using them would be a separate, evidence-led task (it
+    could remove the cold-start reach ceiling entirely). Until then this
+    module deliberately keeps sending only the three parameters it has
+    real evidence for, which is the behaviour the new endpoint was
+    verified to accept. The original findings:
+
     `instruments=`, `interval=`, and `count=` are the only request
     parameters that have any effect. `start=`/`end=` returns HTTP 500.
     `from=`/`to=` returns HTTP 200 but is silently ignored -- the
@@ -252,7 +321,7 @@ def _estimate_count(native_interval: str, start: datetime, end: datetime) -> int
     isolation against a fixed baseline and every one returned HTTP 200
     with the exact same window as the baseline -- silently ignored, not
     applied. No pagination, cursor, offset, or timestamp/date-range
-    mechanism is available through /api/v2/ohlc/ at all. `count=` means
+    mechanism is available through /apis/ohlc/ at all. `count=` means
     "the most recent N observations as of when the request is made" --
     there is no way to anchor a request to an earlier reference point,
     so a request whose true required count would exceed the effective
@@ -463,7 +532,7 @@ def download_history_batch(
 
     CONFIRMED PERMANENT API CONSTRAINT (live-tested, a controlled
     parameter-by-parameter investigation -- see _estimate_count()'s own
-    docstring for the full evidence): /api/v2/ohlc/ has no pagination,
+    docstring for the full evidence): /apis/ohlc/ has no pagination,
     cursor, offset, or date-range mechanism of any kind, and the total
     row cap is a HARD, exactly-enforced 10,000 rows per HTTP request
     (10,000 succeeds, 10,001 returns HTTP 400 "Max row limit exceeded

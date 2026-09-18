@@ -14,6 +14,7 @@ test_command: "pytest -q tests/"
 requires_new_tests: true
 expects_diff: true
 allow_doc_updates: [CLAUDE.md, CHANGELOG.md, README.md]
+# commit_subject: Optional short subject for the -Finish commit (defaults to title)
 ---
 
 # TASK-NNN — <title>
@@ -30,6 +31,19 @@ allow_doc_updates: [CLAUDE.md, CHANGELOG.md, README.md]
     - test_command must scope pytest to tests/ (never a bare 'pytest -q').
     - allowed_paths must be non-empty.
 
+  test_command is EXECUTED, not decorative: -DryRun, -RunClaude and -Finish all
+  run exactly what it declares. It is PARSED into a pytest argument vector, so
+  it must start with 'pytest', 'python -m pytest' or 'py -m pytest'; shell
+  metacharacters and a caller-supplied --junitxml are refused. The harness runs
+  pytest through the repository's own .venv interpreter -- it is not a general
+  command runner, and there is no shell for a metacharacter to reach.
+
+  requires_new_tests is ADVISORY. Nothing enforces it; write the tests anyway.
+
+  commit_subject (optional) is the subject line -Finish uses for the commit.
+  Without it the task's title is used, untruncated -- an over-long subject is
+  warned about, never silently mangled.
+
   expects_diff (optional, default true) tells -RunClaude whether producing no
   working-tree change is a legitimate outcome. Leave it true for any task that
   should result in code changes: with it true, a silent no-op FAILS the run
@@ -40,7 +54,16 @@ allow_doc_updates: [CLAUDE.md, CHANGELOG.md, README.md]
   not errors, but write them anyway -- they are the whole contract.
 
   allowed_paths is VERIFIED AFTER THE FACT, not enforced during editing.
-  The harness can detect an out-of-scope edit; it cannot prevent one.
+  The harness can detect an out-of-scope edit; it cannot prevent one. -Finish
+  re-checks it against the CURRENT working tree (including anything already
+  staged) and refuses to stage a single file if any path falls outside it.
+
+  Lifecycle:
+      .\dev.ps1 TASK-NNN -CreateBranch
+      .\dev.ps1 TASK-NNN -RunClaude
+      # you review the diff
+      .\dev.ps1 TASK-NNN -Finish        [-NoPush] [-NoPr]
+  Moving this file to tasks/completed/ afterwards is manual and deliberate.
 -->
 
 ## Context

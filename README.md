@@ -248,12 +248,60 @@ fallback. A market being QuantHub-eligible does **not** mean QuantHub is
 used automatically — the actual choice is a one-time, persisted decision
 per `(ric, interval)`, described below.
 
+### QuantHub endpoint and authentication
+
+Oscill8 calls exactly **one** QuantHub endpoint:
+
+```
+GET https://qh-api.corp.hertshtengroup.com/apis/ohlc/
+```
+
+QuantHub retired its old `/api/` backend; the previous
+`/api/v2/ohlc/` path now returns **HTTP 403 Forbidden** for every
+instrument, at every interval and count. Only the URL changed on
+Oscill8's side — the request shape (`instruments=`/`interval=`/`count=`),
+the `Authorization` header, the response record shape, batching, count
+estimation, interval mapping and normalization are all unchanged.
+
+| Setting | Meaning |
+| --- | --- |
+| `RBS_QUANTHUB_TOKEN` | The QuantHub **access token**, obtained manually (see below). Sent as `Authorization: Bearer <token>`. |
+| `RBS_QUANTHUB_BASE_URL` | Optional override of the full OHLC endpoint URL. Defaults to the migrated `.../apis/ohlc/`. |
+
+**Authentication is manual, by design.** The operator signs in through
+QuantHub's own web auth page (`/apis/auth/`), copies the resulting
+`access_token`, and puts it in `RBS_QUANTHUB_TOKEN` in the local `.env`.
+**Oscill8 performs no token acquisition, no refresh, and no Microsoft
+sign-in of its own** — `core.quanthub._auth_headers()` only sends
+whatever that variable holds. There is no auth client in the codebase.
+Never commit a real token; `.env` is git-ignored.
+
+> **Upgrading an existing checkout:** `RBS_QUANTHUB_BASE_URL` is read
+> from the environment and **shadows the migrated default**. If your
+> `.env` still pins `.../api/v2/ohlc/`, every QuantHub request keeps
+> hitting the retired backend and keeps returning 403. Update that
+> variable to `https://qh-api.corp.hertshtengroup.com/apis/ohlc/`, or
+> delete the line entirely and let the default apply. `core.quanthub`
+> logs a warning at import when it detects a retired URL.
+
+`RBS_QUANTHUB_BASE_URL` deliberately remains **one complete endpoint
+URL**, not a host root that paths are joined onto: Oscill8 calls a
+single endpoint and never calls `/apis/auth/` itself, so there is no
+second path to derive and no reason to change the configuration
+contract.
+
 ### Why the SQLite cache matters more for QuantHub than for LSEG
 
 QuantHub's HTTP API was live-tested and confirmed to support only three
 effective parameters: `instruments=`, `interval=`, and `count=`.
 `start=`/`end=` return HTTP 500; `from=`/`to=`/`offset=`/`page=`/
-`cursor=`/`before=` are all silently ignored. There is **no way to ask
+`cursor=`/`before=` are all silently ignored. (Those findings were
+established against the retired `/api/v2/ohlc/` backend and are carried
+over unverified: the new `/apis/ohlc/` Swagger *does* document `start`,
+`end`, `extraFields` and `hg_instrument_ids`, which contradicts them.
+Whether they are genuinely honoured has not been tested, so the client
+still sends only the three parameters it has evidence for — evaluating
+the new ones is a separate task.) There is **no way to ask
 QuantHub for an arbitrary historical date range** — `count=N` always
 means "the most recent N observations as of right now," with no anchor
 to an earlier reference point. There is also a hard per-request ceiling,
@@ -661,10 +709,103 @@ an already-selected candidate's chart never touch LSEG (see
 
 `ui/app.py` calls `load_dotenv()` before importing anything that
 transitively imports `core.config`, so an `RBS_*` setting (e.g.
-`RBS_QUANTHUB_TOKEN`) placed in a `.env` file at the repository root is
-picked up automatically — no need to export it as a real OS/session
-environment variable first. `python-dotenv` is already a pinned
-`requirements.txt` dependency.
+`RBS_QUANTHUB_TOKEN`, `RBS_QUANTHUB_BASE_URL`) placed in a `.env` file
+at the repository root is picked up automatically — no need to export it
+as a real OS/session environment variable first. `python-dotenv` is
+already a pinned `requirements.txt` dependency. See
+[QuantHub endpoint and authentication](#quanthub-endpoint-and-authentication)
+for what those two QuantHub settings mean and how the access token is
+obtained.
+
+## Development harness (`dev.ps1`)
+
+Task-driven development is automated by a PowerShell harness. Four modes,
+mutually exclusive, each a SEPARATE invocation:
+
+```powershell
+.\dev.ps1 TASK-003 -DryRun        # read-only observation; mutates nothing
+.\dev.ps1 TASK-003 -CreateBranch  # preflight, then one guarded `git switch -c`
+.\dev.ps1 TASK-003 -RunClaude     # Claude implements (file tools only), then tests
+
+#  >>> a human reads the diff here <<<
+
+.\dev.ps1 TASK-003 -Finish        # re-verify, test, stage, commit, push, open a PR
+```
+
+The human review gate between `-RunClaude` and `-Finish` is the point of the
+split. Nothing chains the modes, and no flag does.
+
+### Task lifecycle
+
+1. Copy `tasks/TEMPLATE.md` to `tasks/active/TASK-NNN-<slug>.md` and fill in the
+   front matter (`id`, `title`, `branch`, `test_command`, `allowed_paths` are
+   required) and the body sections.
+2. `-CreateBranch` creates the branch the task declares, from `main`.
+3. `-RunClaude` runs Claude Code headlessly with **Read, Edit, Write, Glob and
+   Grep only** — no shell, no git, no web, no subagents — then runs the tests
+   itself. Claude never runs the tests and has no tool that could commit.
+4. **You review the diff.**
+5. `-Finish` does the rest. Moving the task file to `tasks/completed/` stays
+   manual and deliberate.
+
+### What `-Finish` does
+
+Each gate refuses before the *first* mutating call, and maps to its own exit
+code:
+
+| Gate | Exit on failure |
+| --- | --- |
+| HEAD is on the declared branch, not `main`/`master`, not detached | 10 |
+| At least one candidate path exists (never an empty commit) | 10 |
+| Every candidate path is inside the task's `allowed_paths` | 80 |
+| The declared `test_command` produced a usable result | 40 |
+| ...and reported no unexpected failures | 60 |
+| `data/strategy_sets/` is byte-identical (checked before *and* after) | 70 |
+| Staging and committing succeeded | 90 |
+| `git push -u origin <branch>` succeeded | 100 |
+| `gh`, **if** present and authenticated, opened the pull request | 110 |
+
+Then it stages **explicit pathspecs only**, commits from a message file with
+the project's `Co-Authored-By` and `Claude-Session` trailers, pushes, and opens
+a pull request.
+
+`-NoPush` stops after the commit; `-NoPr` pushes without opening a PR.
+
+### GitHub CLI is optional
+
+If `gh` is missing **or** signed out, that is a normal, **successful** finish:
+the report records `PrCreated = false` and prints an origin-derived compare URL
+for you to open yourself. Only a `gh` that is present *and* authenticated *and*
+then fails returns 110 — and the report says plainly that the commit and push
+both succeeded. **The harness never merges a pull request.**
+
+### Safety rules the harness enforces
+
+- `data/` (live Strategy Set JSON and the SQLite cache) and `test_qh.py` (a
+  live-HTTP scratch probe) are never staged, modified or cleaned. `data/
+  strategy_sets/` is SHA-256 verified before and after every run.
+- `Invoke-DevGit` is a **read-only** gateway with a subcommand allow-list and a
+  denied-token list. The four mutating git calls that exist each live in their
+  own function with a fixed argument vector built internally, deliberately
+  bypassing that gateway so it can stay read-only:
+  `git switch -c`, `git add -- <paths>`, `git commit -F <file>`,
+  `git push -u origin <branch>`.
+- `git add .`, `git add -A`, `git add -u` and wildcard pathspecs are
+  structurally unreachable. Every staged path passes two independent filters.
+- No `clean`, `stash`, `reset`, `restore`, `checkout -- <path>`, `amend`,
+  `rebase`, `merge`, `cherry-pick`, `--force`, or history rewriting exists
+  anywhere in the harness.
+- Tests always run against the repository's own `.venv` interpreter with
+  `RBS_SQLITE_PATH`/`RBS_STRATEGY_SETS_DIR` redirected into a throwaway `.dev/`
+  sandbox, and are always scoped to `tests/`.
+- The task's `test_command` is authoritative but is **parsed, never executed**:
+  it must be a `pytest` / `python -m pytest` invocation, and shell
+  metacharacters are refused. The harness runs pytest; it is not a command
+  runner.
+
+Artifacts for every run land under `.dev/runs/<TASK-ID>/<UTC-stamp>/`
+(gitignored): `report.md`, `run-summary.json`, the JUnit XML, the commit
+message, and the raw stdout/stderr of everything it launched.
 
 ## Testing
 
@@ -672,17 +813,25 @@ environment variable first. `python-dotenv` is already a pinned
 pytest -q
 ```
 
-Current suite (snapshot as of this documentation pass — re-run the
-command above for the up-to-date count, do not trust this number
-blindly): **1293 tests** — 1290 passing, 1 known environment-specific
-failure (see below), 2 skipped. Unit tests, LSEG and QuantHub both
-mocked — no live session required for the pytest suite itself.
-`tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema`
-fails in environments with pandas >= 3.0 (asserts `datetime64[ns]`; newer
-pandas defaults to `datetime64[us]`) — pre-existing, unrelated to any
-market-data change, not fixed here. The 2 skips are
+Scope the run to `tests/`: the repository root also holds `test_qh.py`,
+which makes a live QuantHub HTTP call at import time.
+
+```
+pytest -q tests/
+```
+
+Current suite (snapshot as of this documentation pass — re-run the command
+above for the up-to-date count, do not trust this number blindly): **1659
+tests** — 1657 passing, 2 skipped. Unit tests, LSEG and QuantHub both
+mocked — no live session required for the pytest suite itself. The 2 skips are
 `tests/test_ui_keyboard_browser.py` (no playwright installed) and
 `tests/test_quanthub_live_smoke.py` (`RBS_QUANTHUB_TOKEN` not set).
+
+`tests/test_dev_harness_finish.py` covers the development harness itself by
+driving its PowerShell functions against throwaway git repositories under
+`tmp_path`, with a local bare repository as `origin` and a stubbed `gh`. It
+never touches the real working tree, index, branches or remotes, and never
+reaches the network.
 
 `test_live_connection.py` is a manual smoke test, not part of the pytest
 suite — run it directly (`python test_live_connection.py`) on a machine
@@ -714,7 +863,13 @@ strategy_import/   Excel/CSV -> StrategySet import (parse/validate/preview/commi
 ui/                Streamlit UI (6A/6B/7B) -- app.py, state.py, controls.py, scan_view.py,
                    results_view.py, chart_view.py, formatting.py, error_formatting.py,
                    strategy_set_view.py/state.py/formatting.py, strategy_import_view.py/state.py
-tests/             Unit tests for every module above (pytest, LSEG and QuantHub mocked)
+tests/             Unit tests for every module above (pytest, LSEG and QuantHub mocked),
+                   plus harness coverage (test_dev_harness_finish.py, harness_ps.py)
+dev.ps1            Development harness entry point: -DryRun / -CreateBranch / -RunClaude / -Finish
+scripts/           Harness internals: _Common.ps1 (read-only git gateway, exit codes, task specs),
+                   Test-RepoState.ps1, Protect-DevData.ps1, Invoke-Oscill8Tests.ps1,
+                   New-TaskBranch.ps1, Invoke-ClaudeTask.ps1, Complete-DevTask.ps1 (commit/push/PR)
+tasks/             Task specifications: TEMPLATE.md, active/, completed/
 ```
 
 ## Current status

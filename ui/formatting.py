@@ -26,7 +26,14 @@ import pandas as pd
 
 from core.config import BarInterval
 
+from core.ric import parse_ric
+
 from strategy_engine.definitions import StrategyDefinition
+
+from strategy_sets.composite import (
+    COMBINATION_NAME_SEPARATOR,
+    CompositeCombinationName,
+)
 
 from template_scanner.filters import FilterCriterion
 from template_scanner.filters import at_lookback as filter_at_lookback
@@ -37,6 +44,12 @@ from template_scanner.scan_results import ScanCandidateResult
 from template_scanner.templates import template_from_dense_weights
 
 _NAN = float("nan")
+
+# What every formatter in this module renders for a missing value.
+# Named because format_strategy_label() has to RECOGNISE it (a label it
+# cannot decorate with a product/contract must stay exactly as
+# fmt_label() produced it), not merely produce it.
+_MISSING_VALUE = "—"  # em dash
 
 # Compact, always-visible caption (spec: no large instructional
 # paragraph should dominate the screen) -- the full explanation moves
@@ -448,7 +461,7 @@ def format_ranked_by(rank_state: dict) -> str:
 # FILTER_SPECS/RANK_METRIC_OPTIONS above) and via the selected candidate,
 # but are deliberately left out of the default table to keep it compact.
 DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("Strategy", "rics", "rics"),
+    ("Strategy Label", "label", "strategy_label"),
     ("Ratio", "weights", "weights"),
     ("Current", "current_price", "number"),
     ("Low", "range_low_robust", "number"),
@@ -461,16 +474,143 @@ DISPLAY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("Osc", "oscillation_count", "number"),
     ("ER", "efficiency_ratio", "number"),
     ("Half-Life", "half_life", "number"),
-    ("Strategy Label", "label", "text"),
 )
 
-# The Strategy Label column shows the actual originating Strategy Set
-# entry name / strategy-grid row Label (see template_scanner.scanner.
-# run_scan()/ScanCandidateResult.label) -- never derived/reconstructed
-# from RICs or the strategy definition. It's a new, optional column
-# (Column selector below) and is deliberately NOT in DEFAULT_VISIBLE_
-# COLUMNS, so the default table's appearance is unchanged.
+# Strategy Label is the results table's ONLY identity column: the
+# separate raw-RIC "Strategy" column ("SRAU27 / SRAZ27 / SRAM28 / ...")
+# was removed in favour of one human-readable name per row. The full
+# RIC list is still shown -- unchanged -- in the Selected Strategy
+# panel below the table (see selected_strategy_summary()), so nothing
+# was actually lost from the screen, only from the grid.
+#
+# For an ORDINARY (single-market or hand-authored intermarket)
+# candidate the value is exactly ScanCandidateResult.label, unchanged:
+# the actual originating Strategy Set entry name / strategy-grid row
+# Label (see template_scanner.scanner.run_scan()) -- never derived or
+# reconstructed from RICs or the strategy definition.
+#
+# For a COMPOSITE (Group A x Group B) candidate it is enriched with
+# each side's own first contract -- see format_strategy_label().
 STRATEGY_LABEL_COLUMN = "Strategy Label"
+
+# Column widths passed straight to st.column_config.Column(width=...)
+# in ui.results_view. Strategy Label now carries a composite's full
+# "<contract> <name> - <contract> <name>" text, which needs noticeably
+# more room than the numeric metric columns beside it.
+RESULT_COLUMN_WIDTHS: dict[str, str] = {
+    STRATEGY_LABEL_COLUMN: "large",
+}
+
+
+def format_contract(ric: str) -> str | None:
+    """One RIC as a trader-facing "<product> <contract>" pair, e.g.
+    `"SRAH27"` -> `"SRA H27"`, `"CRAU6"` -> `"CRA U6"`.
+
+    The split point is the market's own registered
+    `MarketDefinition.ric_root` length, resolved through
+    `core.ric.parse_ric()` -- the repository's single, canonical RIC
+    parser. This function deliberately adds NO parsing of its own (no
+    regex, no fixed root length, no month-code table): a second RIC
+    parser that could disagree with the real one is exactly what must
+    not exist here. That also makes it work unchanged for every
+    configured market -- `SRA`/`FF`/`SON`/`CRA`/`SRE`/`FEI`/`SARO3`/
+    `YBA`/`EON3` -- including the 1-digit-year roots, without a
+    per-market branch.
+
+    The contract half is the ORIGINAL RIC's own remaining characters,
+    sliced rather than rebuilt, so a 1-digit-year market renders what
+    its RIC actually says (`CRA U6`) instead of a normalised year this
+    function invented.
+
+    Returns None -- never a guess, never a partial string -- when the
+    RIC cannot be parsed against any known market root. Callers fall
+    back to the unadorned label.
+    """
+    try:
+        parsed = parse_ric(ric)
+    except (ValueError, KeyError):
+        return None
+
+    root = parsed.market.ric_root
+    remainder = ric[len(root):]
+    if not remainder:
+        return None
+    return f"{root} {remainder}"
+
+
+def format_strategy_label(label: object, rics: Sequence[str]) -> str:
+    """The results grid's Strategy Label cell for one candidate.
+
+    The grid's only identity column, so it has to answer "which product,
+    which contract, which strategy?" on its own:
+
+        ordinary:   "<product> <contract> <strategy name>"
+        composite:  "<product> <contract> <A name>"
+                    " - <product> <contract> <B name>"
+
+    e.g. `"SRA H27 3M Fly 2"`, `"CRA U6 3m sprd"`,
+    `"SRA H27 3M Fly - SRA H27 12M Sprd"`.
+
+    PRODUCT AND CONTRACT COME FROM THE ACTUAL RICs, never from the
+    strategy name and never from the old raw-RIC "Strategy" display
+    string (which no longer exists -- see DISPLAY_COLUMNS). `rics` is
+    the instance's own leg tuple, used exactly as it carries it:
+    `rics[0]` is the first/nearest leg. Nothing here sorts, reorders,
+    re-derives or normalises a RIC; format_contract() only splits one
+    at its registered root boundary.
+
+    COMPOSITE SPLIT. A composite's label arrives as a
+    strategy_sets.composite.CompositeCombinationName (a `str` subclass
+    -- see that class for why the structured provenance rides along
+    with the name rather than being re-derived here), carrying each
+    side's own entry name plus Group A's leg count. Because
+    compose_definition() lays a combination's legs out as A's legs
+    followed by B's negated legs, and generate_intermarket_instances()
+    builds `rics` positionally from that same leg tuple, `rics[0]` is
+    A's first/nearest contract and `rics[leg_count_a]` is B's.
+
+    Group A is ALWAYS on the left: the two sides are read from their
+    own separately-named fields, never by splitting the name string
+    apart, so the A/B orientation constructed upstream can never be
+    inverted or alphabetically reordered here.
+
+    FALLBACKS -- preserve, never guess. The plain fmt_label() label is
+    returned unchanged when:
+      * there is no name to decorate (`None`/blank renders as the same
+        "—" every other missing value does);
+      * `rics` is empty, or too short for a composite's recorded leg
+        split (structurally impossible for a real instance, since every
+        leg produces exactly one RIC);
+      * the relevant RIC does not parse against any known market root
+        -- for a composite, if EITHER side fails to resolve, both sides
+        stay undecorated, so one row can never show a product for one
+        half and not the other.
+    """
+    name = fmt_label(label)
+    rics = tuple(rics)
+
+    if isinstance(label, CompositeCombinationName):
+        if len(rics) <= label.leg_count_a:
+            return name
+
+        contract_a = format_contract(rics[0])
+        contract_b = format_contract(rics[label.leg_count_a])
+        if contract_a is None or contract_b is None:
+            return name
+
+        return (
+            f"{contract_a} {label.name_a}"
+            f"{COMBINATION_NAME_SEPARATOR}"
+            f"{contract_b} {label.name_b}"
+        )
+
+    if name == _MISSING_VALUE or not rics:
+        return name
+
+    contract = format_contract(rics[0])
+    if contract is None:
+        return name
+    return f"{contract} {name}"
 
 # Cross Frequency is deliberately NOT in the default DISPLAY_COLUMNS --
 # Movement and Osc took its place to keep the default grid compact (see
@@ -505,12 +645,12 @@ OPTIONAL_COLUMN_LABELS: tuple[str, ...] = (RANK_COLUMN,) + tuple(
     label for label, _, _ in DISPLAY_COLUMNS
 )
 
-# All existing columns stay visible by default, so a fresh scan looks
-# exactly as it did before the column selector existed; only the new
-# Strategy Label column starts hidden (see its own note above).
-DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = tuple(
-    label for label in OPTIONAL_COLUMN_LABELS if label != STRATEGY_LABEL_COLUMN
-)
+# Every column is visible by default. Strategy Label used to start
+# hidden, back when the raw-RIC "Strategy" column was the table's
+# identity column; now that Strategy Label IS that column, hiding it by
+# default would leave a nameless table. Each column remains
+# independently hideable via the Columns popover.
+DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = OPTIONAL_COLUMN_LABELS
 
 
 def apply_column_selection(display_df: pd.DataFrame, selected_labels: Sequence[str]) -> pd.DataFrame:
@@ -554,12 +694,12 @@ def fmt_number(value: float, decimals: int = 4) -> str:
 
 def fmt_label(value: object) -> str:
     """Format an optional caller-supplied label (e.g.
-    ScanCandidateResult.label); None/blank renders as '—', matching
-    fmt_number/fmt_percent's own missing-value convention."""
+    ScanCandidateResult.label); None/blank renders as _MISSING_VALUE,
+    matching fmt_number/fmt_percent's own missing-value convention."""
     if value is None:
-        return "—"
+        return _MISSING_VALUE
     text = str(value).strip()
-    return text if text else "—"
+    return text if text else _MISSING_VALUE
 
 
 def fmt_percent(value: float, decimals: int = 1) -> str:
@@ -585,8 +725,19 @@ def to_display_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
     columns: dict[str, pd.Series] = {}
     for label, source, kind in DISPLAY_COLUMNS:
         series = results_df[source]
-        if kind == "rics":
-            columns[label] = series.apply(lambda v: " / ".join(v))
+        if kind == "strategy_label":
+            # The only column built from two source columns: a
+            # composite's label needs its candidate's own `rics` to
+            # name each side's first contract (see
+            # format_strategy_label). Row order/index is preserved --
+            # both series come from the same DataFrame.
+            columns[label] = pd.Series(
+                [
+                    format_strategy_label(value, ric_tuple)
+                    for value, ric_tuple in zip(series, results_df["rics"])
+                ],
+                index=results_df.index,
+            )
         elif kind == "weights":
             columns[label] = series.apply(lambda v: " / ".join(fmt_number(w, 2) for w in v))
         elif kind == "percent":

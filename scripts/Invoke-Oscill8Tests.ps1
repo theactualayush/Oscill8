@@ -24,9 +24,136 @@
     sandbox for the child process and restored afterwards, so the suite
     cannot reach data/oscill8.db or data/strategy_sets/.
 
+    3. The task's declared 'test_command' is AUTHORITATIVE, but is parsed --
+       never executed as a command line. ConvertTo-DevPytestArgs turns the
+       declared string into an argument vector for the repository's own
+       interpreter, and refuses anything that is not a pytest invocation. The
+       harness has no shell, so there is nothing for a metacharacter to reach;
+       rejecting them anyway keeps the contract explicit and auditable rather
+       than relying on that absence.
+
 .NOTES
     Windows PowerShell 5.1 compatible.
 #>
+
+# The only command heads a declared test_command may use. Everything else is
+# refused: this file runs pytest, it is not a general command runner.
+$DevTestCommandHeads = @('pytest', 'python -m pytest', 'py -m pytest')
+
+# Characters that would be meaningful to a shell. No shell is involved here
+# (Start-Process receives an argument vector, not a command line), so these can
+# never be interpreted -- they are rejected so that a task file declaring one
+# fails loudly instead of silently having it treated as a literal pytest
+# argument.
+$DevTestCommandForbiddenChars = @(';', '&', '|', '>', '<', '`', '$', '(', ')', '{', '}', '^', "`n", "`r")
+
+function ConvertTo-DevPytestArgs {
+    <#
+    .SYNOPSIS
+        Parse a declared test_command into a python.exe argument vector.
+
+    .DESCRIPTION
+        Accepts 'pytest ...', 'python -m pytest ...' or 'py -m pytest ...' and
+        returns @('-m','pytest', <declared arguments>, '--junitxml=<path>',
+        '-p','no:cacheprovider').
+
+        The two injected arguments are not negotiable: the JUnit XML is how the
+        harness learns what passed, and the cache provider is disabled so a run
+        never writes .pytest_cache into the working tree it is about to verify.
+        A declared command that supplies its own --junitxml is refused rather
+        than silently overridden.
+
+        Returns an object with IsValid/Error/Arguments so the caller can report
+        a bad task file precisely instead of failing somewhere inside pytest.
+
+    .OUTPUTS
+        PSCustomObject: IsValid, Error, Arguments, Tokens, TestCommand.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$TestCommand,
+        [Parameter(Mandatory = $true)][string]$JUnitRelativePath
+    )
+
+    $invalid = {
+        param([string]$Message)
+        return [pscustomobject]@{
+            IsValid     = $false
+            Error       = $Message
+            Arguments   = @()
+            Tokens      = @()
+            TestCommand = $TestCommand
+        }
+    }
+
+    $command = ([string]$TestCommand).Trim()
+    if (-not $command) {
+        return (& $invalid 'test_command is empty.')
+    }
+
+    foreach ($char in $DevTestCommandForbiddenChars) {
+        if ($command.Contains($char)) {
+            return (& $invalid ("test_command contains the forbidden character '{0}'. It is parsed as a pytest invocation, never executed as a shell command line." -f $char))
+        }
+    }
+
+    # Whitespace tokenisation honouring simple double-quoted spans, e.g.
+    #   pytest -q tests/ -k "not slow"
+    $tokens = New-Object System.Collections.ArrayList
+    $current = New-Object System.Text.StringBuilder
+    $inQuote = $false
+    foreach ($char in $command.ToCharArray()) {
+        if ($char -eq '"') { $inQuote = -not $inQuote; continue }
+        if ((-not $inQuote) -and ($char -eq ' ' -or $char -eq "`t")) {
+            if ($current.Length -gt 0) {
+                [void]$tokens.Add($current.ToString())
+                [void]$current.Clear()
+            }
+            continue
+        }
+        [void]$current.Append($char)
+    }
+    if ($inQuote) {
+        return (& $invalid 'test_command has an unterminated double quote.')
+    }
+    if ($current.Length -gt 0) { [void]$tokens.Add($current.ToString()) }
+
+    $tokenList = @($tokens)
+    if ($tokenList.Count -lt 1) {
+        return (& $invalid 'test_command contains no tokens.')
+    }
+
+    # Strip the accepted head, whichever form it takes.
+    $rest = @()
+    if ($tokenList[0] -eq 'pytest') {
+        $rest = @($tokenList[1..($tokenList.Count - 1)])
+        if ($tokenList.Count -eq 1) { $rest = @() }
+    }
+    elseif (($tokenList[0] -eq 'python' -or $tokenList[0] -eq 'py') -and
+            $tokenList.Count -ge 3 -and $tokenList[1] -eq '-m' -and $tokenList[2] -eq 'pytest') {
+        $rest = @()
+        if ($tokenList.Count -gt 3) { $rest = @($tokenList[3..($tokenList.Count - 1)]) }
+    }
+    else {
+        return (& $invalid ("test_command must start with 'pytest', 'python -m pytest' or 'py -m pytest' -- got '{0}'. The harness runs pytest through the repository interpreter; it cannot run arbitrary commands." -f $tokenList[0]))
+    }
+
+    foreach ($token in $rest) {
+        if ($token -like '--junitxml*') {
+            return (& $invalid 'test_command must not supply --junitxml; the harness supplies its own so it can parse the results.')
+        }
+    }
+
+    $arguments = @('-m', 'pytest') + @($rest) + @(('--junitxml=' + $JUnitRelativePath), '-p', 'no:cacheprovider')
+
+    return [pscustomobject]@{
+        IsValid     = $true
+        Error       = $null
+        Arguments   = @($arguments)
+        Tokens      = @($tokenList)
+        TestCommand = $command
+    }
+}
 
 function Invoke-DevTestSuite {
     <#
@@ -50,15 +177,35 @@ function Invoke-DevTestSuite {
         [Parameter(Mandatory = $true)][string]$StdErrPath,
         [Parameter(Mandatory = $true)][string]$SandboxSqlitePath,
         [Parameter(Mandatory = $true)][string]$SandboxStrategySetsDir,
-        [int]$TimeoutSeconds = 1800
+        [int]$TimeoutSeconds = 1800,
+        [string]$TestCommand = 'pytest -q tests/'
     )
 
-    $pytestArgs = @(
-        '-m', 'pytest',
-        '-q', 'tests/',
-        ('--junitxml=' + $JUnitRelativePath),
-        '-p', 'no:cacheprovider'
-    )
+    # The declared test_command is authoritative, parsed (never executed) by
+    # ConvertTo-DevPytestArgs. The default reproduces the historical argument
+    # vector exactly, so a caller that supplies nothing behaves as before.
+    $parsed = ConvertTo-DevPytestArgs -TestCommand $TestCommand -JUnitRelativePath $JUnitRelativePath
+    if (-not $parsed.IsValid) {
+        return [pscustomobject]@{
+            CommandLine       = $null
+            WorkingDirectory  = $RepoRoot
+            JUnitRelativePath = $JUnitRelativePath
+            JUnitPath         = (Join-Path $RepoRoot ($JUnitRelativePath -replace '/', '\'))
+            StdOutPath        = $StdOutPath
+            StdErrPath        = $StdErrPath
+            ExitCode          = $null
+            TimedOut          = $false
+            LaunchError       = $parsed.Error
+            StartedUtc        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            DurationSeconds   = 0
+            PytestSummaryLine = $null
+            SandboxSqlite     = $SandboxSqlitePath
+            SandboxSets       = $SandboxStrategySetsDir
+            TestCommand       = $TestCommand
+        }
+    }
+
+    $pytestArgs = @($parsed.Arguments)
 
     $commandLine = '"{0}" {1}' -f $PythonExe, ($pytestArgs -join ' ')
 
@@ -133,6 +280,7 @@ function Invoke-DevTestSuite {
         PytestSummaryLine = $summaryLine
         SandboxSqlite     = $SandboxSqlitePath
         SandboxSets       = $SandboxStrategySetsDir
+        TestCommand       = $TestCommand
     }
 }
 

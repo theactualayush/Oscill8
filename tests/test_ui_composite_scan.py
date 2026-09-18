@@ -22,6 +22,7 @@ structural-zero filtering, real analytics, real results grid.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -160,18 +161,41 @@ def _markets_shown(at: AppTest) -> set[str]:
 
 
 def _labels_shown(at: AppTest) -> set[str]:
-    """Strategy Label values in the results grid. That column is not in
-    DEFAULT_VISIBLE_COLUMNS, so it is enabled first."""
+    """Strategy Label values in the results grid -- the table's only
+    identity column since the raw-RIC "Strategy" column was removed.
+    Visible by default (ui.formatting.DEFAULT_VISIBLE_COLUMNS)."""
     grid = _results_grid(at)
     if grid is None or "Strategy Label" not in grid.columns:
         return set()
     return set(grid["Strategy Label"].dropna())
 
 
-def _show_label_column(at: AppTest) -> AppTest:
-    """Enable the optional Strategy Label column in the Columns popover."""
-    multiselect = [m for m in at.multiselect if m.label == "Visible columns"][0]
-    return multiselect.set_value(list(multiselect.value) + ["Strategy Label"]).run()
+def _strip_contract(side: str) -> str:
+    """Drop the leading "<product> <contract> " that
+    ui.formatting.format_strategy_label() prepends, leaving the entry
+    name. Exactly two tokens, because the prefix is always
+    product-then-contract (e.g. "SRA U26 3M Fly" -> "3M Fly")."""
+    return side.split(" ", 2)[2]
+
+
+def _entry_names_shown(at: AppTest) -> set[str]:
+    """Each displayed Strategy Label reduced back to its entry-name
+    part(s), so the per-candidate product/contract prefixes (which
+    differ for every rolled instance) do not have to be enumerated.
+
+    A composite label is "<product> <contract> <A name> - <product>
+    <contract> <B name>"; an ordinary one is "<product> <contract>
+    <name>". Stripping the prefix from each side inverts exactly the
+    formatting format_strategy_label() applied.
+    """
+    names = set()
+    for label in _labels_shown(at):
+        if " - " in label:
+            a, b = label.split(" - ", 1)
+            names.add(" - ".join((_strip_contract(a), _strip_contract(b))))
+        else:
+            names.add(_strip_contract(label))
+    return names
 
 
 def _select(at: AppTest, name: str) -> AppTest:
@@ -272,9 +296,17 @@ def test_composite_labels_show_group_a_then_group_b_orientation(repo):
     at = _select(at, "Combos")
     at = _scan(at)
     _assert_no_exception(at)
-    at = _show_label_column(at)
 
-    assert _labels_shown(at) == {"SR3 Fly - CRA Fly"}
+    labels = _labels_shown(at)
+    assert labels                                        # something scanned
+    assert _entry_names_shown(at) == {"SR3 Fly - CRA Fly"}
+    # Every displayed label is "<A contract> SR3 Fly - <B contract> CRA
+    # Fly": Group A on the left, its own first contract in front of it,
+    # never the reverse orientation.
+    for label in labels:
+        # "<product> <contract> <A name> - <product> <contract> <B name>",
+        # Group A always on the left, product/contract from the real RICs.
+        assert re.fullmatch(r"SRA [A-Z]\d+ SR3 Fly - CRA [A-Z]\d+ CRA Fly", label), label
 
 
 def test_structural_zero_combinations_do_not_appear_in_results(repo):
@@ -284,11 +316,10 @@ def test_structural_zero_combinations_do_not_appear_in_results(repo):
     at = _select(at, "Combos")
     at = _scan(at)
     _assert_no_exception(at)
-    at = _show_label_column(at)
 
-    labels = _labels_shown(at)
-    assert labels == {"SR3 Fly - CRA Fly", "SON Fly - SR3 Fly", "SON Fly - CRA Fly"}
-    assert "SR3 Fly - SR3 Fly" not in labels
+    names = _entry_names_shown(at)
+    assert names == {"SR3 Fly - CRA Fly", "SON Fly - SR3 Fly", "SON Fly - CRA Fly"}
+    assert "SR3 Fly - SR3 Fly" not in names
 
 
 def test_all_zero_composite_shows_the_normal_no_candidates_behaviour(repo):
@@ -326,14 +357,47 @@ def test_mixed_ordinary_intermarket_and_composite_produce_one_result_set(repo):
     at = _select(at, "Everything")
     at = _scan(at)
     _assert_no_exception(at)
-    at = _show_label_column(at)
 
     assert _results_grid(at) is not None
     markets = _markets_shown(at)
     assert "SOFR" in markets                                  # ordinary entry
     assert "SOFR/CORRA" in markets                            # hand-authored intermarket
     assert "SOFR/SOFR/SOFR/CORRA/CORRA/CORRA" in markets      # composite
-    assert _labels_shown(at) == {"SOFR Fly", "SOFR vs CORRA", "SR3 Fly - CRA Fly"}
+    # Every kind of row now carries product + first/nearest contract:
+    # an ordinary entry, a hand-authored intermarket entry, and each
+    # side of a composite.
+    assert _entry_names_shown(at) == {"SOFR Fly", "SOFR vs CORRA", "SR3 Fly - CRA Fly"}
+    shown = _labels_shown(at)
+    assert any(re.fullmatch(r"SRA [A-Z]\d+ SOFR Fly", s) for s in shown), shown
+    assert any(re.fullmatch(r"SRA [A-Z]\d+ SOFR vs CORRA", s) for s in shown), shown
+    # No row is left as a bare, product-less entry name.
+    assert "SOFR Fly" not in shown
+    assert "SOFR vs CORRA" not in shown
+
+
+def test_results_grid_has_no_raw_ric_strategy_column(repo):
+    """Range-Bound Opportunities label change: the raw-RIC "Strategy"
+    column is gone and Strategy Label is visible by default, with no
+    blank replacement column left behind."""
+    repo.save(
+        StrategySet(name="Combos", entries=(),
+                    groups=_groups(a=("SR3 Fly",), b=("CRA Fly",)))
+    )
+    at = _app()
+    at.run()
+    at = _select(at, "Combos")
+    at = _scan(at)
+    _assert_no_exception(at)
+
+    grid = _results_grid(at)
+    assert grid is not None
+    assert "Strategy" not in grid.columns
+    assert "Strategy Label" in grid.columns
+    assert list(grid.columns) == [
+        "Rank", "Strategy Label", "Ratio", "Current", "Low", "Median",
+        "High", "Position", "Z", "|Z|", "Movement", "Osc", "ER",
+        "Half-Life",
+    ]
 
 
 # ---------------------------------------------------------------------

@@ -35,7 +35,33 @@ $DevExitCodes = @{
     GateFailed    = 60   # the suite ran and reported unexpected failures
     DataViolation = 70
     PathViolation = 80   # a change landed outside the task's declared allowed_paths
+    CommitFailed  = 90   # staging or committing failed (-Finish)
+    PushFailed    = 100  # 'git push -u origin <branch>' failed (-Finish)
+    PrFailed      = 110  # gh was present AND authenticated, but 'gh pr create' failed
 }
+
+# --- -Finish layer constants ------------------------------------------------
+# Trailers appended to every commit the harness creates. Declared here rather
+# than inline in the commit builder so there is one place to change them, and
+# so no caller can supply arbitrary trailer text.
+#
+# Claude-Session is NOT included here: it is discovered per run from the newest
+# .dev/runs/<TaskId>/*/run-summary.json whose Mode is RunClaude (see
+# scripts/Complete-DevTask.ps1, Get-DevLastClaudeSessionId). When no such run
+# exists the trailer is OMITTED -- a session id is never invented.
+$DevCommitCoAuthor = 'Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>'
+$DevClaudeSessionUrlPrefix = 'https://claude.ai/code/session_'
+
+# Base branch every harness-created pull request targets.
+$DevPrBaseBranch = 'main'
+
+# Branch names -Finish refuses to operate on, whatever a task file declares.
+$DevProtectedBranches = @('main', 'master')
+
+# Hard wall-clock ceiling for 'git push'. The configured credential helper is
+# GUI-based, so a missing credential can block even with GIT_TERMINAL_PROMPT=0;
+# this is the backstop that turns a hang into a clean PushFailed.
+$DevGitPushTimeoutSeconds = 300
 
 # --- Claude execution layer defaults ---------------------------------------
 # Overridable per run by dev.ps1's -ClaudeBudgetUsd / -ClaudeTimeoutSeconds,
@@ -77,11 +103,16 @@ $DevScratchPaths = @(
     'test_qh.py'
 )
 
-# Failures already known to be environmental rather than code defects.
-# Documented in README.md's Testing section and in CLAUDE.md's roadmap.
-$DevKnownBaselineFailures = @(
-    'tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema'
-)
+# Failures already known to be environmental rather than code defects, and
+# therefore recorded rather than treated as regressions.
+#
+# Currently EMPTY, deliberately. The one historical entry
+# (tests/test_cache.py::test_read_bars_output_matches_downloader_canonical_schema,
+# a datetime64[us] vs datetime64[ns] pandas-version mismatch) no longer
+# reproduces: the suite has been independently verified at 1589 passed,
+# 2 skipped. A stale entry here is worse than an empty list -- it silently
+# downgrades a real future failure on that node id to a warning.
+$DevKnownBaselineFailures = @()
 
 # Git subcommands Invoke-DevGit is permitted to run. READ-ONLY ONLY.
 #

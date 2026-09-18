@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Oscill8 development harness -- observation, safe branch creation, and
-    headless Claude Code task execution.
+    Oscill8 development harness -- observation, safe branch creation, headless
+    Claude Code task execution, and the guarded commit/push/PR finish.
 
 .DESCRIPTION
-    Three supported execution modes, mutually exclusive:
+    Four supported execution modes, mutually exclusive:
 
         .\dev.ps1 TASK-001 -DryRun         read-only observation (unchanged)
         .\dev.ps1 TASK-001 -CreateBranch   read-only checks, then create the
@@ -12,6 +12,13 @@
         .\dev.ps1 TASK-001 -RunClaude      preflight, run Claude Code as a
                                            file-only implementation agent,
                                            verify the diff, run the tests
+        .\dev.ps1 TASK-001 -Finish         re-verify everything, run the
+                                           declared tests, then stage, commit,
+                                           push and open a pull request
+
+    The three are SEPARATE INVOCATIONS on purpose. Between -RunClaude and
+    -Finish a human reads the diff. Nothing chains them, and there is no flag
+    that does.
 
     -DryRun resolves the repository root, reads and validates the task
     specification, inspects (never mutates) Git state, classifies every dirty
@@ -59,13 +66,51 @@
     producing no diff is a legitimate outcome; absent the key the default is
     true, so a silent no-op is treated as a failure rather than a pass.
 
+    -Finish runs AFTER a human has reviewed the diff. It trusts nothing from
+    the earlier run: it re-reads the specification, re-inspects the working
+    tree, re-checks every changed path against allowed_paths, and re-runs the
+    tests. Its gates, in order, and each mapped to its own exit code:
+
+        HEAD is on the task's declared branch, is not main/master,
+          and is not detached                                  (else 10)
+        at least one candidate path exists to commit            (else 10)
+        every candidate path is inside allowed_paths            (else 80)
+        the declared test_command ran                           (else 40)
+        it reported no unexpected failures                      (else 60)
+        data/strategy_sets/ is byte-identical                   (else 70)
+        staging and committing succeeded                        (else 90)
+        the push succeeded                                      (else 100)
+        gh, IF present and authenticated, opened the PR         (else 110)
+
+    EVERY ONE OF THOSE GATES RUNS BEFORE THE FIRST MUTATING CALL. Once staging
+    begins, only git and the network can still fail the run.
+
+    A missing or signed-out GitHub CLI is NOT a failure: the run succeeds with
+    PrCreated = false and an origin-derived compare URL in the report.
+
+    -NoPush stops after the commit. -NoPr pushes but opens no pull request.
+
     NOT IMPLEMENTED, BY DESIGN, IN THIS LAYER:
-        commit, push, PR creation, retries, the run-to-run test-delta gate.
+        chaining the modes into one command, retries, resume loops, automatic
+        merge, the run-to-run test-delta gate, and moving task files into
+        tasks/completed/.
 
     NEVER PERFORMED, ANYWHERE:
-        git add (in any form), commit, amend, push, pull, fetch, merge,
-        rebase, cherry-pick, clean, stash, reset, restore, checkout -- <path>,
-        history rewriting, operating on a detached HEAD, or committing to main.
+        'git add .', 'git add -A', 'git add -u', a wildcard/glob pathspec,
+        amend, pull, fetch, merge, rebase, cherry-pick, revert, clean, stash,
+        reset, restore, 'checkout -- <path>', any --force or --force-with-lease,
+        tag, history rewriting, operating on a detached HEAD, committing to
+        main/master, merging a pull request, or any write under data/ or to
+        test_qh.py.
+
+        The ONLY mutating git calls that exist are, one dedicated function
+        each, every argument vector built inside the function:
+            git switch -c <branch> <sha>     scripts/New-TaskBranch.ps1
+            git add -- <explicit paths>      scripts/Complete-DevTask.ps1
+            git commit -F <message-file>     scripts/Complete-DevTask.ps1
+            git push -u origin <branch>      scripts/Complete-DevTask.ps1
+        Invoke-DevGit itself stays strictly read-only, so no future caller can
+        reach a mutating subcommand through the general-purpose wrapper.
 
     Every artifact this script writes lands under .dev/, which .gitignore
     excludes.
@@ -81,6 +126,15 @@
 
 .PARAMETER RunClaude
     Headless Claude Code task-execution mode.
+
+.PARAMETER Finish
+    Post-review finish mode: re-verify, test, stage, commit, push, open a PR.
+
+.PARAMETER NoPush
+    -Finish only. Commit, but do not push and do not open a pull request.
+
+.PARAMETER NoPr
+    -Finish only. Commit and push, but do not open a pull request.
 
 .PARAMETER ClaudeBudgetUsd
     Hard spend ceiling passed to Claude as --max-budget-usd. Defaults to
@@ -104,6 +158,12 @@
 .EXAMPLE
     .\dev.ps1 TASK-001 -RunClaude -ClaudeBudgetUsd 25 -ClaudeTimeoutSeconds 3600
 
+.EXAMPLE
+    .\dev.ps1 TASK-001 -Finish
+
+.EXAMPLE
+    .\dev.ps1 TASK-001 -Finish -NoPush
+
 .NOTES
     Windows PowerShell 5.1 compatible: no '&&'/'||', no ternary, no '??'.
     All paths are quoted -- the repository lives under a OneDrive path
@@ -121,6 +181,12 @@ param(
 
     [switch]$RunClaude,
 
+    [switch]$Finish,
+
+    [switch]$NoPush,
+
+    [switch]$NoPr,
+
     [double]$ClaudeBudgetUsd = 0,
 
     [int]$ClaudeTimeoutSeconds = 0
@@ -135,15 +201,18 @@ function Show-DevUsage {
     Write-Host '  Usage:  .\dev.ps1 <TASK-ID> -DryRun'
     Write-Host '          .\dev.ps1 <TASK-ID> -CreateBranch'
     Write-Host '          .\dev.ps1 <TASK-ID> -RunClaude [-ClaudeBudgetUsd <n>] [-ClaudeTimeoutSeconds <n>]'
+    Write-Host '          .\dev.ps1 <TASK-ID> -Finish [-NoPush] [-NoPr]'
     Write-Host ''
     Write-Host '  -DryRun        Read-only observation. Mutates nothing.'
     Write-Host '  -CreateBranch  Preflight, then create the task branch from main.'
     Write-Host '  -RunClaude     Run Claude Code as a file-only implementation agent,'
-    Write-Host '                 verify the diff, then run "pytest -q tests/".'
+    Write-Host '                 verify the diff, then run the declared test command.'
+    Write-Host '  -Finish        After you have reviewed the diff: re-verify, test,'
+    Write-Host '                 stage explicitly, commit, push, open a pull request.'
     Write-Host ''
-    Write-Host '  Exactly one mode must be supplied. Commit, push, PR creation and'
-    Write-Host '  the test-delta gate are not implemented yet and cannot be'
-    Write-Host '  triggered from this script.'
+    Write-Host '  Exactly one mode must be supplied. The modes are separate'
+    Write-Host '  invocations by design -- a human reviews the diff between'
+    Write-Host '  -RunClaude and -Finish. Merging is never automated.'
     Write-Host ''
 }
 
@@ -161,16 +230,23 @@ $modeCount = 0
 if ($DryRun)       { $modeCount = $modeCount + 1 }
 if ($CreateBranch) { $modeCount = $modeCount + 1 }
 if ($RunClaude)    { $modeCount = $modeCount + 1 }
+if ($Finish)       { $modeCount = $modeCount + 1 }
 
 if ($modeCount -gt 1) {
     Show-DevUsage
-    Write-Host 'ERROR: -DryRun, -CreateBranch and -RunClaude are mutually exclusive.' -ForegroundColor Red
+    Write-Host 'ERROR: -DryRun, -CreateBranch, -RunClaude and -Finish are mutually exclusive.' -ForegroundColor Red
     exit 1
 }
 
 if ($modeCount -eq 0) {
     Show-DevUsage
-    Write-Host 'ERROR: a mode is required -- pass -DryRun, -CreateBranch or -RunClaude.' -ForegroundColor Red
+    Write-Host 'ERROR: a mode is required -- pass -DryRun, -CreateBranch, -RunClaude or -Finish.' -ForegroundColor Red
+    exit 1
+}
+
+if (($NoPush -or $NoPr) -and -not $Finish) {
+    Show-DevUsage
+    Write-Host 'ERROR: -NoPush and -NoPr apply to -Finish only.' -ForegroundColor Red
     exit 1
 }
 
@@ -183,10 +259,12 @@ if ($TaskId -notmatch '^TASK-\d{3}$') {
 $mode = 'DryRun'
 if ($CreateBranch) { $mode = 'CreateBranch' }
 if ($RunClaude)    { $mode = 'RunClaude' }
+if ($Finish)       { $mode = 'Finish' }
 
 $totalStages = 8
 if ($mode -eq 'CreateBranch') { $totalStages = 7 }
 if ($mode -eq 'RunClaude')    { $totalStages = 9 }
+if ($mode -eq 'Finish')       { $totalStages = 14 }
 
 # ---------------------------------------------------------------------------
 # Stage 0 -- repository root and harness bootstrap
@@ -201,6 +279,7 @@ if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.D
 . (Join-Path $scriptDir 'scripts\Invoke-Oscill8Tests.ps1')
 . (Join-Path $scriptDir 'scripts\New-TaskBranch.ps1')
 . (Join-Path $scriptDir 'scripts\Invoke-ClaudeTask.ps1')
+. (Join-Path $scriptDir 'scripts\Complete-DevTask.ps1')
 
 $repoRoot = Get-DevRepoRoot -StartPath $scriptDir
 if (-not $repoRoot) {
@@ -222,8 +301,11 @@ if ($mode -eq 'DryRun') {
 elseif ($mode -eq 'CreateBranch') {
     Write-DevLog 'Oscill8 dev harness -- CREATE BRANCH' 'STEP'
 }
-else {
+elseif ($mode -eq 'RunClaude') {
     Write-DevLog 'Oscill8 dev harness -- RUN CLAUDE (file-only implementation agent)' 'STEP'
+}
+else {
+    Write-DevLog 'Oscill8 dev harness -- FINISH (verify, test, stage, commit, push, PR)' 'STEP'
 }
 Write-DevLog "Task            : $TaskId"
 Write-DevLog "Repository root : $repoRoot"
@@ -259,6 +341,14 @@ elseif ($mode -eq 'CreateBranch') {
 }
 else {
     Write-DevLog ("Branch : {0} (declared by the task)" -f $spec.FrontMatter['branch'])
+}
+
+# The declared test command is authoritative for every mode that runs tests.
+# It is PARSED into a pytest argument vector, never executed as a command line
+# -- see ConvertTo-DevPytestArgs in scripts/Invoke-Oscill8Tests.ps1.
+$testCommand = 'pytest -q tests/'
+if ($spec.FrontMatter.ContainsKey('test_command') -and $spec.FrontMatter['test_command']) {
+    $testCommand = [string]$spec.FrontMatter['test_command']
 }
 
 # A task may declare "expects_diff: false" to say that producing no
@@ -375,6 +465,24 @@ $changes = $null
 $scopeCheck = $null
 $claudeFailures = New-Object System.Collections.ArrayList
 
+# -Finish state
+$branchGate = $null
+$candidates = $null
+$dataComparisonPre = $null
+$commitMessage = $null
+$addResult = $null
+$commitResult = $null
+$pushResult = $null
+$prResult = $null
+$ghExe = $null
+$ghAuth = $null
+$compareUrl = $null
+$claudeSessionId = $null
+$finishExit = $DevExitCodes.Success
+$finishResult = $null
+$finishAborted = $false
+$finishNotes = New-Object System.Collections.ArrayList
+
 if ($mode -eq 'DryRun') {
 
     # --- Stage 5 -- sandbox for RBS_* redirection --------------------------
@@ -395,7 +503,8 @@ if ($mode -eq 'DryRun') {
         -StdErrPath (Join-Path $runDir 'tests.stderr.txt') `
         -SandboxSqlitePath $sandbox.SqlitePath `
         -SandboxStrategySetsDir $sandbox.StrategySetsDir `
-        -TimeoutSeconds 1800
+        -TimeoutSeconds 1800 `
+        -TestCommand $testCommand
 
     Write-DevLog ("Command : {0}" -f $run.CommandLine)
     Write-DevLog ("Duration: {0}s   pytest exit code: {1}" -f $run.DurationSeconds, $run.ExitCode)
@@ -439,6 +548,347 @@ if ($mode -eq 'DryRun') {
         UnexpectedFailures = @($unexpectedFailures)
     }) -Depth 8
 }
+elseif ($mode -eq 'Finish') {
+
+    # ======================================================================
+    # -Finish. Every gate below runs BEFORE the first mutating git call.
+    # Nothing here trusts an earlier run: the tree, the scope and the tests
+    # are all re-established from scratch.
+    # ======================================================================
+
+    # --- Stage 5 -- branch gate --------------------------------------------
+    Write-DevLog ("Stage 5/{0}  Branch gate" -f $totalStages) 'STEP'
+    $branchGate = Test-DevOnTaskBranch `
+        -CurrentBranch $state.CurrentBranch `
+        -DeclaredBranch ([string]$spec.FrontMatter['branch']) `
+        -IsDetached ([bool]$state.IsDetachedHead)
+    Write-DevJsonFile -Path (Join-Path $runDir 'branch-gate.json') -InputObject $branchGate -Depth 6
+
+    if ($branchGate.IsOnTaskBranch) {
+        Write-DevLog ("HEAD is on the task branch: {0}" -f $branchGate.CurrentBranch) 'OK'
+    }
+    else {
+        foreach ($blocker in $branchGate.Blockers) { Write-DevLog $blocker 'ERROR' }
+        Write-DevLog 'REFUSING to finish. Nothing was staged, committed or pushed.' 'ERROR'
+        $finishAborted = $true
+        $finishExit = $DevExitCodes.Preflight
+        $finishResult = 'FAIL (not on the task branch)'
+        foreach ($blocker in $branchGate.Blockers) { [void]$finishNotes.Add($blocker) }
+    }
+
+    # --- Stage 6 -- re-inspect the working tree ----------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 6/{0}  Re-inspecting the working tree (read-only)" -f $totalStages) 'STEP'
+        $changes = Get-DevWorkingTreeChanges -RepoRoot $repoRoot
+        Write-DevJsonFile -Path (Join-Path $runDir 'changes.json') -InputObject $changes -Depth 8
+
+        $candidates = Get-DevFinishCandidatePaths -Changes $changes
+        Write-DevJsonFile -Path (Join-Path $runDir 'candidates.json') -InputObject $candidates -Depth 6
+
+        foreach ($path in $candidates.CandidatePaths) { Write-DevLog ("  candidate : {0}" -f $path) }
+        foreach ($path in $candidates.ExcludedProtected) { Write-DevLog ("  excluded (protected) : {0}" -f $path) }
+        foreach ($path in $candidates.ExcludedScratch)   { Write-DevLog ("  excluded (scratch)   : {0}" -f $path) }
+        if (@($candidates.StagedOnly).Count -gt 0) {
+            Write-DevLog ("{0} path(s) were already staged; they are scope-checked here like any other." -f @($candidates.StagedOnly).Count) 'WARN'
+        }
+        Write-DevLog ("{0} candidate path(s) to commit." -f @($candidates.CandidatePaths).Count)
+
+        if (-not $candidates.HasCandidates) {
+            Write-DevLog 'Nothing to commit: no reviewable change outside protected/scratch paths.' 'ERROR'
+            Write-DevLog 'REFUSING to create an empty commit.' 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.Preflight
+            $finishResult = 'FAIL (nothing to commit)'
+            [void]$finishNotes.Add('-Finish expects a reviewed diff. There was none, and an empty commit is never created.')
+        }
+    }
+
+    # --- Stage 7 -- allowed-path verification ------------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 7/{0}  Verifying every candidate path against allowed_paths" -f $totalStages) 'STEP'
+        $scopeCheck = Test-DevChangedPathsInScope -ChangedPaths @($candidates.CandidatePaths) -Spec $spec
+        Write-DevJsonFile -Path (Join-Path $runDir 'scope-check.json') -InputObject $scopeCheck -Depth 6
+
+        if ($scopeCheck.AllInScope) {
+            Write-DevLog 'All candidate paths are inside the task allowed_paths.' 'OK'
+        }
+        else {
+            foreach ($violation in $scopeCheck.Violations) { Write-DevLog ("  OUT OF SCOPE: {0}" -f $violation) 'ERROR' }
+            Write-DevLog ("Permitted: {0}" -f ($scopeCheck.Permitted -join ', ')) 'ERROR'
+            Write-DevLog 'REFUSING to stage. Resolve the out-of-scope change or widen the task specification.' 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.PathViolation
+            $finishResult = 'FAIL (changes outside the task allowed_paths)'
+            [void]$finishNotes.Add('Out-of-scope paths: ' + (@($scopeCheck.Violations) -join ', '))
+        }
+    }
+
+    # --- Stage 8 -- the declared test command ------------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 8/{0}  Running the declared test command" -f $totalStages) 'STEP'
+        $sandbox = New-DevSandbox -SandboxRoot $sandboxDir
+        Write-DevLog ("RBS_SQLITE_PATH        -> {0}" -f (ConvertTo-DevRelativePath -Path $sandbox.SqlitePath -RepoRoot $repoRoot))
+        Write-DevLog ("RBS_STRATEGY_SETS_DIR  -> {0}" -f (ConvertTo-DevRelativePath -Path $sandbox.StrategySetsDir -RepoRoot $repoRoot))
+        Write-DevLog ("test_command           : {0}" -f $testCommand)
+
+        $junitRelative = ('.dev/runs/{0}/{1}/tests.finish.xml' -f $TaskId, $runStamp)
+        $run = Invoke-DevTestSuite `
+            -RepoRoot $repoRoot `
+            -PythonExe $state.PythonExe `
+            -JUnitRelativePath $junitRelative `
+            -StdOutPath (Join-Path $runDir 'tests.stdout.txt') `
+            -StdErrPath (Join-Path $runDir 'tests.stderr.txt') `
+            -SandboxSqlitePath $sandbox.SqlitePath `
+            -SandboxStrategySetsDir $sandbox.StrategySetsDir `
+            -TimeoutSeconds 1800 `
+            -TestCommand $testCommand
+
+        Write-DevLog ("Command : {0}" -f $run.CommandLine)
+        Write-DevLog ("Duration: {0}s   pytest exit code: {1}" -f $run.DurationSeconds, $run.ExitCode)
+
+        $results = Read-DevJUnitResults -Path $run.JUnitPath
+
+        if ($run.LaunchError) {
+            Write-DevLog ("Failed to run the declared test command: {0}" -f $run.LaunchError) 'ERROR'
+            $testsUnusable = $true
+        }
+        if ($run.TimedOut) {
+            Write-DevLog 'The test command exceeded the harness timeout and was terminated.' 'ERROR'
+            $testsUnusable = $true
+        }
+        if (-not $results.IsParsed) {
+            Write-DevLog ("JUnit results unusable: {0}" -f $results.ParseError) 'ERROR'
+            $testsUnusable = $true
+        }
+
+        if ($results.IsParsed) {
+            $allFailing = @(@($results.FailedNodeIds) + @($results.ErrorNodeIds)) | Sort-Object -Unique
+            foreach ($nodeId in $allFailing) {
+                if ($DevKnownBaselineFailures -contains $nodeId) { $knownFailures = $knownFailures + $nodeId }
+                else { $unexpectedFailures = $unexpectedFailures + $nodeId }
+            }
+            Write-DevLog ("Tests   : {0} total | {1} passed | {2} failed | {3} errors | {4} skipped" -f `
+                $results.Total, $results.Passed, $results.Failed, $results.Errors, $results.Skipped) 'OK'
+            foreach ($nodeId in $knownFailures)      { Write-DevLog ("  known baseline failure : {0}" -f $nodeId) 'WARN' }
+            foreach ($nodeId in $unexpectedFailures) { Write-DevLog ("  UNEXPECTED failure     : {0}" -f $nodeId) 'ERROR' }
+        }
+
+        Write-DevJsonFile -Path (Join-Path $runDir 'tests.summary.json') -InputObject ([pscustomobject]@{
+            Run                = $run
+            Results            = $results
+            KnownFailures      = @($knownFailures)
+            UnexpectedFailures = @($unexpectedFailures)
+        }) -Depth 8
+
+        if ($testsUnusable) {
+            Write-DevLog 'REFUSING to commit: the test command produced no usable result.' 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.TestsUnusable
+            $finishResult = 'FAIL (test command produced no usable result)'
+        }
+        elseif ($unexpectedFailures.Count -gt 0) {
+            Write-DevLog ("REFUSING to commit: {0} unexpected test failure(s)." -f $unexpectedFailures.Count) 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.GateFailed
+            $finishResult = ('FAIL ({0} unexpected test failure(s))' -f $unexpectedFailures.Count)
+            [void]$finishNotes.Add('Nothing was staged, committed or pushed.')
+        }
+    }
+
+    # --- Stage 9 -- protected data verification BEFORE any mutation --------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 9/{0}  Verifying data/strategy_sets/ before staging" -f $totalStages) 'STEP'
+        $manifestPre = New-DevDataSnapshot -DirectoryPath $strategySetsDir -RepoRoot $repoRoot -Label 'pre-commit'
+        Write-DevJsonFile -Path (Join-Path $runDir 'data-manifest.pre-commit.json') -InputObject $manifestPre -Depth 6
+        $dataComparisonPre = Compare-DevDataSnapshot -Before $manifestBefore -After $manifestPre
+
+        if ($dataComparisonPre.Unchanged) {
+            Write-DevLog 'Protected data unchanged by the test run.' 'OK'
+        }
+        else {
+            foreach ($path in $dataComparisonPre.Added)    { Write-DevLog ("  ADDED    {0}" -f $path) 'ERROR' }
+            foreach ($path in $dataComparisonPre.Removed)  { Write-DevLog ("  REMOVED  {0}" -f $path) 'ERROR' }
+            foreach ($path in $dataComparisonPre.Modified) { Write-DevLog ("  MODIFIED {0}" -f $path) 'ERROR' }
+            Write-DevLog 'PROTECTED DATA VIOLATION before staging; REFUSING to commit.' 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.DataViolation
+            $finishResult = 'FAIL (protected data changed)'
+        }
+    }
+
+    # --- Stage 10 -- stage and commit --------------------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 10/{0}  Staging explicit pathspecs and committing" -f $totalStages) 'STEP'
+
+        $claudeSessionId = Get-DevLastClaudeSessionId -RepoRoot $repoRoot -TaskId $TaskId
+        if ($claudeSessionId) {
+            Write-DevLog ("Claude-Session trailer from the last -RunClaude run: {0}" -f $claudeSessionId)
+        }
+        else {
+            Write-DevLog 'No -RunClaude session found for this task; the Claude-Session trailer is omitted (never invented).' 'WARN'
+        }
+
+        $testSummary = $null
+        if ($results -and $results.IsParsed) {
+            $testSummary = ('{0} passed, {1} skipped, {2} failed of {3}' -f `
+                $results.Passed, $results.Skipped, $results.Failed, $results.Total)
+        }
+
+        $commitMessage = New-DevCommitMessage `
+            -Spec $spec -TaskId $TaskId `
+            -Paths @($candidates.CandidatePaths) `
+            -TestSummary $testSummary `
+            -ClaudeSessionId $claudeSessionId
+        foreach ($messageWarning in $commitMessage.Warnings) { Write-DevLog $messageWarning 'WARN' }
+
+        $commitMessagePath = Join-Path $runDir 'commit-message.txt'
+        Write-DevTextFile -Path $commitMessagePath -Content $commitMessage.Text
+        Write-DevLog ("Commit message: {0}" -f (ConvertTo-DevRelativePath -Path $commitMessagePath -RepoRoot $repoRoot))
+
+        try {
+            $addResult = Invoke-DevGitAddPaths -RepoRoot $repoRoot -Paths @($candidates.CandidatePaths)
+            Write-DevLog ("  executed: {0}" -f $addResult.Command)
+        }
+        catch {
+            Write-DevLog ("Staging refused: {0}" -f $_.Exception.Message) 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.CommitFailed
+            $finishResult = 'FAIL (staging refused)'
+            [void]$finishNotes.Add($_.Exception.Message)
+        }
+
+        if (-not $finishAborted -and $addResult.ExitCode -ne 0) {
+            foreach ($line in $addResult.Output) { Write-DevLog ("  git: {0}" -f $line) 'ERROR' }
+            Write-DevLog ("git add failed with exit code {0}." -f $addResult.ExitCode) 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.CommitFailed
+            $finishResult = 'FAIL (git add failed)'
+        }
+
+        if (-not $finishAborted) {
+            $commitResult = Invoke-DevGitCommit -RepoRoot $repoRoot -MessageFile $commitMessagePath
+            foreach ($line in $commitResult.Output) { Write-DevLog ("  git: {0}" -f $line) }
+            Write-DevJsonFile -Path (Join-Path $runDir 'commit.json') -Depth 6 -InputObject ([pscustomobject]@{
+                Add     = $addResult
+                Commit  = $commitResult
+                Message = $commitMessage
+            })
+
+            if ($commitResult.Committed) {
+                Write-DevLog ("Committed {0}" -f $commitResult.CommitSha) 'OK'
+            }
+            else {
+                Write-DevLog ("git commit failed with exit code {0}." -f $commitResult.ExitCode) 'ERROR'
+                $finishAborted = $true
+                $finishExit = $DevExitCodes.CommitFailed
+                $finishResult = 'FAIL (git commit failed)'
+            }
+        }
+        else {
+            Write-DevJsonFile -Path (Join-Path $runDir 'commit.json') -Depth 6 -InputObject ([pscustomobject]@{
+                Add     = $addResult
+                Commit  = $null
+                Message = $commitMessage
+            })
+        }
+    }
+
+    # --- Stage 11 -- push ---------------------------------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 11/{0}  Pushing the task branch" -f $totalStages) 'STEP'
+        if ($NoPush) {
+            Write-DevLog '-NoPush supplied: the commit stays local. Push it yourself when ready.' 'WARN'
+            [void]$finishNotes.Add('-NoPush was supplied; the commit was not pushed and no pull request was opened.')
+        }
+        elseif (-not $state.RemoteUrl) {
+            Write-DevLog 'No origin remote is configured; cannot push.' 'ERROR'
+            $finishAborted = $true
+            $finishExit = $DevExitCodes.PushFailed
+            $finishResult = 'FAIL (no origin remote)'
+            [void]$finishNotes.Add('The commit was created locally and is intact; only the push could not run.')
+        }
+        else {
+            $pushResult = Invoke-DevGitPush `
+                -RepoRoot $repoRoot `
+                -BranchName $branchGate.CurrentBranch `
+                -StdOutPath (Join-Path $runDir 'push.stdout.txt') `
+                -StdErrPath (Join-Path $runDir 'push.stderr.txt')
+            Write-DevJsonFile -Path (Join-Path $runDir 'push.json') -InputObject $pushResult -Depth 6
+            Write-DevLog ("  executed: {0}   ({1}s)" -f $pushResult.Command, $pushResult.DurationSeconds)
+
+            if ($pushResult.Pushed) {
+                Write-DevLog 'Pushed and upstream set.' 'OK'
+            }
+            else {
+                if ($pushResult.TimedOut) {
+                    Write-DevLog ("git push exceeded {0}s and was terminated (credential prompt?)." -f $pushResult.TimeoutSeconds) 'ERROR'
+                }
+                Write-DevLog ("git push failed (exit code {0}). See push.stderr.txt." -f $pushResult.ExitCode) 'ERROR'
+                $finishAborted = $true
+                $finishExit = $DevExitCodes.PushFailed
+                $finishResult = 'FAIL (git push failed)'
+                [void]$finishNotes.Add('The commit was created and is intact; only the push failed. No force push was attempted and none will be.')
+            }
+        }
+    }
+
+    # --- Stage 12 -- pull request (optional) --------------------------------
+    if (-not $finishAborted) {
+        Write-DevLog ("Stage 12/{0}  Pull request" -f $totalStages) 'STEP'
+        $compareUrl = Get-DevCompareUrl -RemoteUrl $state.RemoteUrl -BranchName $branchGate.CurrentBranch -BaseBranch $DevPrBaseBranch
+
+        if ($NoPush -or $NoPr) {
+            Write-DevLog 'Pull-request creation skipped by request.' 'WARN'
+            if ($compareUrl) { Write-DevLog ("Compare URL: {0}" -f $compareUrl) }
+        }
+        else {
+            $ghExe = Resolve-DevGhExe
+            Write-DevJsonFile -Path (Join-Path $runDir 'gh-exe.json') -InputObject $ghExe -Depth 5
+
+            if (-not $ghExe.Resolved) {
+                Write-DevLog 'GitHub CLI (gh) not found -- this is not a failure.' 'WARN'
+                if ($compareUrl) { Write-DevLog ("Open the PR yourself: {0}" -f $compareUrl) 'OK' }
+                [void]$finishNotes.Add('gh is not installed, so no pull request was created. Commit and push succeeded.')
+            }
+            else {
+                $ghAuth = Test-DevGhAuthenticated -GhExe $ghExe.Path
+                Write-DevLog ("gh: {0}" -f $ghExe.Path)
+                if (-not $ghAuth.Authenticated) {
+                    Write-DevLog $ghAuth.Message 'WARN'
+                    if ($compareUrl) { Write-DevLog ("Open the PR yourself: {0}" -f $compareUrl) 'OK' }
+                    [void]$finishNotes.Add('gh is present but not authenticated, so no pull request was created. Commit and push succeeded.')
+                }
+                else {
+                    $prBodyPath = Join-Path $runDir 'pr-body.md'
+                    Write-DevTextFile -Path $prBodyPath -Content (New-DevPrBody -Spec $spec -TaskId $TaskId -Paths @($candidates.CandidatePaths) -TestSummary $testSummary)
+                    $prResult = New-DevPullRequest `
+                        -RepoRoot $repoRoot `
+                        -BranchName $branchGate.CurrentBranch `
+                        -Title ([string]$spec.FrontMatter['title']) `
+                        -BodyFile $prBodyPath `
+                        -StdOutPath (Join-Path $runDir 'pr.stdout.txt') `
+                        -StdErrPath (Join-Path $runDir 'pr.stderr.txt') `
+                        -BaseBranch $DevPrBaseBranch `
+                        -GhExe $ghExe.Path
+                    Write-DevJsonFile -Path (Join-Path $runDir 'pr.json') -InputObject $prResult -Depth 6
+                    Write-DevLog ("  executed: {0}" -f $prResult.Command)
+
+                    if ($prResult.Created) {
+                        Write-DevLog ("Pull request opened: {0}" -f $prResult.Url) 'OK'
+                        [void]$finishNotes.Add('Merging is a separate human decision; the harness never merges.')
+                    }
+                    else {
+                        Write-DevLog ("gh pr create failed (exit code {0}). See pr.stderr.txt." -f $prResult.ExitCode) 'ERROR'
+                        $finishExit = $DevExitCodes.PrFailed
+                        $finishResult = 'FAIL (pull request not created) -- COMMIT AND PUSH SUCCEEDED'
+                        [void]$finishNotes.Add('The commit and the push BOTH SUCCEEDED. Only PR creation failed; open it yourself.')
+                        if ($compareUrl) { [void]$finishNotes.Add('Compare URL: ' + $compareUrl) }
+                    }
+                }
+            }
+        }
+    }
+}
 elseif ($mode -eq 'CreateBranch') {
 
     # --- Stage 5 -- branch preconditions and creation ----------------------
@@ -473,7 +923,7 @@ elseif ($mode -eq 'CreateBranch') {
         Write-DevLog 'Branch was NOT created. Nothing in the working tree was modified.' 'ERROR'
     }
 }
-else {
+elseif ($mode -eq 'RunClaude') {
 
     # --- Stage 5 -- Claude preflight and headless execution ----------------
     Write-DevLog ("Stage 5/{0}  Claude preflight and headless execution" -f $totalStages) 'STEP'
@@ -628,6 +1078,7 @@ else {
 
 $verifyStage = 7
 if ($mode -eq 'CreateBranch') { $verifyStage = 6 }
+if ($mode -eq 'Finish')       { $verifyStage = 13 }
 
 Write-DevLog ("Stage {0}/{1}  Verifying data/strategy_sets/ is byte-identical" -f $verifyStage, $totalStages) 'STEP'
 $manifestAfter = New-DevDataSnapshot -DirectoryPath $strategySetsDir -RepoRoot $repoRoot -Label 'after'
@@ -666,7 +1117,8 @@ if ($mode -eq 'RunClaude') {
         -StdErrPath (Join-Path $runDir 'tests.stderr.txt') `
         -SandboxSqlitePath $sandbox.SqlitePath `
         -SandboxStrategySetsDir $sandbox.StrategySetsDir `
-        -TimeoutSeconds 1800
+        -TimeoutSeconds 1800 `
+        -TestCommand $testCommand
 
     Write-DevLog ("Command : {0}" -f $run.CommandLine)
     Write-DevLog ("Duration: {0}s   pytest exit code: {1}" -f $run.DurationSeconds, $run.ExitCode)
@@ -747,6 +1199,35 @@ elseif ($mode -eq 'CreateBranch') {
         $overallExit = $DevExitCodes.BranchFailed
     }
 }
+elseif ($mode -eq 'Finish') {
+    # -Finish decided its own outcome stage by stage, refusing at the first
+    # gate that failed, so there is nothing to re-derive here. The shared
+    # protected-data check above still takes precedence over all of it.
+    if ($finishExit -ne $DevExitCodes.Success) {
+        $overallExit = $finishExit
+        $overallResult = $finishResult
+    }
+    else {
+        $overallResult = 'PASS (tested, committed, pushed)'
+        if ($NoPush) {
+            $overallResult = 'PASS (tested and committed; not pushed by request)'
+        }
+        elseif ($NoPr) {
+            $overallResult = 'PASS (tested, committed and pushed; no PR by request)'
+        }
+        elseif ($prResult -and $prResult.Created) {
+            $overallResult = 'PASS (tested, committed, pushed, pull request opened)'
+        }
+        elseif ($ghExe -and -not $ghExe.Resolved) {
+            $overallResult = 'PASS (tested, committed, pushed; no gh, PR not created)'
+        }
+        elseif ($ghAuth -and -not $ghAuth.Authenticated) {
+            $overallResult = 'PASS (tested, committed, pushed; gh not authenticated, PR not created)'
+        }
+        [void]$resultNotes.Add('Merging is not automated and never will be by this harness -- review and merge the pull request yourself.')
+    }
+    foreach ($note in $finishNotes) { [void]$resultNotes.Add($note) }
+}
 else {
     # -RunClaude precedence, most severe first. Deliberately explicit rather
     # than collapsed into one boolean, so a failing run says WHY it failed.
@@ -802,6 +1283,9 @@ if ($mode -eq 'DryRun') {
 elseif ($mode -eq 'CreateBranch') {
     Add-ReportLine ("# Branch-creation report -- {0}" -f $TaskId)
 }
+elseif ($mode -eq 'Finish') {
+    Add-ReportLine ("# Finish report -- {0}" -f $TaskId)
+}
 else {
     Add-ReportLine ("# Claude task-execution report -- {0}" -f $TaskId)
 }
@@ -813,6 +1297,9 @@ if ($mode -eq 'DryRun') {
 }
 elseif ($mode -eq 'CreateBranch') {
     Add-ReportLine ("- Mode: ``-CreateBranch`` (preflight, then one guarded ``git switch -c``)")
+}
+elseif ($mode -eq 'Finish') {
+    Add-ReportLine ("- Mode: ``-Finish`` (re-verify, test, stage explicitly, commit, push, PR)")
 }
 else {
     Add-ReportLine ("- Mode: ``-RunClaude`` (headless Claude, file tools only, then tests)")
@@ -826,6 +1313,9 @@ if ($mode -eq 'DryRun') {
 }
 elseif ($mode -eq 'CreateBranch') {
     Add-ReportLine 'Not performed by this layer: Claude Code invocation, commit, push, PR creation, delta gate, test execution. No stash, clean, reset, restore or staging occurs on any path.'
+}
+elseif ($mode -eq 'Finish') {
+    Add-ReportLine 'Not performed by this layer: Claude Code invocation, retries, delta gate, merging, rebasing, and moving the task file to tasks/completed/. Staging used explicit pathspecs only -- never ``git add .``, ``-A`` or ``-u`` -- and no clean, stash, reset, restore, amend or force push occurs on any path.'
 }
 else {
     Add-ReportLine 'Not performed by this layer: commit, push, PR creation, retries, delta gate. Claude was granted file tools only -- no shell, no git execution, no web, no subagents. Nothing has been committed; review the diff yourself.'
@@ -900,6 +1390,9 @@ if ($mode -eq 'DryRun') {
 }
 elseif ($mode -eq 'CreateBranch') {
     Add-ReportLine 'Protected and declared-scratch paths are allowed to be dirty. DirtyTracked and UnknownUntracked paths refuse the branch.'
+}
+elseif ($mode -eq 'Finish') {
+    Add-ReportLine 'A dirty tree is expected here -- it is the reviewed diff being finished. The working-tree safety gate that -CreateBranch and -RunClaude apply is deliberately NOT applied; the allowed-path check below is what gates this mode instead.'
 }
 else {
     Add-ReportLine 'State BEFORE Claude ran. Protected and declared-scratch paths may be dirty; anything else refuses the run, so that changes afterwards are unambiguously attributable to Claude.'
@@ -1042,6 +1535,154 @@ elseif ($mode -eq 'CreateBranch') {
         Add-ReportLine ''
     }
 }
+elseif ($mode -eq 'Finish') {
+
+    Add-ReportLine '## Branch gate'
+    Add-ReportLine ''
+    Add-ReportLine ("- On the task branch: {0}" -f $branchGate.IsOnTaskBranch)
+    Add-ReportLine ("- HEAD branch: ``{0}``" -f $branchGate.CurrentBranch)
+    Add-ReportLine ("- Declared branch: ``{0}``" -f $branchGate.DeclaredBranch)
+    Add-ReportLine ("- Detached: {0}" -f $branchGate.IsDetached)
+    if (@($branchGate.Blockers).Count -gt 0) {
+        Add-ReportLine ''
+        foreach ($blocker in $branchGate.Blockers) { Add-ReportLine ("- {0}" -f $blocker) }
+    }
+    Add-ReportLine ''
+
+    Add-ReportLine '## Candidate paths'
+    Add-ReportLine ''
+    if ($candidates) {
+        Add-ReportLine 'Union of unstaged changes, untracked files and anything already staged, minus protected and declared-scratch paths. Everything below was scope-checked before a single file was staged.'
+        Add-ReportLine ''
+        Add-ReportLine ("- Candidates: {0}" -f @($candidates.CandidatePaths).Count)
+        Add-ReportLine ("- Excluded (protected): {0}" -f ((@($candidates.ExcludedProtected) | ForEach-Object { '`' + $_ + '`' }) -join ', '))
+        Add-ReportLine ("- Excluded (declared scratch): {0}" -f ((@($candidates.ExcludedScratch) | ForEach-Object { '`' + $_ + '`' }) -join ', '))
+        Add-ReportLine ("- Already staged before this run: {0}" -f @($candidates.StagedOnly).Count)
+        Add-ReportLine ''
+        foreach ($path in @($candidates.CandidatePaths)) { Add-ReportLine ("- ``{0}``" -f $path) }
+    }
+    else {
+        Add-ReportLine '_Not reached._'
+    }
+    Add-ReportLine ''
+
+    Add-ReportLine '## Allowed-path verification'
+    Add-ReportLine ''
+    if ($scopeCheck) {
+        Add-ReportLine ("- All candidate paths in scope: {0}" -f $scopeCheck.AllInScope)
+        Add-ReportLine ("- Permitted: {0}" -f ((@($scopeCheck.Permitted) | ForEach-Object { '`' + $_ + '`' }) -join ', '))
+        if (-not $scopeCheck.AllInScope) {
+            Add-ReportLine ''
+            Add-ReportLine 'Out-of-scope changes (nothing was staged):'
+            Add-ReportLine ''
+            foreach ($violation in @($scopeCheck.Violations)) { Add-ReportLine ("- ``{0}``" -f $violation) }
+        }
+    }
+    else {
+        Add-ReportLine '_Not reached._'
+    }
+    Add-ReportLine ''
+
+    Add-ReportLine '## Test summary'
+    Add-ReportLine ''
+    if ($run) {
+        Add-ReportLine ("- Declared test_command: ``{0}``" -f $testCommand)
+        Add-ReportLine ("- Parsed into: ``{0}``" -f $run.CommandLine)
+        Add-ReportLine ("- ``RBS_SQLITE_PATH`` -> ``{0}``" -f (ConvertTo-DevRelativePath -Path $sandbox.SqlitePath -RepoRoot $repoRoot))
+        Add-ReportLine ("- ``RBS_STRATEGY_SETS_DIR`` -> ``{0}``" -f (ConvertTo-DevRelativePath -Path $sandbox.StrategySetsDir -RepoRoot $repoRoot))
+        Add-ReportLine ("- pytest exit code: {0}" -f $run.ExitCode)
+        Add-ReportLine ("- Wall clock: {0}s" -f $run.DurationSeconds)
+        Add-ReportLine ("- pytest summary line: {0}" -f $run.PytestSummaryLine)
+        Add-ReportLine ''
+        if ($results -and $results.IsParsed) {
+            Add-ReportLine '| Total | Passed | Failed | Errors | Skipped |'
+            Add-ReportLine '| --- | --- | --- | --- | --- |'
+            Add-ReportLine ("| {0} | {1} | {2} | {3} | {4} |" -f $results.Total, $results.Passed, $results.Failed, $results.Errors, $results.Skipped)
+        }
+        elseif ($results) {
+            Add-ReportLine ("JUnit XML unusable: {0}" -f $results.ParseError)
+        }
+    }
+    else {
+        Add-ReportLine '_The test command was not reached._'
+    }
+    Add-ReportLine ''
+    if ($unexpectedFailures.Count -gt 0) {
+        Add-ReportLine 'Unexpected failures (nothing was staged, committed or pushed):'
+        Add-ReportLine ''
+        foreach ($nodeId in $unexpectedFailures) { Add-ReportLine ("- ``{0}``" -f $nodeId) }
+        Add-ReportLine ''
+    }
+
+    Add-ReportLine '## Commit'
+    Add-ReportLine ''
+    if ($addResult) {
+        Add-ReportLine ("- Staged with: ``{0}``" -f $addResult.Command)
+        Add-ReportLine '- Explicit pathspecs only. `git add .`, `git add -A` and `git add -u` are structurally unreachable in this harness.'
+    }
+    else {
+        Add-ReportLine '- Nothing was staged.'
+    }
+    if ($commitMessage) {
+        Add-ReportLine ("- Subject: {0}" -f $commitMessage.Subject)
+        Add-ReportLine ("- Co-Authored-By trailer: yes")
+        Add-ReportLine ("- Claude-Session trailer: {0}" -f $(if ($commitMessage.HasSessionId) { $commitMessage.ClaudeSessionId } else { 'omitted (no -RunClaude session recorded for this task; never invented)' }))
+    }
+    if ($commitResult) {
+        Add-ReportLine ("- Committed: {0}" -f $commitResult.Committed)
+        if ($commitResult.CommitSha) { Add-ReportLine ("- Commit: ``{0}``" -f $commitResult.CommitSha) }
+        if (-not $commitResult.Committed) {
+            Add-ReportLine ("- git exit code: {0}" -f $commitResult.ExitCode)
+        }
+    }
+    Add-ReportLine ''
+
+    Add-ReportLine '## Push'
+    Add-ReportLine ''
+    if ($NoPush) {
+        Add-ReportLine '- Skipped: `-NoPush` was supplied. The commit is local.'
+    }
+    elseif ($pushResult) {
+        Add-ReportLine ("- Command: ``{0}``" -f $pushResult.Command)
+        Add-ReportLine ("- Pushed: {0}" -f $pushResult.Pushed)
+        Add-ReportLine ("- Exit code: {0}   Timed out: {1}   Wall clock: {2}s" -f $pushResult.ExitCode, $pushResult.TimedOut, $pushResult.DurationSeconds)
+        Add-ReportLine '- No `--force`, no `--force-with-lease`, no refspec other than the branch name. A diverged remote fails the push rather than being resolved on your behalf.'
+    }
+    else {
+        Add-ReportLine '- Not reached.'
+    }
+    Add-ReportLine ''
+
+    Add-ReportLine '## Pull request'
+    Add-ReportLine ''
+    if ($NoPush -or $NoPr) {
+        Add-ReportLine '- Skipped by request.'
+    }
+    elseif ($prResult -and $prResult.Created) {
+        Add-ReportLine ("- Created: {0}" -f $prResult.Url)
+        Add-ReportLine ("- Base branch: ``{0}``" -f $prResult.BaseBranch)
+    }
+    elseif ($prResult) {
+        Add-ReportLine '- **PR creation FAILED. The commit and the push both SUCCEEDED.**'
+        Add-ReportLine ("- gh exit code: {0}   Timed out: {1}" -f $prResult.ExitCode, $prResult.TimedOut)
+        Add-ReportLine '- See `pr.stderr.txt`. Open the pull request yourself with the compare URL below.'
+    }
+    elseif ($ghExe -and -not $ghExe.Resolved) {
+        Add-ReportLine '- GitHub CLI (`gh`) is not installed. This is NOT a failure: commit and push succeeded.'
+    }
+    elseif ($ghAuth -and -not $ghAuth.Authenticated) {
+        Add-ReportLine '- `gh` is installed but not authenticated. This is NOT a failure: commit and push succeeded.'
+    }
+    else {
+        Add-ReportLine '- Not reached.'
+    }
+    if ($compareUrl) {
+        Add-ReportLine ("- Compare URL: {0}" -f $compareUrl)
+    }
+    Add-ReportLine ''
+    Add-ReportLine 'The harness never merges a pull request. Review and merge it yourself.'
+    Add-ReportLine ''
+}
 else {
 
     Add-ReportLine '## Claude execution'
@@ -1181,6 +1822,16 @@ if ($mode -eq 'DryRun') {
 elseif ($mode -eq 'CreateBranch') {
     $artifactNames = $artifactNames + @('worktree-safety.json', 'branch.json')
 }
+elseif ($mode -eq 'Finish') {
+    $artifactNames = $artifactNames + @(
+        'branch-gate.json', 'changes.json', 'candidates.json', 'scope-check.json',
+        'data-manifest.pre-commit.json', 'tests.finish.xml', 'tests.summary.json',
+        'tests.stdout.txt', 'tests.stderr.txt', 'commit-message.txt', 'commit.json',
+        'push.json', 'push.stdout.txt', 'push.stderr.txt', 'gh-exe.json',
+        'pr-body.md', 'pr.json', 'pr.stdout.txt', 'pr.stderr.txt',
+        'run-summary.json'
+    )
+}
 else {
     $artifactNames = $artifactNames + @(
         'worktree-safety.json', 'claude-exe.json', 'prompt.md',
@@ -1197,6 +1848,44 @@ Add-ReportLine ''
 
 # Machine-readable companion to report.md. Deliberately carries no
 # environment variables, tokens or credentials -- only run facts.
+if ($mode -eq 'Finish') {
+    Write-DevJsonFile -Path (Join-Path $runDir 'run-summary.json') -Depth 8 -InputObject ([pscustomobject]@{
+        TaskId             = $TaskId
+        Mode               = $mode
+        GeneratedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        RepositoryRoot     = $state.RepoRoot
+        Branch             = $state.CurrentBranch
+        DeclaredBranch     = [string]$spec.FrontMatter['branch']
+        OnTaskBranch       = $(if ($branchGate) { $branchGate.IsOnTaskBranch } else { $false })
+        TaskSpec           = $spec.RelativePath
+        TestCommand        = $testCommand
+        CandidatePaths     = $(if ($candidates) { @($candidates.CandidatePaths) } else { @() })
+        ExcludedProtected  = $(if ($candidates) { @($candidates.ExcludedProtected) } else { @() })
+        ExcludedScratch    = $(if ($candidates) { @($candidates.ExcludedScratch) } else { @() })
+        ScopeViolations    = $(if ($scopeCheck) { @($scopeCheck.Violations) } else { @() })
+        DataUnchanged      = $dataComparison.Unchanged
+        TestExitCode       = $(if ($run) { $run.ExitCode } else { $null })
+        TestTotal          = $(if ($results) { $results.Total } else { $null })
+        TestPassed         = $(if ($results) { $results.Passed } else { $null })
+        TestFailed         = $(if ($results) { $results.Failed } else { $null })
+        TestSkipped        = $(if ($results) { $results.Skipped } else { $null })
+        UnexpectedFailures = @($unexpectedFailures)
+        KnownFailures      = @($knownFailures)
+        StagedPaths        = $(if ($addResult) { @($addResult.StagedPaths) } else { @() })
+        Committed          = $(if ($commitResult) { $commitResult.Committed } else { $false })
+        CommitSha          = $(if ($commitResult) { $commitResult.CommitSha } else { $null })
+        ClaudeSessionId    = $claudeSessionId
+        Pushed             = $(if ($pushResult) { $pushResult.Pushed } else { $false })
+        PushSkipped        = [bool]$NoPush
+        GhResolved         = $(if ($ghExe) { $ghExe.Resolved } else { $false })
+        GhAuthenticated    = $(if ($ghAuth) { $ghAuth.Authenticated } else { $false })
+        PrCreated          = $(if ($prResult) { $prResult.Created } else { $false })
+        PrUrl              = $(if ($prResult) { $prResult.Url } else { $null })
+        CompareUrl         = $compareUrl
+        OverallResult      = $overallResult
+        ExitCode           = $overallExit
+    })
+}
 if ($mode -eq 'RunClaude') {
     Write-DevJsonFile -Path (Join-Path $runDir 'run-summary.json') -Depth 8 -InputObject ([pscustomobject]@{
         TaskId            = $TaskId
@@ -1241,6 +1930,7 @@ Write-DevLog ("Report written: {0}" -f (ConvertTo-DevRelativePath -Path $reportP
 $resultLabel = 'DRY RUN RESULT'
 if ($mode -eq 'CreateBranch') { $resultLabel = 'BRANCH RESULT' }
 if ($mode -eq 'RunClaude')    { $resultLabel = 'CLAUDE RUN RESULT' }
+if ($mode -eq 'Finish')       { $resultLabel = 'FINISH RESULT' }
 
 Write-Host ''
 if ($overallExit -eq $DevExitCodes.Success) {
