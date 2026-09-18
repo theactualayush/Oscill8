@@ -85,9 +85,36 @@ LSEG_APP_KEY = os.environ.get("RBS_LSEG_APP_KEY", "")
 # market still routed to LSEG (core.providers.PROVIDER_ROUTING) -- these
 # settings are only consulted when core.quanthub.download_history() is
 # actually called.
+#
+# BACKEND MIGRATION (QuantHub retired its old /api/ backend): the OHLC
+# endpoint moved from /api/v2/ohlc/ to /apis/ohlc/. The old path now
+# returns HTTP 403 for every instrument, at every interval and count --
+# it is retired, not rate-limited and not an entitlement problem.
+#
+# QUANTHUB_BASE_URL deliberately remains ONE COMPLETE ENDPOINT URL, not a
+# host/root that paths are joined onto. Oscill8 calls exactly one
+# QuantHub endpoint (/apis/ohlc/, from core.quanthub._fetch_quanthub_
+# records) and acquires its token manually through QuantHub's own web
+# auth page rather than through /apis/auth/, so there is no second path
+# to derive and no reason to change the configuration contract. Revisit
+# only if Oscill8 ever calls a second QuantHub endpoint itself.
+#
+# OPERATOR ACTION REQUIRED: this default only applies when
+# RBS_QUANTHUB_BASE_URL is unset. An existing .env that pins the old
+# /api/v2/ohlc/ URL SHADOWS this value and will keep calling the retired
+# backend -- core.quanthub logs a warning at import when it sees one.
+# Either update that variable to the new endpoint or remove it entirely
+# and let this default apply.
 QUANTHUB_BASE_URL = os.environ.get(
-    "RBS_QUANTHUB_BASE_URL", "https://qh-api.corp.hertshtengroup.com/api/v2/ohlc/"
+    "RBS_QUANTHUB_BASE_URL", "https://qh-api.corp.hertshtengroup.com/apis/ohlc/"
 )
+
+# The manually-obtained QuantHub access token. The operator signs in
+# through QuantHub's own web auth page (/apis/auth/) and pastes the
+# resulting access_token here; Oscill8 performs NO token acquisition,
+# refresh, or Microsoft sign-in of its own -- it only sends whatever
+# this variable holds as `Authorization: Bearer <token>` (see
+# core.quanthub._auth_headers).
 QUANTHUB_TOKEN = os.environ.get("RBS_QUANTHUB_TOKEN", "")
 
 

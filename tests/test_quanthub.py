@@ -3,15 +3,19 @@ tests/test_quanthub.py
 
 Unit tests for core/quanthub.py: QH instrument construction (namespace
 independence from LSEG RICs), response normalization, batching, count
-estimation, 4H resampling, credential handling, and error propagation
+estimation, 4H resampling, credential handling, error propagation
 (an HTTP 500 must NOT be classified as MarketDataUnavailableError --
-that classification is LSEG-specific, see core/downloader.py).
+that classification is LSEG-specific, see core/downloader.py), and --
+added with the /api/v2/ohlc/ -> /apis/ohlc/ backend migration -- the
+OUTGOING REQUEST URL itself.
 
 requests.get is mocked throughout -- no live QuantHub network access.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -22,6 +26,11 @@ import requests
 from core import config, quanthub
 from core.config import BarInterval
 from core.downloader import MarketDataUnavailableError
+
+# The migrated QuantHub OHLC endpoint. QuantHub retired the old /api/
+# backend; the old path now returns HTTP 403 for every request.
+MIGRATED_OHLC_URL = "https://qh-api.corp.hertshtengroup.com/apis/ohlc/"
+RETIRED_OHLC_URL = "https://qh-api.corp.hertshtengroup.com/api/v2/ohlc/"
 
 
 # ---------------------------------------------------------------------
@@ -172,6 +181,140 @@ def _mock_response(mocker, *, json_body=None, status_code=200, raise_exc=None):
 @pytest.fixture(autouse=True)
 def _quanthub_token(monkeypatch):
     monkeypatch.setattr(config, "QUANTHUB_TOKEN", "test-token")
+
+
+@pytest.fixture(autouse=True)
+def _quanthub_endpoint(monkeypatch):
+    """Pin the migrated endpoint for every test in this module.
+
+    core.config reads RBS_QUANTHUB_BASE_URL at IMPORT time, so a
+    developer machine that still exports the retired URL would otherwise
+    make the outgoing-URL assertions below depend on local environment
+    rather than on the code. Pinning it here keeps every request-shape
+    test deterministic; that the SHIPPED DEFAULT is itself migrated is
+    proven separately, and independently of the environment, by
+    test_config_default_endpoint_is_the_migrated_apis_path below.
+    """
+    monkeypatch.setattr(config, "QUANTHUB_BASE_URL", MIGRATED_OHLC_URL)
+
+
+# ---------------------------------------------------------------------
+# Backend migration: /api/v2/ohlc/ -> /apis/ohlc/
+#
+# The outgoing URL is passed POSITIONALLY to requests.get, so it lands in
+# call_args.args[0]. Every pre-existing test in this file read only
+# call_args kwargs (headers/params) and therefore could not have caught
+# an endpoint regression -- that gap is what these tests close.
+# ---------------------------------------------------------------------
+
+def test_fetch_records_posts_to_the_migrated_apis_ohlc_url(mocker):
+    mock_get = _mock_response(mocker, json_body=[])
+    quanthub._fetch_quanthub_records(["SONU28"], "1H", 5)
+
+    args, _kwargs = mock_get.call_args
+    assert args[0] == MIGRATED_OHLC_URL
+
+
+def test_fetch_records_never_uses_the_retired_api_v2_url(mocker):
+    """Regression guard for the retired backend. The old path returns
+    HTTP 403 for every instrument, at every interval and count."""
+    mock_get = _mock_response(mocker, json_body=[])
+    quanthub._fetch_quanthub_records(["SONU28"], "1H", 5)
+
+    requested_url = mock_get.call_args.args[0]
+    assert requested_url != RETIRED_OHLC_URL
+    assert quanthub.RETIRED_QUANTHUB_OHLC_PATH not in requested_url
+    assert "/apis/ohlc/" in requested_url
+
+
+def test_request_url_comes_from_config_never_hardcoded_in_the_client(mocker):
+    """The client must send whatever core.config resolved, so an
+    operator override (RBS_QUANTHUB_BASE_URL) still works and a future
+    endpoint change stays a one-line config change."""
+    monkeypatched_url = "https://example.invalid/apis/ohlc/"
+    mocker.patch.object(config, "QUANTHUB_BASE_URL", monkeypatched_url)
+    mock_get = _mock_response(mocker, json_body=[])
+
+    quanthub._fetch_quanthub_records(["SONU28"], "1H", 5)
+
+    assert mock_get.call_args.args[0] == monkeypatched_url
+
+
+def test_every_batched_request_uses_the_migrated_url(mocker):
+    """The URL is per-request, so a multi-chunk download must use the
+    migrated endpoint on EVERY chunk, not just the first."""
+    mock_get = _mock_response(mocker, json_body=[])
+    instruments = [f"SON{m}26" for m in "FGHJKMNQUVXZ"] + ["SONF27"]  # 13 -> 2 chunks
+
+    quanthub.download_history_batch(instruments, "DAILY", "2026-01-01", "2026-01-10")
+
+    assert mock_get.call_count == 2
+    assert [c.args[0] for c in mock_get.call_args_list] == [MIGRATED_OHLC_URL] * 2
+
+
+def test_config_default_endpoint_is_the_migrated_apis_path(monkeypatch, tmp_path):
+    """The SHIPPED default in core/config.py -- not whatever this
+    machine's environment happens to hold.
+
+    core.config reads RBS_QUANTHUB_BASE_URL once at import, so the
+    already-imported module cannot answer this question on a machine
+    that sets the variable. A fresh, throwaway copy of the same source
+    file is executed with the variable cleared instead; core/config.py
+    imports nothing from core, so loading it standalone is safe and
+    leaves the real core.config untouched.
+    """
+    monkeypatch.delenv("RBS_QUANTHUB_BASE_URL", raising=False)
+
+    spec = importlib.util.spec_from_file_location("_fresh_core_config", config.__file__)
+    fresh = importlib.util.module_from_spec(spec)
+    # config.py declares dataclasses under `from __future__ import
+    # annotations`, and dataclasses resolves those annotations via
+    # sys.modules[cls.__module__] -- so the throwaway copy has to be
+    # registered while it executes. Removed again immediately; the real
+    # core.config is never touched.
+    sys.modules[spec.name] = fresh
+    try:
+        spec.loader.exec_module(fresh)
+        default_url = fresh.QUANTHUB_BASE_URL
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    assert default_url == MIGRATED_OHLC_URL
+    assert quanthub.RETIRED_QUANTHUB_OHLC_PATH not in default_url
+    # The real, already-imported module is unaffected by this probe.
+    assert config.__name__ == "core.config"
+
+
+def test_retired_endpoint_constant_is_recognition_only(monkeypatch, caplog):
+    """RETIRED_QUANTHUB_OHLC_PATH exists to RECOGNISE a stale configured
+    URL and warn, never to build a request and never to rewrite the
+    operator's own setting."""
+    monkeypatch.setattr(config, "QUANTHUB_BASE_URL", RETIRED_OHLC_URL)
+    with caplog.at_level("WARNING", logger="core.quanthub"):
+        quanthub._warn_if_retired_endpoint_configured()
+
+    assert any("RETIRED" in r.message for r in caplog.records)
+    # The warning is advisory only -- the configured value is left alone.
+    assert config.QUANTHUB_BASE_URL == RETIRED_OHLC_URL
+
+
+def test_no_warning_when_the_migrated_endpoint_is_configured(caplog):
+    with caplog.at_level("WARNING", logger="core.quanthub"):
+        quanthub._warn_if_retired_endpoint_configured()
+    assert not [r for r in caplog.records if "RETIRED" in r.message]
+
+
+def test_auth_header_is_unchanged_by_the_migration(mocker):
+    """The new backend uses the same Authorization: Bearer <token>
+    scheme, with the token still supplied manually via
+    RBS_QUANTHUB_TOKEN. Oscill8 performs NO token acquisition, refresh,
+    or Microsoft sign-in -- there is no auth client to assert about."""
+    mock_get = _mock_response(mocker, json_body=[])
+    quanthub._fetch_quanthub_records(["SONU28"], "1H", 5)
+
+    _args, kwargs = mock_get.call_args
+    assert kwargs["headers"] == {"Authorization": "Bearer test-token"}
+    assert not hasattr(quanthub, "fetch_access_token")
 
 
 def test_fetch_records_handles_bare_list_response(mocker):

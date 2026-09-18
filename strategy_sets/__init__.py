@@ -70,6 +70,7 @@ deployment.
 
 from strategy_sets.composite import (
     CompositeCombination,
+    CompositeCombinationName,
     CompositeResolutionError,
     SourceStrategy,
     composite_labels_by_definition_id,
@@ -115,6 +116,7 @@ __all__ = [
     "StrategySetRepository",
     "expand_strategy_set",
     "CompositeCombination",
+    "CompositeCombinationName",
     "CompositeResolutionError",
     "SourceStrategy",
     "compose_definition",

@@ -39,6 +39,7 @@ import pytest
 
 from core import config
 from core.config import BarInterval
+from core.ric import parse_ric
 
 from strategy_engine.combinations import StrategyInstance
 from strategy_engine.definitions import StrategyDefinition
@@ -768,6 +769,61 @@ def test_expand_combinations_matches_expand_strategy_set(repo):
     assert [i.rics for i in expand_combinations(combinations, _START, _END)] == [
         i.rics for i in expand_strategy_set(composite, _START, _END, repository=repo)
     ]
+
+
+def test_label_values_are_plain_composite_name_strings(repo):
+    """The label map's values are CompositeCombinationName, a `str`
+    subclass -- every existing consumer (ScanCandidateResult.label,
+    results_to_dataframe()'s label column, log lines, equality checks)
+    keeps seeing exactly the "A - B" string it always did."""
+    combinations = resolve_composite_combinations(_composite(), repo)
+    labels = composite_labels_by_definition_id(combinations)
+
+    for combination in combinations:
+        label = labels[id(combination.definition)]
+        assert isinstance(label, str)
+        assert label == combination.name
+        assert f"{label}" == combination.name
+
+
+def test_label_values_carry_each_side_name_and_leg_count(repo):
+    """The structured provenance a presentation layer needs to render
+    "<A first contract> <A name> - <B first contract> <B name>": the
+    A/B names as separate fields (never re-split out of the string) and
+    Group A's leg count, which is where a combination's rics split."""
+    combinations = resolve_composite_combinations(_composite(), repo)
+    labels = composite_labels_by_definition_id(combinations)
+
+    for combination in combinations:
+        label = labels[id(combination.definition)]
+        assert label.name_a == combination.group_a.entry_name
+        assert label.name_b == combination.group_b.entry_name
+        assert label.leg_count_a == len(definition_legs(combination.group_a.definition))
+        assert label.leg_count_b == len(definition_legs(combination.group_b.definition))
+        # Every leg of the composed definition belongs to exactly one
+        # side, so the two counts account for the whole leg list -- and
+        # therefore for the whole `rics` tuple of every rolled instance.
+        assert label.leg_count_a + label.leg_count_b == len(combination.definition.legs)
+
+
+def test_label_leg_count_splits_a_rolled_instance_rics_by_side(repo):
+    """rics[0] is Group A's first contract and rics[leg_count_a] is
+    Group B's -- the invariant ui.formatting.format_strategy_label()
+    relies on, proven against really-rolled instances rather than
+    assumed."""
+    combinations = resolve_composite_combinations(_composite(), repo)
+    labels = composite_labels_by_definition_id(combinations)
+
+    for combination in combinations:
+        label = labels[id(combination.definition)]
+        a_markets = [leg.market_key for leg in definition_legs(combination.group_a.definition)]
+        b_markets = [leg.market_key for leg in definition_legs(combination.group_b.definition)]
+        for instance in generate_intermarket_instances(combination.definition, _START, _END):
+            assert len(instance.rics) == label.leg_count_a + label.leg_count_b
+            a_rics = instance.rics[: label.leg_count_a]
+            b_rics = instance.rics[label.leg_count_a :]
+            assert [parse_ric(r).market_key for r in a_rics] == a_markets
+            assert [parse_ric(r).market_key for r in b_rics] == b_markets
 
 
 def test_labels_pair_with_the_resolution_they_came_from(repo):

@@ -144,6 +144,60 @@ logger = get_logger(__name__)
 COMBINATION_NAME_SEPARATOR = " - "
 
 
+class CompositeCombinationName(str):
+    """A composite combination's "<Group A entry> - <Group B entry>"
+    name that ALSO carries the structured A/B provenance a presentation
+    layer needs to render a per-instance label.
+
+    It IS a `str` (subclass), and its string value is byte-for-byte the
+    same "A - B" name CompositeCombination.name already carried, so
+    every existing consumer -- ScanCandidateResult.label's `str | None`
+    type hint, results_to_dataframe()'s `label` column, equality
+    comparisons in tests, logging, ui.formatting.fmt_label() -- is
+    completely unaffected. Nothing downstream has to know this subclass
+    exists.
+
+    Why the extra attributes exist: a composite's DISPLAY label (see
+    ui.formatting.format_strategy_label) is "<first contract of A>
+    <name A> - <first contract of B> <name B>", and the two contracts
+    are INSTANCE-level facts (they differ for every rolled candidate),
+    while the names are DEFINITION-level. The one fact that bridges
+    them is `leg_count_a`: compose_definition() lays a combination's
+    legs out as Group A's legs followed by Group B's negated legs, and
+    strategy_engine.intermarket_combinations.generate_intermarket_
+    instances() builds `rics` positionally from that same leg tuple --
+    so `rics[0]` is A's first contract and `rics[leg_count_a]` is B's.
+    That split point is not recoverable from the composed
+    IntermarketDefinition alone (a negated weight is indistinguishable
+    from a legitimately negative one), which is exactly why it is
+    carried here rather than re-derived, guessed, or parsed back out of
+    the name string.
+
+    Purely descriptive display metadata, exactly like `label` itself:
+    never used for pricing, provider resolution, cache keys, dedup, bp
+    conversion, or strategy identity.
+    """
+
+    name_a: str
+    name_b: str
+    leg_count_a: int
+    leg_count_b: int
+
+    def __new__(
+        cls,
+        name_a: str,
+        name_b: str,
+        leg_count_a: int,
+        leg_count_b: int,
+    ) -> "CompositeCombinationName":
+        obj = super().__new__(cls, f"{name_a}{COMBINATION_NAME_SEPARATOR}{name_b}")
+        obj.name_a = name_a
+        obj.name_b = name_b
+        obj.leg_count_a = leg_count_a
+        obj.leg_count_b = leg_count_b
+        return obj
+
+
 class CompositeResolutionError(ValueError):
     """A composite StrategySet's `groups` configuration cannot be
     resolved against the saved Strategy Sets it references.
@@ -721,6 +775,15 @@ def composite_labels_by_definition_id(
     labels_by_definition_id=...) so each generated candidate carries its
     "Group A - Group B" name into ScanCandidateResult.label.
 
+    Each value is a CompositeCombinationName -- a `str` whose string
+    value IS `combination.name`, unchanged, carrying the structured A/B
+    provenance (each side's own entry name and leg count) alongside it
+    so a presentation layer can render a per-instance label without
+    re-resolving anything or parsing the name back apart. See that
+    class's own docstring; nothing downstream needs to know about it,
+    since it compares, formats, and stores exactly as the plain string
+    always did.
+
     Safe for the same reason that mechanism already works for grid rows
     and Strategy Set entries: generate_intermarket_instances() stores
     the definition object it was given BY REFERENCE on every instance it
@@ -736,11 +799,20 @@ def composite_labels_by_definition_id(
     path: a caller that wants labels drives resolve -> expand_
     combinations -> run_scan_on_instances itself.)
     """
-    return {id(combination.definition): combination.name for combination in combinations}
+    return {
+        id(combination.definition): CompositeCombinationName(
+            name_a=combination.group_a.entry_name,
+            name_b=combination.group_b.entry_name,
+            leg_count_a=len(definition_legs(combination.group_a.definition)),
+            leg_count_b=len(definition_legs(combination.group_b.definition)),
+        )
+        for combination in combinations
+    }
 
 
 __all__ = [
     "COMBINATION_NAME_SEPARATOR",
+    "CompositeCombinationName",
     "CompositeResolutionError",
     "SourceStrategy",
     "CompositeCombination",

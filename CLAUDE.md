@@ -1256,9 +1256,69 @@ regardless of which provider ends up serving the data) AND an entry in
 `core.providers._MARKET_KEY_TO_QH_PRODUCT` before it can be routed to
 QuantHub at all.
 
+### Endpoint and authentication (post-migration)
+
+Oscill8 calls exactly ONE QuantHub endpoint, and there is exactly one
+`requests.*` call site for it in the whole codebase
+(`core.quanthub._fetch_quanthub_records`):
+
+```
+GET https://qh-api.corp.hertshtengroup.com/apis/ohlc/
+```
+
+**Backend migration (`/api/v2/ohlc/` → `/apis/ohlc/`).** QuantHub
+retired its old `/api/` backend. The old path now returns HTTP 403
+Forbidden for every instrument, at every interval and count —
+reproduced against `CRAM28`, `CRAU28` and `SONU28`, all of which had
+previously returned real data through this same code path (the SQLite
+cache still holds their bars). That is what identified the cause as a
+retired endpoint rather than an instrument entitlement, a rate limit, or
+an Oscill8 defect. **Only the URL changed**: request shape
+(`instruments=`/`interval=`/`count=`), Bearer header, response record
+shape, batching, count estimation, interval mapping, normalization,
+dedup and the retry policy are all untouched, and the new endpoint was
+verified by hand to return the same `{product, time (unix ms), open,
+high, low, close, volume}` records.
+
+**Authentication is MANUAL and must stay that way.** The new backend
+documents a `/apis/auth/` endpoint, but **Oscill8 never calls it** and
+has no auth client, no Microsoft sign-in, no token acquisition and no
+refresh. The operator signs in through QuantHub's own web auth page,
+copies the resulting `access_token` into `RBS_QUANTHUB_TOKEN`, and
+`core.quanthub._auth_headers()` sends it verbatim as `Authorization:
+Bearer <token>` — exactly as before the migration. Do not add an auth
+client without an explicit instruction to.
+
+**Configuration contract, and the trap in it.**
+`core.config.QUANTHUB_BASE_URL` is deliberately ONE COMPLETE ENDPOINT
+URL, not a host root with paths joined onto it — Oscill8 calls a single
+endpoint and never calls `/apis/auth/` itself, so there is no second
+path to derive. It is overridable via `RBS_QUANTHUB_BASE_URL`, and **an
+existing `.env` that still pins `/api/v2/ohlc/` SHADOWS the migrated
+default entirely** — the app keeps calling the retired backend and keeps
+getting 403, with nothing to distinguish that from a credential
+problem. `core.quanthub._warn_if_retired_endpoint_configured()` logs one
+warning at import when it sees such a URL. It deliberately only WARNS:
+it never rewrites the operator's own setting, since silently
+"correcting" configuration would hide the problem rather than surface
+it. `core.quanthub.RETIRED_QUANTHUB_OHLC_PATH` exists solely for that
+recognition and must never be used to build a request.
+
 ### QuantHub's confirmed API limitation — why the cache matters
 
-**Live-tested and confirmed, not assumed.** QuantHub's `/api/v2/ohlc/`
+**Live-tested and confirmed, not assumed — BUT against the RETIRED
+`/api/v2/ohlc/` backend, and carried over unverified.** The new
+`/apis/ohlc/` Swagger documents `start`, `end`, `extraFields` and
+`hg_instrument_ids` parameters, which directly contradicts the
+"only three parameters have any effect" finding below. Whether they are
+now genuinely honoured has NOT been tested and must not be assumed
+either way; if `start`/`end` really work, they would remove the
+cold-start reach ceiling described here entirely. Until someone
+establishes that with real evidence, the client keeps sending only the
+three parameters it has evidence for — which is the request shape the
+new endpoint was verified to accept. The original findings, verbatim:
+
+QuantHub's OHLC
 endpoint is NOT a generic historical-database API. It does not accept
 `start=`/`end=` (returns HTTP 500), `from=`/`to=` (HTTP 200 but silently
 ignored — byte-identical response with or without it), or `offset=`/
@@ -1640,6 +1700,13 @@ after `ui/app.py`'s existing `sys.path` bootstrap and before any
 `load_dotenv()` must run first). No other file changed — `core.config`/
 `core.quanthub` already read `RBS_*` via plain `os.environ.get()`;
 they simply needed the environment populated before their first import.
+
+The two QuantHub `RBS_*` settings are `RBS_QUANTHUB_TOKEN` (the
+manually-obtained access token) and `RBS_QUANTHUB_BASE_URL` (optional
+full-endpoint override, defaulting to the migrated `/apis/ohlc/` URL) —
+see "Endpoint and authentication (post-migration)" above, including why
+an override left over from before the migration silently breaks every
+QuantHub request. Never commit a real token value.
 
 ---
 
@@ -2086,6 +2153,133 @@ the next time the composite is opened or scanned.
 
 ---
 
+# Development Harness (`dev.ps1`)
+
+Task-driven development is automated by a PowerShell harness at the
+repository root. It is not part of the application and nothing under
+`core/`, `database/`, `strategy_engine/`, `strategy_sets/`,
+`template_scanner/`, `range_analytics/`, `ui/` or `strategy_import/`
+imports it — but a session modifying the harness, or working through a
+task file, needs the rules below.
+
+```
+dev.ps1                       entry point, mode dispatch, stages, report
+scripts/_Common.ps1            exit codes, the READ-ONLY git gateway, task-spec parsing
+scripts/Test-RepoState.ps1      preflight + dirty-path classification
+scripts/Protect-DevData.ps1      data/ SHA-256 snapshots + the .dev test sandbox
+scripts/Invoke-Oscill8Tests.ps1   sandboxed pytest runner + test_command parser
+scripts/New-TaskBranch.ps1         branch creation (one mutating git call)
+scripts/Invoke-ClaudeTask.ps1       headless Claude launch, diff/scope inspection
+scripts/Complete-DevTask.ps1         commit / push / PR (three mutating git calls)
+tasks/TEMPLATE.md, tasks/active/, tasks/completed/
+tests/test_dev_harness_finish.py, tests/harness_ps.py
+```
+
+## Four modes, four separate invocations
+
+```
+.\dev.ps1 TASK-003 -DryRun        read-only observation; mutates nothing
+.\dev.ps1 TASK-003 -CreateBranch  preflight, then one guarded `git switch -c`
+.\dev.ps1 TASK-003 -RunClaude     Claude implements (file tools only), then tests
+      >>> A HUMAN REVIEWS THE DIFF HERE <<<
+.\dev.ps1 TASK-003 -Finish        re-verify, test, stage, commit, push, open a PR
+```
+
+The split is the design, not an unfinished state: **nothing chains the
+modes and no flag does.** Claude implements; the harness validates,
+tests, commits and pushes; the human reviews and merges. A future
+one-command workflow is explicitly out of scope — do not add one without
+being asked.
+
+## `-Finish` (TASK-002)
+
+Runs after the human review. It trusts nothing from the earlier run: it
+re-reads the spec, re-inspects the working tree, re-checks scope, and
+re-runs the tests. Gates, in order, each mapped to its own exit code —
+and **every one of them runs before the first mutating call**:
+
+| Gate | Exit |
+|---|---|
+| HEAD on the declared branch, not `main`/`master`, not detached | 10 |
+| At least one candidate path (an empty commit is never created) | 10 |
+| Every candidate path inside `allowed_paths` | 80 |
+| The declared `test_command` produced a usable result | 40 |
+| ...and reported no unexpected failures | 60 |
+| `data/strategy_sets/` byte-identical (verified before AND after) | 70 |
+| Staging and committing succeeded | 90 |
+| `git push -u origin <branch>` succeeded | 100 |
+| `gh`, IF present and authenticated, opened the PR | 110 |
+
+Key design points a future session needs:
+
+- **Candidate paths = `ChangedPaths` ∪ `StagedTracked`, minus protected
+  and scratch.** The union is load-bearing: `Get-DevWorkingTreeChanges`
+  omits already-staged paths, so without it a pre-staged file would be
+  committed having never passed the `allowed_paths` check.
+- **The working-tree safety gate is deliberately NOT applied.**
+  `-CreateBranch`/`-RunClaude` refuse a dirty tree; `-Finish` requires
+  one — it is the reviewed diff. The scope check is what gates this mode
+  instead.
+- **`Claude-Session` trailer is discovered, never invented.** Read from
+  the newest `.dev/runs/<TaskId>/*/run-summary.json` whose `Mode` is
+  `RunClaude`. No such run → the trailer is OMITTED. `Co-Authored-By`
+  always appears (`$DevCommitCoAuthor` in `_Common.ps1`).
+- **`gh` is optional.** Missing or signed out → a normal, SUCCESSFUL
+  finish with `PrCreated = false` and an origin-derived compare URL.
+  Only present-and-authenticated-and-then-failing is 110, and the report
+  states that commit and push both succeeded. **Nothing ever merges.**
+- **`test_command` is authoritative but PARSED, never executed**
+  (`ConvertTo-DevPytestArgs`): it must start with `pytest`,
+  `python -m pytest` or `py -m pytest`; shell metacharacters and a
+  caller-supplied `--junitxml` are refused. It applies to `-DryRun`,
+  `-RunClaude` and `-Finish` alike. There is no shell anywhere in the
+  harness and none may be added.
+- **`$DevKnownBaselineFailures` is empty and should stay that way**
+  unless a genuinely environment-specific failure reappears. A stale
+  entry silently downgrades a real regression on that node id.
+
+## Invariants a future session must not break
+
+1. **`Invoke-DevGit` stays read-only.** Its subcommand allow-list and
+   denied-token list must not be widened or weakened. Every mutating git
+   operation instead gets its OWN function that bypasses the gateway,
+   builds a fixed argument vector internally, and re-validates its own
+   inputs. There are exactly four:
+   `git switch -c` (`New-TaskBranch.ps1`), and `git add -- <paths>`,
+   `git commit -F <file>`, `git push -u origin <branch>`
+   (`Complete-DevTask.ps1`).
+2. **Staging is explicit.** `git add .`, `-A`, `-u` and wildcard
+   pathspecs are structurally unreachable; `Test-DevStageablePath`
+   re-validates every path independently of the scope check.
+3. **`data/` and `test_qh.py` are untouchable** — never staged,
+   modified, cleaned or committed. `data/strategy_sets/` is hashed
+   before and after every run.
+4. **Claude gets file tools only** (`Read, Edit, Write, Glob, Grep`) —
+   no shell, no git, no web, no subagents. It never runs the tests and
+   has no tool that could commit.
+5. **No `clean`, `stash`, `reset`, `restore`, `checkout -- <path>`,
+   `amend`, `rebase`, `merge`, `cherry-pick`, `--force`, or history
+   rewriting** exists anywhere in the harness, and none may be added.
+6. **Existing exit codes are a stable contract** — append, never
+   renumber (0/1/10/20/30/40/50/60/70/80, plus 90/100/110).
+7. **Windows PowerShell 5.1**: no `&&`/`||`, no ternary, no `??`, no
+   `ConvertFrom-Json -AsHashtable`. Quote every path — the repository
+   lives under a OneDrive path containing spaces.
+8. Harness artifacts live under `.dev/` (gitignored) and never enter a
+   commit.
+
+Harness coverage is `tests/test_dev_harness_finish.py`, which drives the
+PowerShell functions against throwaway repositories under `tmp_path`
+with a local bare `origin` and a stubbed `gh` — never the real working
+tree, never the network.
+
+**Not implemented, deliberately:** chaining the modes, retries/resume
+loops, automatic merge or rebase, test-delta gating between runs, and
+moving task files into `tasks/completed/` (which stays a manual,
+explicit step).
+
+---
+
 # LSEG
 
 The application currently uses the LSEG Data Library through an
@@ -2207,12 +2401,17 @@ Module 10 — Composite Strategy Sets (Group A × Group B: groups model/
 persistence, composition, structural-zero filtering, execution
 integration, and the authoring UI) — STATUS: COMPLETE
 
+Development harness (not an application module) — dev.ps1's four modes,
+including the TASK-002 `-Finish` commit/push/PR layer — STATUS: COMPLETE
+(see the Development Harness section above)
+
 Current suite: re-run `pytest -q tests/` for the up-to-date count, do
 not trust any number written here blindly — see README.md's Testing
-section. As of this documentation pass: 1589 passed, 2 skipped
+section. As of this documentation pass: 1657 passed, 2 skipped
 (`tests/test_ui_keyboard_browser.py` — no playwright installed;
 `tests/test_quanthub_live_smoke.py` — `RBS_QUANTHUB_TOKEN` not set) —
-1591 total. (An earlier pass recorded a `datetime64[us]` vs
+1659 total (includes 68 development-harness tests, see the Development
+Harness section above). (An earlier pass recorded a `datetime64[us]` vs
 `datetime64[ns]` pandas-version failure in
 `tests/test_cache.py::test_read_bars_output_matches_downloader_
 canonical_schema`; it does not reproduce in the current environment.

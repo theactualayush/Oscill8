@@ -626,3 +626,75 @@
   being retroactively backfilled for that older gap, to avoid
   fabricating version numbers or dates for work this pass did not
   itself trace commit-by-commit.
+
+---
+
+## v0.19.0
+
+### Changed
+- **QuantHub backend migration: `/api/v2/ohlc/` → `/apis/ohlc/`.**
+  QuantHub retired its old `/api/` backend; the previous path now
+  returns **HTTP 403 Forbidden** for every instrument, at every interval
+  and count. Reproduced against `CRAM28`, `CRAU28` and `SONU28` — all
+  three had previously returned real data through this same code path
+  (their bars are still in the SQLite cache), which is what identified
+  the cause as a retired endpoint rather than an instrument entitlement,
+  a rate limit, or an Oscill8 defect.
+  `core.config.QUANTHUB_BASE_URL`'s default is now the migrated URL.
+- **Only the URL changed.** The request shape
+  (`instruments=`/`interval=`/`count=`), the `Authorization: Bearer`
+  header, the response record shape
+  (`{product, time (unix ms), open, high, low, close, volume}`),
+  `QUANTHUB_BATCH_SIZE`, `QUANTHUB_MAX_ROWS_PER_REQUEST`, count
+  estimation, interval mapping, normalization, dedup, 4H resampling and
+  the retry/429 policy are all **unchanged**. Public signatures
+  (`build_instrument`, `download_history`, `download_history_batch`) are
+  unchanged, the provider-layer boundary is unchanged, and no module
+  above it was touched. The SQLite cache is **not** reset or migrated —
+  cache identity is keyed on the LSEG RIC and provider, neither of which
+  changed.
+
+### Added
+- `core.quanthub.RETIRED_QUANTHUB_OHLC_PATH` and
+  `_warn_if_retired_endpoint_configured()`: one warning logged at import
+  when `RBS_QUANTHUB_BASE_URL` still pins the retired backend. That
+  override **shadows the migrated default**, so an un-updated `.env`
+  would otherwise keep calling the dead endpoint and keep returning 403
+  with nothing to distinguish it from a credential failure. The check
+  only warns — it never rewrites the operator's own setting, and the
+  constant is never used to build a request.
+- **Outgoing-request-URL test coverage**, closing a real pre-existing
+  gap: every previous test in `tests/test_quanthub.py` read only
+  `call_args` *kwargs* (headers/params), while the URL is passed
+  *positionally*, so no test could have caught an endpoint regression.
+  New tests assert the migrated URL is used, that the retired
+  `/api/v2/ohlc/` path is not, that every chunk of a multi-request batch
+  uses it, that the URL comes from config rather than being hardcoded,
+  and that the **shipped default** in `core/config.py` is migrated
+  independently of whatever the local environment sets.
+- `tests/test_quanthub_live_smoke.py` gained the request verified by
+  hand against the new backend (`SONU28` / `1H` / `count=5`), asserting
+  the record shape that proves normalization needed no change. Both live
+  tests still self-skip without `RBS_QUANTHUB_TOKEN`, and now also skip
+  (rather than fail with a misleading 403) when the configured endpoint
+  is still the retired one. No token value is ever read or printed.
+
+### Documentation
+- README.md gained a "QuantHub endpoint and authentication" section;
+  CLAUDE.md gained "Endpoint and authentication (post-migration)". Both
+  document the new endpoint, the two `RBS_QUANTHUB_*` settings, and the
+  upgrade trap of a stale `RBS_QUANTHUB_BASE_URL`.
+- **Authentication remains MANUAL.** The new backend documents a
+  `/apis/auth/` endpoint, but Oscill8 never calls it: the operator signs
+  in through QuantHub's own web auth page and pastes the resulting
+  `access_token` into `RBS_QUANTHUB_TOKEN`. There is no auth client, no
+  Microsoft sign-in, no token acquisition and no refresh in the
+  codebase, and none was added.
+- The documented "only `instruments=`/`interval=`/`count=` have any
+  effect" finding is now explicitly marked as **established against the
+  retired backend and carried over unverified** — the new Swagger
+  documents `start`, `end`, `extraFields` and `hg_instrument_ids`, which
+  contradicts it. Untested either way; the client still sends only the
+  three parameters it has evidence for. Evaluating the new parameters
+  (and the Swagger's larger instrument limit) is deliberately left as a
+  separate task, as is any rate-limit/`X-RateLimit-Reset` retry work.
