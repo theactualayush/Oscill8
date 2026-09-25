@@ -453,12 +453,14 @@ def test_nested_composite_source_produces_a_readable_error(repo):
 
 
 def test_incompatible_price_field_produces_a_readable_error(repo):
+    # A DIFFERENT market on the Group B side, so the pair really is
+    # formed by market-pair-first pairing and reaches compose_definition().
     repo.save(
         StrategySet(
             name="High Field",
             entries=(
                 StrategySetEntry(
-                    name="SR3 Fly High", definition=_fly("SOFR", price_field="High")
+                    name="CRA Fly High", definition=_fly("CORRA", price_field="High")
                 ),
             ),
         )
@@ -466,7 +468,7 @@ def test_incompatible_price_field_produces_a_readable_error(repo):
     repo.save(
         StrategySet(
             name="Combos", entries=(),
-            groups=_groups(a=("SR3 Fly",), b=("SR3 Fly High",), b_source="High Field"),
+            groups=_groups(a=("SR3 Fly",), b=("CRA Fly High",), b_source="High Field"),
         )
     )
     at = _app()

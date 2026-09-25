@@ -2120,9 +2120,12 @@ five phases: groups model/persistence, composition, structural-zero
 filtering, execution integration, and the authoring UI.
 
 Lets ONE Strategy Set describe a PAIRING of two other, already-saved
-Strategy Sets: every selected Group A strategy against every selected
-Group B strategy, each pair priced as "Group A strategy − Group B
-strategy". Additive throughout — `strategy_engine/`, `range_analytics/`,
+Strategy Sets, each pair priced as "Group A strategy − Group B
+strategy". Pairing is MARKET-PAIR-FIRST (see the pairing bullet below,
+a later change to this module's original strategy-level product): the
+two groups' unique markets are paired first, and each surviving market
+pair then expands into the full Cartesian product of the strategies
+belonging to those two markets. Additive throughout — `strategy_engine/`, `range_analytics/`,
 `core/`, `database/`, and `strategy_import/` are completely untouched
 by it, and `template_scanner/` gained no composite awareness at all
 (its own "the scanner never imports `strategy_sets`" design-principle
@@ -2155,6 +2158,7 @@ ui/
 
 tests/
     test_strategy_sets_groups.py, test_strategy_sets_composite.py,
+    test_strategy_sets_composite_market_pairing.py,
     test_strategy_sets_composite_structural_zero.py,
     test_composite_execution.py,
     test_composite_strategy_set_end_to_end.py,
@@ -2201,10 +2205,37 @@ Key design points a future session needs:
   9's rule that a cross-market series' bp convention is never guessed
   from one leg (`range_analytics` then leaves the bp-denominated
   metrics NaN rather than aborting the scan).
-- **Unordered-pair dedup.** If both (X, Y) and (Y, X) occur in the
-  product, only the FIRST generated survives, keeping its own real A/B
-  orientation — the canonical key is used for detection only, never to
-  reorder or rename what survives.
+- **Pairing is MARKET-PAIR-FIRST, not strategy-level.**
+  `composite.market_pair_first_pairs()` is the top-level pairing rule;
+  the old strategy-level product survives beneath it as
+  `cartesian_pairs()`, applied once per surviving market pair. A
+  strategy's MARKET IDENTITY is the distinct market keys of its legs,
+  in first-appearance order (`composite.strategy_markets()`, derived
+  from the existing `definition_legs()`) — a `StrategyDefinition`
+  yields a 1-tuple, and a Module 9 `IntermarketDefinition` yields every
+  market its legs touch, never a reduced/"primary" one (the same rule
+  `_resolve_bp_per_point()` and `resolve_display_market_key()` already
+  follow for a cross-market definition). Three rules, in order:
+  (1) a market identity is NEVER paired with an equal one, so
+  "SOFR → SOFR" is never formed at all — the point of a composite is
+  a CROSS-market relationship; (2) reverse market pairs are
+  deduplicated by `market_pair_identity()` — "SOFR → CORRA" and
+  "CORRA → SOFR" are one unordered relationship, and the survivor keeps
+  the real Group A → Group B orientation the trader configured, never
+  an alphabetical one; (3) WITHIN a surviving market pair, every Group
+  A strategy meets every Group B strategy — a genuine Cartesian
+  product, never a positional/zip match (3 SOFR strategies × 2 CORRA
+  strategies is 6 combinations). Market order and strategy order are
+  both the trader's own selection order, by first appearance; nothing
+  is sorted anywhere.
+- **Unordered-pair dedup (strategy level).** Inside one market pair, if
+  both (X, Y) and (Y, X) occur, only the FIRST generated survives,
+  keeping its own real A/B orientation — the canonical key is used for
+  detection only, never to reorder or rename what survives. Scoping it
+  per market pair is equivalent to scoping it globally: a strategy's
+  shape determines its markets, so a reverse strategy pair always lands
+  in the reverse market pair, which rule (1) or (2) above already
+  removed.
 - **Structural-zero filtering.** After composition and BEFORE any
   instance generation, provider call, cache prewarm, history build, or
   analytics, a combination whose per-`(market_key, offset)` aggregated

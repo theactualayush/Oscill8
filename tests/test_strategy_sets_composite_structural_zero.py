@@ -80,6 +80,12 @@ def _spread(market_key: str) -> StrategyDefinition:
     )
 
 
+def _outright(market_key: str) -> StrategyDefinition:
+    return StrategyDefinition(
+        market_key=market_key, offsets=(0,), weights=(1.0,), interval=BarInterval.DAILY,
+    )
+
+
 def _intermarket(legs, bp_per_point=None) -> IntermarketDefinition:
     return IntermarketDefinition(
         legs=tuple(LegSpec(market_key=m, offset=o, weight=w) for m, o, w in legs),
@@ -336,6 +342,43 @@ def repo(tmp_path) -> StrategySetRepository:
             ),
         )
     )
+    # Structural-zero filtering applies to the COMPOSED definition and is
+    # independent of pairing, so the pair it drops has to be one that
+    # market-pair-first pairing really forms -- i.e. genuinely
+    # cross-market. "Net SOFR/CORRA" is a hand-authored Module 9 entry
+    # whose two SOFR legs already cancel, leaving one CORRA leg; minus
+    # the CORRA outright below, EVERY (market, offset) aggregate is zero.
+    repository.save(
+        StrategySet(
+            name="Cancelling",
+            entries=(StrategySetEntry(name="SON Fly", definition=_fly("SONIA")),),
+            intermarket_entries=(
+                IntermarketStrategySetEntry(
+                    name="Net SOFR/CORRA",
+                    definition=_intermarket(
+                        (("SOFR", 0, 1.0), ("SOFR", 0, -1.0), ("CORRA", 0, 1.0))
+                    ),
+                ),
+            ),
+        )
+    )
+    repository.save(
+        StrategySet(
+            name="CORRA Outrights",
+            entries=(StrategySetEntry(name="CRA Outright", definition=_outright("CORRA")),),
+        )
+    )
+    # Two entries with an IDENTICAL shape, for the strategy-level dedup
+    # that still runs inside a single market pair.
+    repository.save(
+        StrategySet(
+            name="Dupes",
+            entries=(
+                StrategySetEntry(name="Fly One", definition=_fly("SOFR")),
+                StrategySetEntry(name="Fly Two", definition=_fly("SOFR")),
+            ),
+        )
+    )
     return repository
 
 
@@ -356,29 +399,50 @@ def _names(combinations) -> list[str]:
 
 # --- (L) same strategy on both sides ------------------------------------
 
-def test_same_strategy_on_both_sides_is_generated_then_dropped(repo):
+def test_same_strategy_on_both_sides_is_never_paired(repo):
+    """A strategy against itself is the canonical structurally-zero
+    composition -- but it is now removed one step EARLIER, by pairing:
+    both sides are the same market, and market-pair-first pairing never
+    pairs a market with itself. compose_definition() is unchanged and
+    still produces the full negated shape when called directly."""
     composite = _composite(("SR3 Fly",), ("SR3 Fly",))
-    # The selection itself is never rejected -- composition still happens
-    # and still produces the full negated shape...
     composed = compose_definition(
         _source(_fly("SOFR"), "STIR Flys", "SR3 Fly"),
         _source(_fly("SOFR"), "Other Flys", "SR3 Fly"),
     )
     assert composed.weights == (1.0, -2.0, 1.0, -1.0, 2.0, -1.0)
-    # ... it is simply not returned.
+    assert is_structurally_zero(composed)
+    # ... but no such combination is ever produced.
     assert resolve_composite_combinations(composite, repo) == []
 
 
 def test_structurally_zero_pairs_are_dropped_from_a_larger_product(repo):
-    composite = _composite(("SR3 Fly", "SON Fly", "SR3 Spread"), ("SR3 Fly", "CRA Fly"))
+    # Both market pairs are genuinely cross-market and are really formed:
+    #   {SOFR, CORRA} -> {CORRA}   composes to all-zero aggregates
+    #   {SONIA}       -> {CORRA}   is an ordinary surviving combination
+    composite = _composite(
+        ("Net SOFR/CORRA", "SON Fly"), ("CRA Outright",),
+        a_source="Cancelling", b_source="CORRA Outrights",
+    )
     assert _names(resolve_composite_combinations(composite, repo)) == [
-        # "SR3 Fly - SR3 Fly" dropped
-        "SR3 Fly - CRA Fly",
-        "SON Fly - SR3 Fly",
-        "SON Fly - CRA Fly",
-        "SR3 Spread - SR3 Fly",
-        "SR3 Spread - CRA Fly",
+        # "Net SOFR/CORRA - CRA Outright" dropped (structurally zero)
+        "SON Fly - CRA Outright",
     ]
+
+
+def test_a_dropped_pair_really_was_formed_and_composed(repo):
+    """The drop above is a filter on the COMPOSED definition, not an
+    artefact of pairing: the same two source strategies compose to a
+    real, all-zero definition when composed directly."""
+    composed = compose_definition(
+        _source(
+            _intermarket((("SOFR", 0, 1.0), ("SOFR", 0, -1.0), ("CORRA", 0, 1.0))),
+            "Cancelling", "Net SOFR/CORRA",
+        ),
+        _source(_outright("CORRA"), "CORRA Outrights", "CRA Outright"),
+    )
+    assert aggregate_leg_weights(composed) == {("SOFR", 0): 0.0, ("CORRA", 0): 0.0}
+    assert is_structurally_zero(composed)
 
 
 # --- (K) Group selection order preserved among survivors ----------------
@@ -403,14 +467,15 @@ def test_surviving_names_are_never_sorted_alphabetically(repo):
 
 # --- (J) reverse-direction dedup unchanged ------------------------------
 
-def test_reverse_direction_dedup_still_applies_among_survivors(repo):
+def test_reverse_market_pair_dedup_still_applies_among_survivors(repo):
+    # A = [SOFR, CORRA], B = [CORRA, SOFR]: the market product reaches
+    # SOFR -> CORRA first, so CORRA -> SOFR (its reverse) is dropped,
+    # and the survivor keeps its Group-A-first orientation.
     composite = _composite(
-        ("SR3 Fly", "SR3 Spread"), ("SR3 Fly",), a_source="STIR Flys", b_source="STIR Flys"
+        ("SR3 Fly", "CRA Fly"), ("CRA Fly", "SR3 Fly"),
+        a_source="Other Flys", b_source="Other Flys",
     )
-    names = _names(resolve_composite_combinations(composite, repo))
-    # (SR3 Fly, SR3 Fly) is structurally zero -> dropped.
-    # (SR3 Spread, SR3 Fly) survives, in its Group-A-first orientation.
-    assert names == ["SR3 Spread - SR3 Fly"]
+    assert _names(resolve_composite_combinations(composite, repo)) == ["SR3 Fly - CRA Fly"]
 
 
 def test_orientation_of_survivors_is_still_group_a_then_group_b(repo):
@@ -432,19 +497,22 @@ def test_filtering_is_deterministic_across_repeated_resolution(repo):
     assert [c.definition.legs for c in first] == [c.definition.legs for c in second]
 
 
-def test_both_self_pairs_drop_and_the_cross_pair_survives_once(repo):
-    # A = B = [SR3 Fly, SR3 Spread]: (Fly, Fly) and (Spread, Spread) are
-    # structurally zero; (Fly, Spread) survives and (Spread, Fly) is its
-    # reverse-direction duplicate.
-    composite = _composite(("SR3 Fly", "SR3 Spread"), ("SR3 Fly", "SR3 Spread"),
-                           a_source="STIR Flys", b_source="STIR Flys")
-    assert _names(resolve_composite_combinations(composite, repo)) == [
-        "SR3 Fly - SR3 Spread"
-    ]
+def test_strategy_level_dedup_still_applies_inside_one_market_pair(repo):
+    # "Fly One" and "Fly Two" are byte-identical SOFR flys, so both land
+    # in the SAME market group and produce the SAME unordered strategy
+    # pair against "CRA Fly" -- cartesian_pairs() keeps the first only.
+    composite = _composite(
+        ("Fly One", "Fly Two"), ("CRA Fly",),
+        a_source="Dupes", b_source="Other Flys",
+    )
+    assert _names(resolve_composite_combinations(composite, repo)) == ["Fly One - CRA Fly"]
 
 
 def test_a_wholly_structurally_zero_product_resolves_to_no_combinations(repo):
-    composite = _composite(("SR3 Fly",), ("SR3 Fly",))
+    composite = _composite(
+        ("Net SOFR/CORRA",), ("CRA Outright",),
+        a_source="Cancelling", b_source="CORRA Outrights",
+    )
     assert resolve_composite_combinations(composite, repo) == []
 
 
@@ -457,21 +525,26 @@ def test_a_structurally_zero_pair_never_reaches_instance_generation(repo, mocker
     # Spy on the name as composite.py resolves it -- expand_combinations()
     # calls it through this module's own namespace.
     spy = mocker.spy(composite_module, "generate_intermarket_instances")
-    composite = _composite(("SR3 Fly",), ("SR3 Fly", "CRA Fly"))
+    composite = _composite(
+        ("Net SOFR/CORRA", "SON Fly"), ("CRA Outright",),
+        a_source="Cancelling", b_source="CORRA Outrights",
+    )
     instances = expand_strategy_set(composite, _START, _END, repository=repo)
 
-    # Exactly one definition was rolled -- the surviving cross-market one.
+    # Exactly one definition was rolled -- the surviving combination.
+    # The structurally-zero one was formed and composed, then dropped
+    # before any calendar rolling happened.
     assert spy.call_count == 1
     rolled_definition = spy.call_args_list[0].args[0]
-    assert rolled_definition.market_keys == ("SOFR",) * 3 + ("CORRA",) * 3
+    assert rolled_definition.market_keys == ("SONIA",) * 3 + ("CORRA",)
     assert not is_structurally_zero(rolled_definition)
     assert instances
 
 
 def test_a_structurally_zero_pair_reaches_no_provider_or_cache_work(repo, mocker):
     """End of the same boundary: the dropped pair's legs are never
-    fetched. SONIA appears ONLY in the structurally-zero pair here, so
-    if any SONIA RIC is requested the pair leaked downstream."""
+    fetched. SOFR appears ONLY in the structurally-zero pair here, so
+    if any SOFR RIC is requested the pair leaked downstream."""
     from template_scanner.scanner import run_scan_on_instances
 
     dates = pd.date_range("2026-02-02", periods=20, freq="B")
@@ -490,8 +563,12 @@ def test_a_structurally_zero_pair_reaches_no_provider_or_cache_work(repo, mocker
     fetch = mocker.patch("strategy_engine.pricing.get_history_batch", side_effect=_batch)
     lazy = mocker.patch("strategy_engine.pricing.get_history")
 
-    # The ONLY pair in this product is structurally zero.
-    zero_only = _composite(("SR3 Fly",), ("SR3 Fly",))
+    # The ONLY pair in this product is formed, composed, and then
+    # dropped as structurally zero.
+    zero_only = _composite(
+        ("Net SOFR/CORRA",), ("CRA Outright",),
+        a_source="Cancelling", b_source="CORRA Outrights",
+    )
     instances = expand_strategy_set(zero_only, _START, _END, repository=repo)
     assert instances == []
     run_scan_on_instances(instances, "2026-02-02", "2026-02-27", lookbacks=(5,))
@@ -515,7 +592,8 @@ def test_end_to_end_composite_expansion_excludes_structurally_zero(repo):
 
     market_shapes = {i.definition.market_keys for i in instances}
     # The three surviving combinations, and nothing SOFR-only (which is
-    # the only shape "SR3 Fly - SR3 Fly" could have produced).
+    # the only shape the never-formed SOFR -> SOFR pair could have
+    # produced).
     assert market_shapes == {
         ("SOFR",) * 3 + ("CORRA",) * 3,   # SR3 Fly - CRA Fly
         ("SONIA",) * 3 + ("SOFR",) * 3,   # SON Fly - SR3 Fly

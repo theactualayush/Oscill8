@@ -162,8 +162,9 @@ def _names(combinations) -> list[str]:
 # ---------------------------------------------------------------------
 
 def test_group_a_times_group_b_produces_the_cartesian_product(repo):
-    # Four pairs are formed; "SR3 Fly - SR3 Fly" is structurally zero
-    # and dropped (Phase 3), leaving three.
+    # Markets: A = [SOFR, SONIA], B = [SOFR, CORRA]. SOFR -> SOFR is
+    # same-market and never formed, leaving SOFR -> CORRA, SONIA ->
+    # SOFR and SONIA -> CORRA, each with one strategy per side.
     combinations = resolve_composite_combinations(_composite(), repo)
     assert _names(combinations) == [
         "SR3 Fly - CRA Fly",
@@ -175,9 +176,10 @@ def test_group_a_times_group_b_produces_the_cartesian_product(repo):
 def test_group_a_selection_order_is_respected(repo):
     reversed_a = _composite(a_selected=("SON Fly", "SR3 Fly"))
     assert _names(resolve_composite_combinations(reversed_a, repo)) == [
+        # Group A's market order is now SONIA first, then SOFR.
         "SON Fly - SR3 Fly",
         "SON Fly - CRA Fly",
-        # "SR3 Fly - SR3 Fly" dropped here (structurally zero)
+        # SOFR -> SOFR is same-market and never formed.
         "SR3 Fly - CRA Fly",
     ]
 
@@ -185,8 +187,9 @@ def test_group_a_selection_order_is_respected(repo):
 def test_group_b_selection_order_is_respected(repo):
     reversed_b = _composite(b_selected=("CRA Fly", "SR3 Fly"))
     assert _names(resolve_composite_combinations(reversed_b, repo)) == [
+        # Group B's market order is now CORRA first, then SOFR.
         "SR3 Fly - CRA Fly",
-        # "SR3 Fly - SR3 Fly" dropped here (structurally zero)
+        # SOFR -> SOFR is same-market and never formed.
         "SON Fly - CRA Fly",
         "SON Fly - SR3 Fly",
     ]
@@ -227,10 +230,11 @@ def test_resolution_is_deterministic_across_repeated_calls(repo):
 
 def test_same_strategy_on_both_sides_is_allowed_at_the_pairing_layer(repo):
     # Selecting one strategy on BOTH sides is legitimate and is never
-    # rejected as a selection error -- the pair is formed, composed, and
-    # only then recognized as structurally zero and dropped (Phase 3).
-    # compose_definition() itself is unchanged: it still produces the
-    # full negated-B shape, which is what makes the cancellation exact.
+    # rejected as a selection error -- it simply yields nothing, because
+    # both sides are the same market and market-pair-first pairing never
+    # pairs a market with itself. compose_definition() itself is
+    # unchanged and still produces the full negated-B shape when called
+    # directly, which is what would make the cancellation exact.
     a = SourceStrategy("STIR Flys", "SR3 Fly", _fly("SOFR"))
     b = SourceStrategy("Other Flys", "SR3 Fly", _fly("SOFR"))
     assert compose_definition(a, b).weights == (1.0, -2.0, 1.0, -1.0, 2.0, -1.0)
@@ -242,10 +246,9 @@ def test_same_strategy_on_both_sides_is_allowed_at_the_pairing_layer(repo):
 
 
 def test_same_strategy_pair_is_generated_only_once(repo):
-    # "SR3 Fly" appears in BOTH selections on each side -- the (SR3, SR3)
-    # pair can be reached twice, is formed once, and is then dropped as
-    # structurally zero. Using a spread on one side keeps a survivor so
-    # this asserts the dedup, not just the drop.
+    # "SR3 Fly" (SOFR) is selected on both sides -- a same-market pair,
+    # never formed -- while the cross-market SOFR -> CORRA relationship
+    # still produces its one combination.
     combinations = resolve_composite_combinations(
         _composite(
             a_source="STIR Flys", a_selected=("SR3 Fly",),
@@ -257,15 +260,17 @@ def test_same_strategy_pair_is_generated_only_once(repo):
 
 
 def test_reverse_direction_duplicate_is_removed(repo):
-    # A = [SR3, CRA], B = [CRA, SR3] -- the product contains both
-    # (SR3, CRA) and (CRA, SR3), which are the SAME unordered pair.
+    # A = [SR3 (SOFR), CRA (CORRA)], B = [CRA (CORRA), SR3 (SOFR)] --
+    # the market product contains both SOFR -> CORRA and CORRA -> SOFR,
+    # which are the SAME unordered market relationship.
     composite = _composite(
         a_source="Other Flys", a_selected=("SR3 Fly", "CRA Fly"),
         b_source="Other Flys", b_selected=("CRA Fly", "SR3 Fly"),
     )
     combinations = resolve_composite_combinations(composite, repo)
-    # (SR3, SR3) and (CRA, CRA) are formed but structurally zero, so the
-    # single cross pair is all that survives -- in its first-generated
+    # SOFR -> SOFR and CORRA -> CORRA are same-market and never formed,
+    # and CORRA -> SOFR is the reverse of SOFR -> CORRA, so the single
+    # cross pair is all that survives -- in its first-generated
     # orientation.
     assert _names(combinations) == ["SR3 Fly - CRA Fly"]
     # (CRA Fly, SR3 Fly) was dropped as the reverse of the first pair.
@@ -312,7 +317,7 @@ def test_same_source_set_used_for_both_groups_works(repo):
         b_source="STIR Flys", b_selected=("SON Fly", "CORRA Fly"),
     )
     combinations = resolve_composite_combinations(composite, repo)
-    # "SON Fly - SON Fly" cancels and is dropped (Phase 3).
+    # SONIA -> SONIA is same-market and never formed.
     assert _names(combinations) == [
         "SR3 Fly - SON Fly",
         "SR3 Fly - CORRA Fly",
@@ -322,11 +327,13 @@ def test_same_source_set_used_for_both_groups_works(repo):
 
 def test_identically_named_strategies_with_different_shapes_do_not_collapse(repo):
     # "STIR Flys / SR3 Fly" is a SOFR fly; "Divergent / SR3 Fly" is a
-    # SOFR *spread* -- same name, genuinely different strategy.
+    # CORRA *spread* -- same name, genuinely different strategy. The
+    # shapes are what identity is built from, never the shared name:
+    assert strategy_identity(_fly("SOFR")) != strategy_identity(_spread("SOFR"))
     repo.save(
         StrategySet(
             name="Divergent",
-            entries=(StrategySetEntry(name="SR3 Fly", definition=_spread("SOFR")),),
+            entries=(StrategySetEntry(name="SR3 Fly", definition=_spread("CORRA")),),
         )
     )
     composite = _composite(
@@ -342,6 +349,7 @@ def test_identically_named_strategies_with_different_shapes_do_not_collapse(repo
     # self-cancelling strategy.
     assert len(combination.definition.legs) == 5
     assert combination.definition.weights == (1.0, -2.0, 1.0, -1.0, 1.0)
+    assert combination.definition.market_keys == ("SOFR", "SOFR", "SOFR", "CORRA", "CORRA")
 
 
 def test_identically_shaped_strategies_in_different_sets_are_the_same_strategy(repo):
@@ -356,8 +364,9 @@ def test_identically_shaped_strategies_in_different_sets_are_the_same_strategy(r
         b_source="Other Flys", b_selected=("SR3 Fly",),
     )
     combinations = resolve_composite_combinations(composite, repo)
-    # ("STIR Flys/SR3 Fly", "Other Flys/SR3 Fly") is the same shape on
-    # both sides, so it cancels and is dropped (Phase 3).
+    # ("STIR Flys/SR3 Fly", "Other Flys/SR3 Fly") is the same shape --
+    # and therefore the same market -- on both sides, so it is never
+    # paired at all.
     assert _names(combinations) == ["SON Fly - SR3 Fly"]
     assert strategy_identity(_fly("SOFR")) == strategy_identity(_fly("SOFR"))
     assert strategy_identity(_fly("SOFR")) != strategy_identity(_fly("SONIA"))
@@ -419,25 +428,39 @@ def test_definition_legs_flattens_both_definition_shapes():
     assert definition_legs(entry.definition) == entry.definition.legs
 
 
-def test_same_market_composite_resolves_bp_per_point(repo):
-    # A SOFR fly minus a SOFR spread: every leg is SOFR, so the bp
-    # convention is unambiguous -- and enough exposure remains that it
-    # is not structurally zero.
+def test_compose_definition_still_resolves_bp_per_point_for_one_market():
+    # compose_definition() is unchanged by market-pair-first pairing: a
+    # SOFR fly minus a SOFR spread is every-leg-SOFR, so the bp
+    # convention is unambiguous and is still resolved. Composition is
+    # tested DIRECTLY here because resolve_composite_combinations() no
+    # longer produces a same-market combination at all (see
+    # test_same_market_pairs_are_never_formed) -- the rule moved to
+    # pairing, not to composition.
+    combination = compose_definition(
+        SourceStrategy("STIR Flys", "SR3 Fly", _fly("SOFR")),
+        SourceStrategy("Spreads", "SR3 Spread", _spread("SOFR")),
+    )
+    assert combination.market_keys == ("SOFR",) * 5
+    assert combination.bp_per_point == config.get_market("SOFR").bp_per_point
+
+
+def test_same_market_pairs_are_never_formed(repo):
+    # The consequence of the rule above, stated directly: a SOFR fly and
+    # a SOFR spread are a legitimate, non-cancelling pair, but they are
+    # the SAME market, so no combination is produced.
     repo.save(
         StrategySet(
             name="Spreads",
             entries=(StrategySetEntry(name="SR3 Spread", definition=_spread("SOFR")),),
         )
     )
-    combination = resolve_composite_combinations(
+    assert resolve_composite_combinations(
         _composite(
             a_source="STIR Flys", a_selected=("SR3 Fly",),
             b_source="Spreads", b_selected=("SR3 Spread",),
         ),
         repo,
-    )[0]
-    assert combination.definition.market_keys == ("SOFR",) * 5
-    assert combination.definition.bp_per_point == config.get_market("SOFR").bp_per_point
+    ) == []
 
 
 def test_cross_market_composite_leaves_bp_per_point_unset(repo):
@@ -448,19 +471,22 @@ def test_cross_market_composite_leaves_bp_per_point_unset(repo):
 
 
 def test_mismatched_interval_is_rejected_clearly(repo):
+    # Group B is a DIFFERENT market from Group A, so the pair really is
+    # formed and reaches compose_definition() -- which is where the
+    # one-interval rule lives, unchanged.
     repo.save(
         StrategySet(
             name="Hourly",
             entries=(
                 StrategySetEntry(
-                    name="SR3 Fly H", definition=_fly("SOFR", interval=BarInterval.HOURLY)
+                    name="CRA Fly H", definition=_fly("CORRA", interval=BarInterval.HOURLY)
                 ),
             ),
         )
     )
     composite = _composite(
         a_source="STIR Flys", a_selected=("SR3 Fly",),
-        b_source="Hourly", b_selected=("SR3 Fly H",),
+        b_source="Hourly", b_selected=("CRA Fly H",),
     )
     with pytest.raises(CompositeResolutionError, match="one interval"):
         resolve_composite_combinations(composite, repo)
@@ -472,14 +498,14 @@ def test_mismatched_price_field_is_rejected_clearly(repo):
             name="HighField",
             entries=(
                 StrategySetEntry(
-                    name="SR3 Fly High", definition=_fly("SOFR", price_field="High")
+                    name="CRA Fly High", definition=_fly("CORRA", price_field="High")
                 ),
             ),
         )
     )
     composite = _composite(
         a_source="STIR Flys", a_selected=("SR3 Fly",),
-        b_source="HighField", b_selected=("SR3 Fly High",),
+        b_source="HighField", b_selected=("CRA Fly High",),
     )
     with pytest.raises(CompositeResolutionError, match="one price field"):
         resolve_composite_combinations(composite, repo)

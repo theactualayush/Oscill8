@@ -5,10 +5,11 @@ Phases 2 and 3 of the composite ("Group A x Group B") Strategy Set
 design: the COMPOSITION layer that turns a Phase 1 StrategyGroupPair
 configuration (strategy_sets/model.py) into concrete strategy_engine.
 IntermarketDefinition objects -- one per surviving A/B source-strategy
-pair. "Surviving" means two things here: the pair survived the
-unordered-pair deduplication in cartesian_pairs() (Phase 2), and the
-definition it composed to is not structurally zero (Phase 3, see the
-STRUCTURAL ZERO section below).
+pair. "Surviving" means two things here: the pair was formed by the
+MARKET-PAIR-FIRST pairing rule in market_pair_first_pairs() (Phase 2,
+see the PAIRING section below), and the definition it composed to is
+not structurally zero (Phase 3, see the STRUCTURAL ZERO section
+below).
 
 This module deliberately contains NO curve generation, NO calendar
 arithmetic, NO RIC construction, and NO instance-level deduplication.
@@ -33,12 +34,28 @@ NEGATED weight. That is exactly what IntermarketDefinition already
 models (an arbitrary flat tuple of LegSpec, each carrying its own
 market_key/offset/weight), so no new definition type, no nesting, and
 no second expansion engine is introduced. Subtraction -- not addition
--- is what makes "SR3 Fly - SR3 Fly" resolve to a structurally
+-- is what makes a cancelling pair resolve to a structurally
 all-zero series, which is exactly what is_structurally_zero() detects
 and resolve_composite_combinations() drops (see the STRUCTURAL ZERO
-section below, and the same-pair note on cartesian_pairs(), which
-deliberately still FORMS such a pair -- the filtering happens one
-level up).
+section below). The most obvious such pair, a strategy against itself,
+can no longer even be formed: both sides would be the same market, and
+the PAIRING section below never pairs a market with itself.
+
+PAIRING IS MARKET-PAIR-FIRST, NOT STRATEGY-LEVEL (Phase 2): the top
+level of the product is the two groups' unique MARKETS, not their
+individual strategies. market_pair_first_pairs() below pairs each
+unique market in Group A with each unique market in Group B, skipping
+same-market pairs entirely and keeping only one direction of each
+unordered market relationship; only then does it expand the full
+Cartesian product of the strategies belonging to those two markets.
+A composite Strategy Set exists to express CROSS-market relationships,
+so "SOFR -> SOFR" is never formed at all, while "3 SOFR strategies
+against 2 CORRA strategies" is still the full 6 combinations. The old
+strategy-level product lives on as the lower-level helper
+cartesian_pairs(), applied once per surviving market pair. See
+market_pair_first_pairs()' own docstring for the three rules, the
+ordering guarantees, and how a multi-market Module 9 source strategy
+participates.
 
 WHY A FLAT LEG LIST IS SUFFICIENT, INCLUDING FOR INTERMARKET SOURCES:
 a source strategy may be either an ordinary StrategySetEntry (a
@@ -396,7 +413,8 @@ def pair_identity(group_a: SourceStrategy, group_b: SourceStrategy) -> tuple:
     generated. It never reaches a user, never reorders a combination's
     legs, and never rewrites its Group-A-first display name -- the
     surviving combination keeps whatever real A/B orientation it was
-    generated with (see cartesian_pairs()).
+    generated with (see cartesian_pairs()). The market-level
+    equivalent of this same distinction is market_pair_identity().
 
     Ordering uses repr() of each side's own strategy_identity() purely
     as a stable total order over two arbitrary identity tuples; the
@@ -578,11 +596,19 @@ def cartesian_pairs(
     group_a_strategies: list[SourceStrategy],
     group_b_strategies: list[SourceStrategy],
 ) -> list[tuple[SourceStrategy, SourceStrategy]]:
-    """The Group A x Group B Cartesian product, in Group-A-then-Group-B
-    selection order, with reverse-direction duplicates removed.
+    """The strategy-level Cartesian product of two strategy lists, in
+    Group-A-then-Group-B selection order, with reverse-direction
+    duplicates removed.
 
-    Iteration order is Group A's selection order in the OUTER loop and
-    Group B's selection order in the INNER loop, so the product reads
+    This is the LOWER-LEVEL helper, not the top-level pairing rule.
+    market_pair_first_pairs() below is what resolve_composite_
+    combinations() actually calls; it applies this function once per
+    surviving MARKET pair, over just that market pair's own members.
+    Called directly with two whole groups it still computes the plain
+    strategy-level product, which is what its own focused tests do.
+
+    Iteration order is the first list's order in the OUTER loop and the
+    second list's order in the INNER loop, so the product reads
     naturally as "every Group B strategy against Group A's first
     strategy, then against its second, ...". No alphabetical sorting is
     applied at any point.
@@ -592,16 +618,13 @@ def cartesian_pairs(
     generated survives, keeping its own real A/B orientation. The
     canonical key is never used to reorder or rename what survives.
 
-    A strategy paired with ITSELF (X, X) is a legitimate combination and
-    is returned (once). It is not an error, and it is deliberately NOT
-    filtered out here even though "A - A" composes to a structurally
-    all-zero series: this function's job is pairing, and structural-zero
-    filtering is resolve_composite_combinations()' job, applied to the
-    COMPOSED definition one level up (see is_structurally_zero()). That
-    split is intentional -- the pair must be formed and composed before
-    it can be tested, and it still consumes its slot in the unordered-
-    pair dedup above, so forming it is what stops the reverse (X, X)
-    from being reconsidered later.
+    A strategy paired with ITSELF (X, X) is still returned by THIS
+    function (once). It is not an error here: this function's job is
+    the product, and both of the rules that remove such a pair live one
+    level up -- market_pair_first_pairs() never forms a same-market
+    pair at all (so (X, X) cannot reach here through the live path),
+    and resolve_composite_combinations() drops any composed definition
+    that turns out to be structurally zero (see is_structurally_zero()).
     """
     seen: set[tuple] = set()
     pairs: list[tuple[SourceStrategy, SourceStrategy]] = []
@@ -612,6 +635,174 @@ def cartesian_pairs(
                 continue
             seen.add(key)
             pairs.append((a, b))
+    return pairs
+
+
+def strategy_markets(definition) -> tuple[str, ...]:
+    """The DISTINCT markets one source strategy's legs belong to, in
+    first-appearance leg order -- the market identity used by
+    market_pair_first_pairs().
+
+    Derived from definition_legs(), so both definition shapes are
+    handled by the one existing type-dispatched translation and no new
+    market-inference convention is introduced:
+
+      * a single-market StrategyDefinition yields a 1-tuple, e.g.
+        ("SOFR",) -- exactly its own market_key;
+      * an IntermarketDefinition yields every market its legs touch,
+        e.g. ("SOFR", "CORRA") for a SOFR-vs-CORRA basis.
+
+    A multi-market definition is deliberately NOT reduced to one
+    "primary" market. That follows the rule the surrounding
+    architecture already established for exactly this situation rather
+    than inventing a second one: _resolve_bp_per_point() above returns
+    None the moment two markets are involved, and Module 9's
+    resolve_display_market_key() only ever joins every leg market into
+    a cosmetic label. Neither ever picks one leg's market to stand for
+    the whole definition, and neither does this.
+
+    Never a display value and never a provider/cache/bp key: this tuple
+    is used only to group strategies and to pair markets. Every leg
+    still resolves per-RIC / per-LegSpec.market_key downstream, exactly
+    as before.
+    """
+    markets: dict[str, None] = {}
+    for leg in definition_legs(definition):
+        markets.setdefault(leg.market_key, None)
+    return tuple(markets)
+
+
+def _market_group_key(definition) -> frozenset[str]:
+    """The ORDER-INSENSITIVE form of strategy_markets() -- the key two
+    strategies are grouped under, and compared by, in
+    market_pair_first_pairs().
+
+    Order-insensitive so that two intermarket strategies describing the
+    same markets in a different leg order (a SOFR leg then a CORRA leg
+    vs. a CORRA leg then a SOFR leg) land in the SAME market group
+    instead of two spurious ones. Used as a key only -- the group's own
+    strategies keep their first-appearance selection order.
+    """
+    return frozenset(strategy_markets(definition))
+
+
+def market_pair_identity(
+    markets_a: frozenset[str], markets_b: frozenset[str]
+) -> frozenset[frozenset[str]]:
+    """The canonical, ORDER-INSENSITIVE identity of a market pair:
+    identity(X, Y) == identity(Y, X).
+
+    The exact same distinction pair_identity() already draws one level
+    down, applied to markets instead of strategies: an unordered key
+    for UNIQUENESS, while the surviving pair keeps its real,
+    directional Group-A -> Group-B orientation for construction and
+    display. This key never reorders, renames, or reorients anything.
+    """
+    return frozenset({markets_a, markets_b})
+
+
+def group_strategies_by_market(
+    sources: list[SourceStrategy],
+) -> dict[frozenset[str], list[SourceStrategy]]:
+    """`sources` bucketed by market identity (_market_group_key), with
+    BOTH orders preserved by insertion:
+
+      * market order = each market identity's first appearance in the
+        group's own selection order;
+      * strategy order within a bucket = the group's own selection
+        order.
+
+    Nothing is sorted -- alphabetically or otherwise -- at either level.
+    A plain dict is relied on for insertion order (guaranteed since
+    Python 3.7), the same mechanism strategy_markets() uses.
+    """
+    buckets: dict[frozenset[str], list[SourceStrategy]] = {}
+    for source in sources:
+        buckets.setdefault(_market_group_key(source.definition), []).append(source)
+    return buckets
+
+
+def market_pair_first_pairs(
+    group_a_strategies: list[SourceStrategy],
+    group_b_strategies: list[SourceStrategy],
+) -> list[tuple[SourceStrategy, SourceStrategy]]:
+    """MARKET-PAIR-FIRST pairing: the Cartesian product of the two
+    groups' unique MARKETS, then -- within each surviving market pair --
+    the Cartesian product of that pair's own strategies.
+
+    This is the top-level pairing rule. It is deliberately NARROWER
+    than a plain strategy-level Group A x Group B product: the point of
+    a composite Strategy Set is to express CROSS-MARKET relationships,
+    so the markets are paired first and only then are strategies
+    expanded inside each relationship.
+
+        unique markets in Group A  x  unique markets in Group B
+                              |
+                              v
+             for each surviving market pair (mA, mB):
+               Group A strategies in mA  x  Group B strategies in mB
+
+    Three rules, in the order they are applied:
+
+      1. SAME-MARKET PAIRS ARE NEVER FORMED. A market identity is never
+         paired with an equal one, so "SOFR -> SOFR" produces nothing
+         at all -- not even a pair to be composed and then dropped.
+         This is a pairing rule, not a filter on a composed definition:
+         structural-zero filtering (is_structurally_zero(), applied one
+         level up) is untouched and still catches every other way a
+         composed definition can cancel, including cross-market ones.
+      2. REVERSE MARKET PAIRS ARE DEDUPLICATED, by
+         market_pair_identity() -- if both (mA, mB) and (mB, mA) occur,
+         only the FIRST one reached survives, in the real Group A ->
+         Group B orientation it was reached with. "SOFR -> CORRA" and
+         "CORRA -> SOFR" are the same unordered market relationship;
+         which one a trader sees follows their own Group A / Group B
+         configuration, never alphabetical order.
+      3. WITHIN a surviving market pair, EVERY Group A strategy in mA
+         is paired with EVERY Group B strategy in mB -- a genuine
+         Cartesian product, never a positional/zip match. Three SOFR
+         strategies against two CORRA strategies is six combinations.
+
+    Order is entirely the trader's own selection order, at both levels
+    (see group_strategies_by_market): market pairs iterate Group A's
+    market order in the outer loop and Group B's in the inner loop, and
+    each pair's strategies iterate their group's selection order.
+    Nothing is sorted alphabetically anywhere.
+
+    MULTI-MARKET (Module 9 intermarket) SOURCE STRATEGIES: a group
+    member may be a hand-authored IntermarketDefinition, whose market
+    identity is every market its legs touch (see strategy_markets) --
+    it is never collapsed onto one "primary" market, because nothing in
+    this architecture has ever picked one leg's market to stand for a
+    cross-market definition. Such a strategy therefore forms its own
+    market group (e.g. {"SOFR", "CORRA"}), and rules 1-3 apply to it
+    unchanged: it pairs with any group whose market identity DIFFERS
+    (including one that partially overlaps it, e.g. {"CORRA"}, which is
+    still a different relationship), and never with an identical one.
+
+    Strategy-level reverse-duplicate removal still happens, inside
+    cartesian_pairs(), scoped to each market pair. That scoping is
+    equivalent to a global one: a strategy's shape determines its
+    markets, so a reverse strategy pair (Y, X) always lands in the
+    reverse market pair of (X, Y) -- which rule 1 or rule 2 has already
+    removed before any strategy pairing happens.
+    """
+    buckets_a = group_strategies_by_market(group_a_strategies)
+    buckets_b = group_strategies_by_market(group_b_strategies)
+
+    seen_market_pairs: set[frozenset[frozenset[str]]] = set()
+    pairs: list[tuple[SourceStrategy, SourceStrategy]] = []
+
+    for markets_a, sources_a in buckets_a.items():
+        for markets_b, sources_b in buckets_b.items():
+            if markets_a == markets_b:
+                continue  # rule 1: a market is never paired with itself
+            key = market_pair_identity(markets_a, markets_b)
+            if key in seen_market_pairs:
+                continue  # rule 2: reverse of a market pair already formed
+            seen_market_pairs.add(key)
+            pairs.extend(cartesian_pairs(sources_a, sources_b))  # rule 3
+
     return pairs
 
 
@@ -644,6 +835,15 @@ def resolve_composite_combinations(
     """Resolve a composite StrategySet's `groups` configuration into its
     generated "Group A - Group B" combinations.
 
+    Pairing is MARKET-PAIR-FIRST (see market_pair_first_pairs): the
+    two groups' unique markets are paired first -- skipping same-market
+    pairs and reverse-direction market duplicates -- and each surviving
+    market pair then expands into the full Cartesian product of the
+    strategies belonging to those two markets, in the trader's own
+    selection order. This is narrower than the strategy-level Group A x
+    Group B product it replaced: a same-market combination such as
+    "SR3 Fly - SR3 Spread" is no longer produced at all.
+
     Returns [] -- never an error -- when the set is not an A x B
     composite at all:
       * `strategy_set.groups is None` (an ordinary Strategy Set), or
@@ -660,11 +860,12 @@ def resolve_composite_combinations(
     SR3 Fly" is the canonical example. This is automatic and not
     configurable -- see the module docstring for why it is a derivation
     rule rather than a trader-facing filter, and why it is a completely
-    different thing from a historically flat series. Group A x Group B
-    pairing itself is unchanged: such a pair is still GENERATED (a
-    strategy may legitimately be selected on both sides) and still
-    consumes its slot in the unordered-pair dedup, it is simply not
-    returned.
+    different thing from a historically flat series. It remains a
+    filter on the COMPOSED definition, independent of pairing: a
+    cross-market pair whose legs happen to cancel exactly is still
+    formed, composed, and only then dropped. (A strategy against
+    itself is no longer one of those cases -- it is same-market, so
+    market_pair_first_pairs() never forms it in the first place.)
 
     `interval`, when given, is the runtime scan interval: it is applied
     to every resolved Group A and Group B source definition BEFORE
@@ -704,7 +905,7 @@ def resolve_composite_combinations(
 
     combinations: list[CompositeCombination] = []
     structurally_zero = 0
-    for a, b in cartesian_pairs(group_a_strategies, group_b_strategies):
+    for a, b in market_pair_first_pairs(group_a_strategies, group_b_strategies):
         definition = compose_definition(a, b)
         if is_structurally_zero(definition):
             structurally_zero += 1
@@ -719,7 +920,7 @@ def resolve_composite_combinations(
         )
 
     # One summary line, never one per dropped combination -- a large
-    # Cartesian product must not flood the log.
+    # product must not flood the log.
     if structurally_zero:
         logger.info(
             "resolve_composite_combinations: '%s' dropped %d structurally-zero "
@@ -824,6 +1025,10 @@ __all__ = [
     "pair_identity",
     "resolve_group_entries",
     "cartesian_pairs",
+    "strategy_markets",
+    "group_strategies_by_market",
+    "market_pair_identity",
+    "market_pair_first_pairs",
     "resolve_composite_combinations",
     "expand_combinations",
     "composite_labels_by_definition_id",
