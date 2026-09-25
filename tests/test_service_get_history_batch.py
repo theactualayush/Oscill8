@@ -97,7 +97,7 @@ def test_mixed_batch_routes_lseg_and_quanthub_rics_independently(mocker):
     )
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-01-01"]) for instr in instruments
         },
     )
@@ -124,7 +124,7 @@ def test_qh_mapped_ric_lseg_attempt_uses_the_lseg_ric_not_a_qh_instrument(mocker
     )
     mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-01-01"]) for instr in instruments
         },
     )
@@ -154,7 +154,7 @@ def test_duplicate_rics_fetched_once_each(mocker):
     )
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-01-01"]) for instr in instruments
         },
     )
@@ -212,7 +212,7 @@ def test_quanthub_batch_only_requests_rics_needing_a_fetch(mocker, db_session):
     )
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-01-01"]) for instr in instruments
         },
     )
@@ -266,7 +266,7 @@ def test_lseg_unavailable_ric_does_not_prevent_other_rics_from_resolving(mocker)
     mocker.patch("database.service.download_history", side_effect=_download)
     mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-01-01"]) for instr in instruments
         },
     )

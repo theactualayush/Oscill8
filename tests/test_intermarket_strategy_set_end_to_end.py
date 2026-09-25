@@ -141,7 +141,7 @@ def test_strategy_set_json_to_scan_candidate_result_end_to_end(mocker, db_sessio
     mock_lseg = mocker.patch("database.service.download_history", side_effect=_lseg_side_effect)
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(_PRICE_DATES, close=1.10) for instr in instruments
         },
     )

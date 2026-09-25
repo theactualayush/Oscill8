@@ -88,7 +88,7 @@ def test_intermarket_instance_routes_each_leg_to_its_own_provider_and_combines_c
     mock_lseg = mocker.patch("database.service.download_history", side_effect=_lseg_side_effect)
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-02-02"], close=1.15) for instr in instruments
         },
     )
@@ -122,7 +122,7 @@ def test_intermarket_legs_persist_independent_cache_and_provenance(mocker, db_se
     mocker.patch("database.service.download_history", side_effect=_lseg_side_effect)
     mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _make_df(["2026-02-02"], close=1.15) for instr in instruments
         },
     )

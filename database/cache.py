@@ -81,6 +81,29 @@ def _to_nullable_float(value) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
+# Maximum rows sent to the database in one statement.
+#
+# Every bound value in a statement costs one host parameter, and both
+# supported backends cap those per statement: SQLite's
+# SQLITE_MAX_VARIABLE_NUMBER (32,766 since SQLite 3.32) and
+# PostgreSQL's 65,535. insert_bars binds 8 parameters per row, so a
+# single un-batched INSERT fails at ~4,095 rows on SQLite with
+# "OperationalError: too many SQL variables".
+#
+# That ceiling is genuinely reachable in normal operation -- an LSEG
+# HOURLY chunk spans MAX_LOOKBACK_DAYS[HOURLY] = 180 days (~4,320
+# hourly bars), a QuantHub count request may return up to
+# QUANTHUB_MAX_ROWS_PER_REQUEST = 10,000, and a date-range request
+# whose chunks are recombined before persistence can be larger still.
+# 1,000 rows is 8,000 parameters, comfortably inside both backends'
+# limits while keeping the number of round trips small.
+_MAX_ROWS_PER_STATEMENT = 1_000
+
+
+def _batched(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def insert_bars(session: Session, ric: str, interval: str, df: pd.DataFrame) -> int:
     """Upsert canonical-schema OHLCV bars into price_bars.
 
@@ -89,20 +112,31 @@ def insert_bars(session: Session, ric: str, interval: str, df: pd.DataFrame) -> 
     (ric, interval, datetime) already exist are silently skipped at the
     database level -- safe to call with overlapping/already-cached data.
 
+    Both the existence pre-check and the insert are issued in batches of
+    _MAX_ROWS_PER_STATEMENT so that a large frame cannot exceed the
+    backend's per-statement host-parameter limit (see that constant).
+    Batching is purely a transport detail: the rows written, the
+    ON CONFLICT DO NOTHING semantics and the returned count are
+    identical to a single statement, and every batch shares this call's
+    one transaction, committed once at the end.
+
     Returns the number of NEW rows actually inserted.
     """
     if df.empty:
         return 0
 
     requested_dts = [pd.Timestamp(d).to_pydatetime() for d in df["Date"]]
-    existing = session.execute(
-        select(PriceBar.datetime).where(
-            PriceBar.ric == ric,
-            PriceBar.interval == interval,
-            PriceBar.datetime.in_(requested_dts),
+    existing_set: set = set()
+    for dt_batch in _batched(requested_dts, _MAX_ROWS_PER_STATEMENT):
+        existing_set.update(
+            session.execute(
+                select(PriceBar.datetime).where(
+                    PriceBar.ric == ric,
+                    PriceBar.interval == interval,
+                    PriceBar.datetime.in_(dt_batch),
+                )
+            ).scalars().all()
         )
-    ).scalars().all()
-    existing_set = set(existing)
 
     records = [
         {
@@ -121,10 +155,14 @@ def insert_bars(session: Session, ric: str, interval: str, df: pd.DataFrame) -> 
     if not new_records:
         return 0
 
-    stmt = _upsert_statement(session.get_bind(), new_records)
-    session.execute(stmt)
+    for record_batch in _batched(new_records, _MAX_ROWS_PER_STATEMENT):
+        session.execute(_upsert_statement(session.get_bind(), record_batch))
     session.commit()
-    logger.debug("Inserted %d new bar(s) for %s [%s]", len(new_records), ric, interval)
+    logger.debug(
+        "Inserted %d new bar(s) for %s [%s] in %d statement(s)",
+        len(new_records), ric, interval,
+        -(-len(new_records) // _MAX_ROWS_PER_STATEMENT),
+    )
     return len(new_records)
 
 

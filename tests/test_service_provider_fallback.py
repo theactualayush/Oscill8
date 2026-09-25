@@ -17,10 +17,12 @@ get_established_provider):
       sub-range(s) from LSEG on every later call -- this is the fix for
       the regression where a QuantHub-mapped market's incomplete cache
       re-downloaded the ENTIRE requested window from LSEG instead of
-      just the gap. An established-QuantHub (ric, interval) always
-      re-requests the FULL window from QuantHub whenever anything is
-      missing -- a QuantHub API limitation (no start/end/pagination),
-      not a design choice.
+      just the gap. An established-QuantHub (ric, interval) is now
+      incremental in exactly the same way, fetching only its missing
+      sub-range(s) via QuantHub's start/end request shape -- it used to
+      re-request the FULL window whenever anything was missing, which
+      was a genuine API limitation (count= only, no start/end) rather
+      than a design choice, and no longer applies.
     - NEVER a mix of LSEG and QuantHub bars for one (ric, interval).
     - Provider is keyed on (ric, interval) together -- the same
       contract can have different established providers at different
@@ -92,7 +94,7 @@ def _seed_established(db_session, ric: str, interval: str, start: datetime, end:
     cache.record_sync_range(db_session, ric, interval, start, end, provider=provider)
 
 
-def _qh_batch_side_effect(instruments, interval, start, end):
+def _qh_batch_side_effect(instruments, interval, start, end, use_date_range=False):
     return {instr: _bars(["2026-01-01", "2026-01-02"], seed=500.0) for instr in instruments}
 
 
@@ -329,9 +331,14 @@ def test_d_established_lseg_multiple_gaps_each_fetched_independently(mocker, db_
 
 
 # ---------------------------------------------------------------------
-# E. Established QuantHub -- LSEG is never consulted again; QuantHub's
-#    unavoidable full-window re-fetch is used whenever anything is
-#    missing.
+# E. Established QuantHub -- LSEG is never consulted again, and only the
+#    genuinely missing sub-range is fetched.
+#
+#    This section previously asserted a FULL-window re-fetch, because
+#    QuantHub's count= parameter could not express a historical
+#    sub-range. QuantHub's start/end support removed that limitation, so
+#    an established-QuantHub (ric, interval) is now incremental in
+#    exactly the same way an established-LSEG one always was.
 # ---------------------------------------------------------------------
 
 def test_e_established_quanthub_never_calls_lseg_again(mocker, db_session):
@@ -351,15 +358,18 @@ def test_e_established_quanthub_never_calls_lseg_again(mocker, db_session):
 
     mock_lseg.assert_not_called()
     assert mock_qh.call_count == 1
-    # QuantHub cannot request just the missing 2 days -- the full
-    # window is requested, matching its own API limitation.
+    # ONLY the missing Jan4-Jan5 gap is requested -- NOT the full
+    # Jan1-Jan5 window. Jan1-Jan3 is already cached and must never be
+    # re-downloaded.
     called_start, called_end = mock_qh.call_args[0][2], mock_qh.call_args[0][3]
-    assert called_start == datetime(2026, 1, 1)
+    assert called_start == datetime(2026, 1, 4)
     assert called_end == datetime(2026, 1, 5, 23, 59, 59, 999999)
+    # ...and it is sent as a date-range request, not a count request.
+    assert mock_qh.call_args.kwargs["use_date_range"] is True
 
     # The pre-existing Jan1-Jan3 bars are untouched (insert_bars upserts
     # with ON CONFLICT DO NOTHING) -- only the genuinely missing Jan4/
-    # Jan5 bars come from this QuantHub full-window re-fetch.
+    # Jan5 bars come from this incremental QuantHub fetch.
     assert len(result) == 5
     by_date = result.set_index(result["Date"].dt.strftime("%Y-%m-%d"))["Close"]
     assert by_date["2026-01-04"] >= 500.0

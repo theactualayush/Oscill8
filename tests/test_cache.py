@@ -503,3 +503,88 @@ def test_delete_bars_and_sync_ranges_on_empty_cache_is_a_safe_no_op(db_session):
     )
     assert deleted == 0
     assert cache.get_sync_ranges(db_session, "CRAH26", "DAILY") == []
+
+
+# ---------------------------------------------------------------------
+# Large-frame inserts: per-statement host-parameter limit
+#
+# insert_bars binds 8 parameters per row, so a single un-batched INSERT
+# hit SQLite's SQLITE_MAX_VARIABLE_NUMBER (32,766) at ~4,095 rows and
+# raised "OperationalError: too many SQL variables". That ceiling is
+# reachable in normal operation: an LSEG HOURLY chunk covers 180 days
+# (~4,320 hourly bars), a QuantHub count request may return up to
+# 10,000 rows, and a date-range request whose chunks are recombined
+# before persistence can be larger again.
+#
+# insert_bars now batches at _MAX_ROWS_PER_STATEMENT. Batching is a
+# transport detail only -- these tests pin that the rows written, the
+# duplicate handling and the returned count are unchanged.
+# ---------------------------------------------------------------------
+
+def _hourly_frame(start: str, periods: int, seed: float = 100.0) -> pd.DataFrame:
+    idx = pd.date_range(start, periods=periods, freq="1h")
+    return pd.DataFrame(
+        {
+            "Date": idx,
+            "Open": [seed + i for i in range(periods)],
+            "High": [seed + i + 1 for i in range(periods)],
+            "Low": [seed + i - 1 for i in range(periods)],
+            "Close": [seed + i + 0.5 for i in range(periods)],
+            "Volume": [10 + i for i in range(periods)],
+        }
+    )
+
+
+def test_insert_bars_handles_a_frame_larger_than_the_bind_parameter_limit(db_session):
+    """REGRESSION. 13,000 rows is 104,000 bind parameters -- over three
+    times SQLite's 32,766 limit -- and used to raise
+    OperationalError: too many SQL variables."""
+    rows = 13_000
+    df = _hourly_frame("2025-01-01", rows)
+
+    inserted = cache.insert_bars(db_session, "CRAH26", "HOURLY", df)
+
+    assert inserted == rows
+    stored = cache.read_bars(
+        db_session, "CRAH26", "HOURLY", datetime(2024, 1, 1), datetime(2030, 1, 1)
+    )
+    assert len(stored) == rows
+    assert stored["Date"].is_monotonic_increasing
+    assert int(stored["Date"].duplicated().sum()) == 0
+
+
+def test_insert_bars_batching_preserves_upsert_semantics(db_session):
+    """Re-inserting an overlapping large frame must still be a no-op for
+    the rows already present -- ON CONFLICT DO NOTHING applies per
+    batch exactly as it did for one statement."""
+    first = _hourly_frame("2025-01-01", 5_000, seed=100.0)
+    assert cache.insert_bars(db_session, "CRAH26", "HOURLY", first) == 5_000
+
+    # 3,000 rows overlap, 2,000 are new; different values on the
+    # overlap prove existing rows are not rewritten.
+    overlapping = _hourly_frame("2025-01-01", 7_000, seed=999.0)
+    inserted = cache.insert_bars(db_session, "CRAH26", "HOURLY", overlapping)
+
+    assert inserted == 2_000
+    stored = cache.read_bars(
+        db_session, "CRAH26", "HOURLY", datetime(2024, 1, 1), datetime(2030, 1, 1)
+    )
+    assert len(stored) == 7_000
+    assert int(stored["Date"].duplicated().sum()) == 0
+    # The original value survived; the conflicting one was skipped.
+    assert stored.iloc[0]["Open"] == 100.0
+
+
+def test_insert_bars_batch_size_stays_within_both_backends_limits():
+    """8 parameters per row must leave headroom under SQLite's 32,766
+    and PostgreSQL's 65,535 per-statement limits."""
+    assert cache._MAX_ROWS_PER_STATEMENT * 8 < 32_766
+
+
+def test_batched_helper_splits_without_losing_or_duplicating_items():
+    items = list(range(2_500))
+    batches = cache._batched(items, cache._MAX_ROWS_PER_STATEMENT)
+
+    assert [i for batch in batches for i in batch] == items
+    assert all(len(b) <= cache._MAX_ROWS_PER_STATEMENT for b in batches)
+    assert cache._batched([], 100) == []

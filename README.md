@@ -290,39 +290,53 @@ single endpoint and never calls `/apis/auth/` itself, so there is no
 second path to derive and no reason to change the configuration
 contract.
 
-### Why the SQLite cache matters more for QuantHub than for LSEG
+### QuantHub request shapes and limits
 
-QuantHub's HTTP API was live-tested and confirmed to support only three
-effective parameters: `instruments=`, `interval=`, and `count=`.
-`start=`/`end=` return HTTP 500; `from=`/`to=`/`offset=`/`page=`/
-`cursor=`/`before=` are all silently ignored. (Those findings were
-established against the retired `/api/v2/ohlc/` backend and are carried
-over unverified: the new `/apis/ohlc/` Swagger *does* document `start`,
-`end`, `extraFields` and `hg_instrument_ids`, which contradicts them.
-Whether they are genuinely honoured has not been tested, so the client
-still sends only the three parameters it has evidence for — evaluating
-the new ones is a separate task.) There is **no way to ask
-QuantHub for an arbitrary historical date range** — `count=N` always
-means "the most recent N observations as of right now," with no anchor
-to an earlier reference point. There is also a hard per-request ceiling,
-`QUANTHUB_MAX_ROWS_PER_REQUEST = 10_000` (10,000 rows succeeds, 10,001
-returns HTTP 400), and a `QUANTHUB_BATCH_SIZE = 10` cap on distinct
-instruments per request (`core/quanthub.py`;
-`_max_count_for_batch(batch_size) = 10_000 // batch_size` — e.g. 10
-instruments in one request caps each to 1,000 rows).
+QuantHub's OHLC endpoint supports **two** request shapes, both
+live-verified, chosen explicitly by the caller (`use_date_range`):
 
-This is why the SQLite cache is load-bearing for a QuantHub-served
-`(ric, interval)`, not just a performance optimization: once a bar has
-been fetched and persisted, it never needs to be re-requested from
-QuantHub, because QuantHub itself cannot be asked for "just the new
-part" — every subsequent QuantHub fetch for that `(ric, interval)` is a
-**full-window re-request of the most recent N observations**, not an
-incremental one (see "Established QUANTHUB" in the state machine below).
-A cold-start `(ric, interval)` that has never been cached pays this
-full-window cost once; every following scan against the same
-`(ric, interval)` is a pure cache read for any window inside what's
-already stored, and pays the full-window QuantHub cost again only when
-the requested window extends beyond what's cached.
+- `count=N` — the most recent N observations as of right now, with no
+  anchor to an earlier reference point. The original shape, still
+  supported and still the default.
+- `start=`/`end=` — a genuine historical date range, both as **unix
+  seconds**, with `count` omitted (all three together are rejected).
+  Unix milliseconds silently return zero rows and date strings return
+  HTTP 500, so the encoding is not negotiable; it lives in one place,
+  `core.quanthub._to_unix_seconds()`.
+
+An earlier README stated that `start=`/`end=` returned HTTP 500 and
+that there was no way to ask for an arbitrary date range. That finding
+was established against the retired `/api/v2/ohlc/` backend and carried
+across the migration untested; re-testing against the live migrated
+endpoint showed the HTTP 500 was a timestamp-*format* rejection, not a
+missing capability.
+
+Three limits apply, all live-measured:
+
+| Limit | Value | Notes |
+|---|---|---|
+| Rows per response | `QUANTHUB_MAX_ROWS_PER_REQUEST = 10_000` | **Total**, shared across every instrument in the request |
+| Instruments per request | `QUANTHUB_BATCH_SIZE = 10` | `_max_count_for_batch(n) = 10_000 // n` for the count shape |
+| Requests per minute | ~30 server-side | Oscill8 paces itself at `QUANTHUB_REQUESTS_PER_MINUTE = 25` |
+
+A date range too large for one response is **chunked automatically
+inside the provider** — sized up front from the same density estimate
+the count shape uses, split reactively if QuantHub rejects it with the
+specific `"Max row limit exceeded (10000)"` 400, then recombined before
+normalization (which is what keeps 4H buckets whole). Callers see one
+result; `database/service.py` contains no chunking logic.
+
+### Why the SQLite cache is load-bearing for QuantHub
+
+Date-range support removed the cold-start ceiling — an explicit
+`[start, end]` reaches directly into the past — but the cache matters
+more than ever because of the **request-rate limit**. At 25
+requests/minute the cheapest request is the one never made. Once a bar
+is persisted it is never re-requested: `_missing_ranges()` ensures only
+genuinely missing date ranges are fetched, so a warm scan makes **zero**
+QuantHub calls and an incremental top-up downloads only the gap.
+Measured on SR3 hourly with a one-day gap: 36 rows downloaded instead
+of 2,989, for the same 34 new bars.
 
 ### Provider provenance: the state machine
 
@@ -357,10 +371,13 @@ never repeated. Once established:
 - **Established LSEG** — every later request does the original,
   unchanged incremental fetch: only the missing sub-range(s) from LSEG.
   QuantHub is never consulted again for this `(ric, interval)`.
-- **Established QUANTHUB** — whenever anything is missing, QuantHub has
-  no way to fetch "just the gap," so the full requested window is
-  re-requested from QuantHub every time. LSEG is never consulted again
-  for this `(ric, interval)` either way.
+- **Established QUANTHUB** — incremental in exactly the same way:
+  only the missing sub-range(s) are fetched, using the date-range
+  request shape (and chunked across several HTTP requests if one range
+  would exceed the 10,000-row response ceiling). Before start/end
+  support existed this branch had to re-request the full window every
+  time — a real API limitation then, lifted now. LSEG is never
+  consulted again for this `(ric, interval)` either way.
 
 **Legacy/unknown `(ric, interval)`** — `provider` is `NULL` but
 `sync_ranges` coverage already exists (e.g. cached before the provider

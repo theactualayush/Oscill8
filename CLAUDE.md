@@ -1185,12 +1185,30 @@ Key design points a future session needs:
 
 ---
 
-## Module 8 – QuantHub Secondary Provider, Provider Provenance & Effective-Request-End
+## Module 8 – QuantHub Provider: Provenance, Date Ranges, Incremental Cache Sync, Rate Limiting & Chunking
 
-COMPLETED AND TESTED. This module was built across several rounds after
-Module 7A and was not previously documented here — this section is
-that missing documentation, written from the current code, not from
-memory of how it was designed.
+COMPLETED AND TESTED. Built across several rounds after Module 7A, then
+extended by a four-task QuantHub migration. This section is written
+from the current code, not from memory of how it was designed.
+
+The migration, in order, and what each part left behind:
+
+| Step | What it added |
+|---|---|
+| Provider provenance | A persisted per-`(ric, interval)` LSEG/QuantHub decision, and the currently-forming-bar exclusion |
+| Date ranges | `start`/`end` as unix seconds, `count` omitted — the count shape stays supported |
+| Incremental cache sync | Established QuantHub fetches only what `_missing_ranges()` reports missing, batched by identical missing range |
+| Rate limiting & hardening | 25 req/min client pacing, `Retry-After`-aware 429 retry, deterministic 400s no longer retried |
+| Automatic chunking | An oversized date range is split across several requests inside the provider and recombined |
+
+**LSEG was NOT removed by any of this.** `core/downloader.py` and
+`core/providers.py` are untouched; provider routing
+(`PROVIDER_ROUTING`), the LSEG-first establishment trial, the
+established-LSEG incremental path and the legacy/unknown LSEG-first
+fallback all behave exactly as before. QuantHub remains strictly behind
+the provider boundary: nothing above `database/service.py` knows which
+provider served a bar, and `strategy_engine`/`template_scanner`/`ui`
+still only ever call `database.get_history`/`get_history_batch`.
 
 Introduces QuantHub as a second market-data provider alongside LSEG,
 a persisted per-`(ric, interval)` decision of which provider actually
@@ -1304,75 +1322,184 @@ it never rewrites the operator's own setting, since silently
 it. `core.quanthub.RETIRED_QUANTHUB_OHLC_PATH` exists solely for that
 recognition and must never be used to build a request.
 
-### QuantHub's confirmed API limitation — why the cache matters
+### QuantHub request shapes, limits, and automatic chunking
 
-**Live-tested and confirmed, not assumed — BUT against the RETIRED
-`/api/v2/ohlc/` backend, and carried over unverified.** The new
-`/apis/ohlc/` Swagger documents `start`, `end`, `extraFields` and
-`hg_instrument_ids` parameters, which directly contradicts the
-"only three parameters have any effect" finding below. Whether they are
-now genuinely honoured has NOT been tested and must not be assumed
-either way; if `start`/`end` really work, they would remove the
-cold-start reach ceiling described here entirely. Until someone
-establishes that with real evidence, the client keeps sending only the
-three parameters it has evidence for — which is the request shape the
-new endpoint was verified to accept. The original findings, verbatim:
+**SUPERSEDED FINDING, kept because it explains the shape of the code.**
+This section previously stated that QuantHub had no date-range
+mechanism at all: that `start=`/`end=` returned HTTP 500, that `count=`
+was the only way to ask for history, and that a cold-started instrument
+could therefore never reach further back than one request's count cap.
+That investigation was real, but it ran against the RETIRED
+`/api/v2/ohlc/` backend and was carried across the migration untested.
+Re-testing against the live MIGRATED endpoint (see
+`tools/qh_stress_test.py`) established that `start`/`end` DO work --
+the HTTP 500 was a timestamp-FORMAT rejection, not a missing
+capability. Everything below describes what the client does today.
 
-QuantHub's OHLC
-endpoint is NOT a generic historical-database API. It does not accept
-`start=`/`end=` (returns HTTP 500), `from=`/`to=` (HTTP 200 but silently
-ignored — byte-identical response with or without it), or `offset=`/
-`page=`/`cursor=`/`before=` (each tested in isolation, every one HTTP
-200 with the exact same window as a baseline request — silently
-ignored, never applied). There is no pagination, cursor, offset, or
-date-range mechanism of any kind.
-
-The only parameters that have any effect are:
+**Two request shapes, both live-verified, chosen explicitly by the
+caller** (`core.quanthub.download_history`/`download_history_batch`
+take `use_date_range: bool = False`):
 
 ```
-instruments=   (comma-separated QH instrument identifiers)
-interval=      (native QuantHub interval)
-count=         (how many of the MOST RECENT observations, as of now)
+count=N              the most recent N observations AS OF NOW.
+                     No anchor to an earlier point. The original
+                     shape, still supported and still the default.
+
+start=S&end=E        a genuine date range, both UNIX SECONDS.
+                     `count` MUST be omitted.
 ```
 
-`count=` always means "the most recent N observations as of when the
-request is made" — there is no way to anchor a request to an earlier
-reference point. A request whose true required count would exceed the
-achievable cap simply retrieves a shorter history than requested,
-never multiple requests, never fabricated bars — older history beyond
-that is genuinely unreachable in a single request, no matter how the
-request is shaped.
+Three conditions on the date-range shape, each established by test, not
+assumption:
 
-**Hard row ceiling, live-confirmed exactly:** `QUANTHUB_MAX_ROWS_PER_REQUEST
-= 10_000` (`core/quanthub.py`) — 10,000 total rows in one HTTP request
-succeeds; 10,001 returns HTTP 400 "Max row limit exceeded (10000)".
-This cap is shared across every instrument in the request:
-`instruments_in_request × count ≤ 10,000`. `QUANTHUB_BATCH_SIZE = 10`
-is the separate, independently live-verified maximum instrument count
-per HTTP request (10 distinct instruments in one request returned all
-480 expected records for `count=48`; not tested above 10). Because the
-row ceiling is shared, batching MORE instruments into one request
-directly SHRINKS the effective `count` (and therefore how far back)
-each individual instrument in that request can reach — `core.quanthub.
-_max_count_for_batch(batch_size)` computes `10_000 // batch_size` as
-the per-instrument cap for whatever batch size is actually used; a
-smaller trailing chunk legitimately gets a HIGHER count than a
-full-sized batch of 10.
+- **Unix SECONDS only.** Unix milliseconds return zero rows *silently*;
+  `"YYYY-MM-DD"` and ISO-8601 strings both return HTTP 500. The
+  conversion lives in exactly one place, `core.quanthub._to_unix_seconds()`
+  -- naive datetimes are read as UTC (the convention already used
+  throughout this pipeline), tz-aware ones are converted. Do not change
+  the encoding without re-establishing it against the live API.
+- **`count` must be omitted.** All three together are rejected with
+  `{"error": "Only two of start or end or count should be provided"}`.
+  `core.quanthub._build_request_params()` enforces this before any HTTP
+  call, and also rejects start-without-end / end-without-start
+  (QuantHub accepts `end`+`count`, but Oscill8 has no caller for it and
+  does not ship untested semantics).
+- **Whole-day bounds.** `download_history_batch` sends `00:00:00`
+  through `23:59:59.999999`, which is exactly the window its own
+  client-side filter keeps, so both shapes return identical rows for
+  identical arguments.
 
-**This is exactly why the SQLite cache matters more for QuantHub-backed
-instruments than for LSEG-backed ones.** A cold-started QuantHub
-instrument can only ever receive, on its first-ever fetch, the most
-recent history reachable within that request's effective count cap —
-nothing older is retrievable through this endpoint, ever, regardless of
-how the request is shaped. Deep history is NOT permanently unreachable,
-though: Module 2's SQLite cache persists every completed bar QuantHub
-returns and never re-fetches what it already has, so an instrument that
-gets scanned repeatedly over time accumulates history day by day as
-"now" (and therefore QuantHub's own reachable window) advances — this
-is the existing, unmodified caching behavior already doing the only
-thing that can compensate for QuantHub's API-side ceiling; it does not
-change the ceiling itself for a genuinely new instrument's first
+**Hard row ceiling, live-confirmed exactly:**
+`QUANTHUB_MAX_ROWS_PER_REQUEST = 10_000` (`core/quanthub.py`) -- 10,000
+total rows in one HTTP request succeeds; 10,001 returns HTTP 400
+`"Max row limit exceeded (10000)"`. The cap is on the TOTAL response
+and is **shared across every instrument in the request**: 2 instruments
+x 5,000 rows succeeds, 2 x 5,001 does not. `QUANTHUB_BATCH_SIZE = 10`
+is the separate, independently live-verified instrument-per-request cap
+(a later benchmark accepted 20, but the batch size is deliberately left
+at 10 -- raising it is a separate, evidence-led decision, and under a
+shared row ceiling a larger batch buys fewer requests at the cost of
+reach per instrument).
+
+**Automatic date-range chunking**
+(`core.quanthub._fetch_date_range_chunked` / `_fetch_day_range_or_split`).
+A logical date-range request that would exceed the row ceiling is
+transparently split into several HTTP requests and recombined; callers
+cannot tell. Hybrid strategy:
+
+1. **Proactive sizing.** Chunk length is derived from
+   `_estimate_count` -- the SAME density model the count shape already
+   uses, so this module has one density model, not two. It is
+   documented there as a deliberately generous UPPER bound, which is
+   exactly the property sizing needs: erring high produces slightly
+   smaller chunks, never an oversized request. Sizing always reasons
+   about `instruments x bars`, never one instrument in isolation.
+2. **Reactive splitting.** If QuantHub rejects a request anyway with
+   the specific row-limit 400, that range is halved by days and the
+   halves retried, recursively. `_is_row_limit_error()` matches only
+   the `"Max row limit exceeded"` marker in the response body -- every
+   other 400 propagates immediately, because a smaller date range
+   cannot fix a malformed request.
+
+Measured sizing (ceiling 10,000): DAILY 9,995 days for 1 instrument /
+995 for 10; HOURLY and 4H 415 days for 1 / 40 for 10. So the common
+case is NOT split -- six months of hourly data for one instrument
+(~2,989 rows, benchmark-measured) stays a single request.
+
+Chunks are **contiguous, non-overlapping whole days** -- each ends on a
+day boundary and the next begins the following day, so no day is
+skipped and none is fetched twice. Recursion is bounded by
+`_MAX_CHUNK_SPLIT_DEPTH = 10`, and a single day cannot be split
+further: a day that still exceeds the ceiling fails with a clear
+message naming the only remaining lever (fewer instruments per
+request), never an endless loop.
+
+**Recombination happens at the RAW-RECORD level, below normalization.**
+`_merge_grouped()` extends each product's record list across chunks
+(never `dict.update()`, which would silently keep only the last
+chunk), and de-duplication by timestamp runs only when more than one
+response actually contributed. Normalization, **4H resampling** and
+date filtering then run ONCE on the combined set. That ordering is what
+makes 4H safe: a 4H bar is resampled from native hourly bars, so
+building buckets after recombination means a chunk boundary can never
+produce a partial bucket. DAILY, HOURLY and 4H are all supported.
+
+**Chunking lives in the QuantHub provider, never in
+`database/service.py`.** The service hands the provider one missing
+range; the provider may internally issue several requests; the service
+receives one combined result and feeds it to the existing
+normalization/persistence path unchanged.
+
+### Rate limiting and error hardening
+
+**QuantHub enforces roughly 30 requests per minute**, and says so in
+the 429 body:
+
+```json
+{"error": "Rate limit exceeded",
+ "detail": "Too many requests. Retry after 3 second(s)",
+ "limit": 30, "window": "minute"}
+```
+
+This is a THIRD limit, independent of the row ceiling and the
+instrument cap, and was discovered by a benchmark run that paced itself
+too fast. Oscill8 holds itself deliberately below it at
+`QUANTHUB_REQUESTS_PER_MINUTE = 25` (one request every 2.4s) via
+`core.quanthub.QuantHubRateLimiter`, a minimum-interval limiter. Every
+outbound QuantHub HTTP request passes through it -- including every
+retry and every chunk request -- and it is acquired only AFTER
+parameter validation and credential lookup, so a request that was never
+going to be sent does not consume a slot. The first request through a
+fresh limiter is never delayed. It is thread-safe (Streamlit runs each
+browser session's script on its own thread) and reserves a slot under
+the lock before sleeping outside it, so concurrent callers take
+distinct, properly-spaced slots rather than racing off one shared
+timestamp. `OBSERVED_QUANTHUB_RATE_LIMIT_PER_MINUTE = 30` records the
+measured server limit for provenance only; it is never used to build a
 request.
+
+**HTTP 429 is retried**, unlike an earlier design that excluded it. The
+exclusion existed because no cooldown signal had been observed and
+blind exponential retry risked compounding the condition; the body
+above establishes the cause, so the retry is now directed rather than
+blind. `_quanthub_wait()` honours `Retry-After` when it carries a
+usable delay-seconds value, clamped to
+`QUANTHUB_MAX_RETRY_AFTER_WAIT_SECONDS = 60.0`; when the header is
+absent, an HTTP-date, or otherwise unparseable, it falls back to a
+bounded backoff (5s then 10s). A 429 consumes the SAME 3-attempt budget
+every other retryable failure uses -- never its own, which would
+multiply the very requests that caused it. `QuantHubRateLimitError`
+carries `retry_after` and `response_body`.
+
+**Deterministic HTTP 400s are NOT retried.** `QuantHubRequestError`
+(raised before `raise_for_status()`) covers malformed parameters, an
+invalid request shape, and the row-limit rejection. Re-sending an
+identical request gets an identical answer, so the previous behaviour
+-- three attempts plus ~6s of backoff, and three of the minute's
+request budget, for a guaranteed failure -- was pure waste. It
+SUBCLASSES `requests.exceptions.HTTPError`, so callers catching that
+keep working; only the attempt count changed. The response body is
+preserved on the exception, because it is the only place QuantHub says
+*which* validation failed.
+
+**Transient failures are unchanged.** 5xx, connection errors, timeouts
+and any unrecognised exception still retry up to 3 attempts on
+`wait_exponential(multiplier=1, min=2, max=10)` -- the identical policy
+object as before this hardening existed.
+
+### Why the SQLite cache is still load-bearing
+
+The date-range shape removed the cold-start ceiling (an explicit
+`[start, end]` reaches directly into the past, so a never-cached
+instrument is no longer limited to "the most recent N bars as of now"),
+but the cache matters more than ever, for a different reason: the
+**request-rate limit**. At 25 requests/minute the cheapest request is
+the one never made. Module 2's SQLite cache persists every completed
+bar, and `database.service._missing_ranges()` ensures only genuinely
+missing date ranges are ever requested -- a warm scan makes zero
+QuantHub calls, and an incremental top-up downloads the gap rather than
+the whole window. Measured on SR3 hourly with a one-day gap: 36 rows
+downloaded instead of 2,989, for the same 34 new bars.
 
 ### Provider provenance: the state machine
 
@@ -1442,10 +1569,13 @@ Once established (LSEG or QuantHub), the decision is NEVER
 automatically revisited — `established == "LSEG"` fetches ONLY the
 missing sub-range(s) from LSEG forever after (QuantHub is never
 consulted again for that `(ric, interval)`); `established == "QUANTHUB"`
-re-requests the FULL effective window from QuantHub whenever ANYTHING
-is missing (QuantHub's own API limitation, described above — it cannot
-be asked for just a narrow gap), and LSEG is never consulted again
-either. **A `(ric, interval)`'s history is never a mix of LSEG and
+is now **incremental in exactly the same way**, fetching only its
+missing sub-range(s) via the date-range request shape
+(`_fetch_established_quanthub` → `_download_quanthub_range`), and LSEG
+is never consulted again either. Until QuantHub's start/end support was
+established, this branch had to re-request the ENTIRE effective window
+whenever anything was missing — a genuine API limitation at the time,
+not a design choice, and now lifted. **A `(ric, interval)`'s history is never a mix of LSEG and
 QuantHub bars for a single established provider** — but see the
 LEGACY/UNKNOWN case below, which is the one deliberate, narrow
 exception to that rule.
@@ -1549,13 +1679,14 @@ either (an earlier version of this design DID still return it, never
 cached, for that one call only — that behavior is gone; see the
 now-superseded Module 2 bullet above). `_persist_downloaded()`'s
 `Date < boundary` filter is the actual, load-bearing enforcement point
-for this — not a redundant safety net: QuantHub in particular has no
-way to be asked, server-side, to exclude a same-day in-progress bar (its
-`count=`-only API always means "the most recent N observations as of
-now," and its own local response filter truncates the request's `end`
-to a bare calendar date before filtering), so this Date-level check is
-what actually keeps such a bar out of the cache regardless of what
-either provider hands back.
+for this — not a redundant safety net. QuantHub still cannot be asked,
+server-side, to exclude a same-day in-progress bar: the count shape
+always means "the most recent N observations as of now," and the
+date-range shape is sent on WHOLE-DAY bounds (`00:00:00` through
+`23:59:59.999999`), so an `end` of "today" necessarily includes
+today's still-forming bar. This Date-level check is therefore what
+actually keeps such a bar out of the cache, regardless of which request
+shape was used or what either provider hands back.
 
 If `effective_end < start` (the ENTIRE requested window is still
 forming — e.g. a narrow intraday request wholly inside the currently-
@@ -1601,19 +1732,22 @@ against the wrong identifier. Always use the LSEG RIC when inspecting
 `sync_ranges`/provider provenance directly (e.g. via SQL or
 `database.cache`), never the QuantHub instrument string.
 
-### Debugging gotcha: a QuantHub `count=` observed at different times can legitimately differ
+### Debugging gotcha: a QuantHub request window observed at different times can legitimately differ
 
-For a LEGACY/UNKNOWN-provider `(ric, interval)` (see above), `count=`
-is computed by `core.quanthub._estimate_count()` from whatever
-`sync_ranges` coverage's trailing edge actually is AT THE MOMENT OF THAT
-CALL — not from the strategy's originally-configured price window, and
-not remembered across calls (`record_sync_range()` merges coverage
-forward; it does not retain history of where the edge used to be). A
-long-requested window (e.g. `2026-01-01 -> 2027-08-01`) that is mostly
-already cached will correctly compute a SMALL `count` sized to just the
-narrow, genuinely-missing trailing gap — a `count` far smaller than the
-window's own nominal span is expected, correct behavior for this path,
-not a bug, a hardcoded cap, or a sign the date-window logic is broken.
+**Now expressed as a date range rather than a `count`.** Every QuantHub
+fetch from `database/service.py` uses the date-range shape, so what a
+request asks for is whatever `sync_ranges` coverage leaves genuinely
+missing AT THE MOMENT OF THAT CALL — not the strategy's
+originally-configured price window, and not remembered across calls
+(`record_sync_range()` merges coverage forward; it does not retain
+history of where the edge used to be). A long-requested window (e.g.
+`2026-01-01 -> 2027-08-01`) that is mostly already cached will
+correctly request only the narrow, genuinely-missing gap — an outbound
+window far smaller than the caller's nominal span is expected, correct
+behaviour, not a bug, a hardcoded cap, or a sign the date-window logic
+is broken. (Before start/end support existed the same observation
+showed up as a surprisingly small `count=`, computed by
+`core.quanthub._estimate_count()` from that same trailing edge.)
 Live-investigated end-to-end (empty cache -> full-window count;
 today's-actual partial cache -> tail-only count) with no code defect
 found; see `tests/test_service_provider_fallback.py`'s
@@ -1656,7 +1790,33 @@ for the same class of scenario under test.
   re-fetched by a subsequent `build_history()` call for the same
   instances/window, across all four provider states in the same batch.
 
+Added by the QuantHub start/end + incremental-cache + hardening +
+chunking work:
+
+- A date-range request sends `start`/`end` as unix SECONDS and NO
+  `count`; a count request sends `count` and no `start`/`end`; all
+  three together are rejected before any HTTP call.
+- An established-QuantHub `(ric, interval)` with a cache gap requests
+  ONLY that gap; a fully-covered request makes ZERO QuantHub calls; an
+  interior hole is detected and refilled without re-downloading the
+  cached data around it.
+- Batched QuantHub RICs are grouped by IDENTICAL missing range, so
+  batching is preserved without widening any RIC's request to cover
+  another's older gap.
+- Every outbound QuantHub HTTP request takes a rate-limiter slot,
+  including retries and chunk requests; a request rejected before the
+  wire takes none.
+- HTTP 429 is retried within the shared 3-attempt budget, honouring
+  `Retry-After` when usable and a bounded fallback otherwise; a
+  deterministic HTTP 400 is attempted exactly once.
+- Only the `"Max row limit exceeded"` 400 triggers chunking; every
+  other 400, and 429/5xx/timeout, do not.
+- A chunked retrieval is `assert_frame_equal`-identical to the same
+  data returned in one response, and 4H buckets built after
+  recombination match those built from a single response.
+
 See `tests/test_downloader.py`, `tests/test_service_provider_fallback.py`,
+`tests/test_service_quanthub_incremental.py`,
 `tests/test_service_effective_request_end.py`,
 `tests/test_service_get_history_batch.py`,
 `tests/test_multimarket_cache_key_independence.py`,
@@ -1975,7 +2135,9 @@ strategy_sets/
                        _from_dict — a `groups` key, omitted entirely
                        when None)
     composite.py        (the whole composite engine: group resolution,
-                       A×B pairing + unordered-pair dedup, composition
+                       market-pair-first pairing + same-market
+                       exclusion + reverse-market-pair dedup +
+                       strategy-level unordered-pair dedup, composition
                        to an IntermarketDefinition, structural-zero
                        filtering, combination labels)
     expansion.py         (+ expand_strategy_set_with_labels(); a second
@@ -2052,10 +2214,13 @@ Key design points a future session needs:
   drop a real strategy with genuinely small weights). Automatic and not
   configurable — it is a derivation rule, not a trader-facing filter,
   and is a completely different thing from a historically FLAT series,
-  which is real data and still scans. Selecting the same strategy on
-  both sides remains valid: the pair is still generated and still
-  consumes its slot in the unordered-pair dedup, it is simply not
-  returned. One summary log line, never one per dropped pair.
+  which is real data and still scans. It stays a filter on the
+  COMPOSED definition, independent of pairing — a cross-market pair
+  whose legs happen to cancel exactly is still formed, composed, and
+  only then dropped. Selecting the same strategy on both sides remains
+  valid but now yields nothing one step EARLIER: both sides are the
+  same market, so market-pair-first pairing never forms the pair at
+  all. One summary log line, never one per dropped pair.
 - **Runtime interval is applied BEFORE composition.**
   `strategy_sets.execution.run_strategy_set()` applies the scan's one
   interval to the set's own entries via `with_interval_override()`, AND
@@ -2335,9 +2500,13 @@ accurate for any market not routed to QuantHub** (see
 the CME `ESTR` entry). For the six markets routed to QuantHub (CORRA,
 SONIA, EURIBOR, SARON, YBA, ESTR_ICE), the real behaviour is richer
 than this diagram shows — a persisted per-`(ric, interval)` provider
-decision, QuantHub full-window refetches instead of incremental
-missing-range downloads, a legacy/unknown fallback path, and an
-effective-request-end cap that excludes the currently-forming bar. See
+decision, a legacy/unknown fallback path, an effective-request-end cap
+that excludes the currently-forming bar, and a provider layer that
+rate-limits itself and splits an oversized date range across several
+HTTP requests. The cache-first, missing-range-only shape of the diagram
+does now hold for QuantHub too: an established QuantHub
+`(ric, interval)` fetches only what `_missing_ranges()` reports as
+missing, exactly as LSEG always has. See
 **Module 8 – QuantHub Secondary Provider, Provider Provenance &
 Effective-Request-End** above (and `database/service.py`'s own module
 docstring, which is the authoritative source) for the accurate,
@@ -2389,9 +2558,14 @@ Module 7B — Strategy Set UI integration (selector built into the
 scanner grid, simplified single-grid design) — STATUS: COMPLETE
 Strategy Set Import — Excel/CSV -> StrategySet import pipeline and UI
 panel — STATUS: COMPLETE
-Module 8 — QuantHub secondary provider, provider provenance, and
-effective-request-end (currently-forming-bar exclusion) — STATUS:
-COMPLETE
+Module 8 — QuantHub provider: secondary-provider routing, provider
+provenance, effective-request-end (currently-forming-bar exclusion),
+start/end date-range requests, `_missing_ranges()`-driven incremental
+cache synchronization, client-side rate limiting (25 req/min) with
+`Retry-After`-aware 429 handling and non-retried deterministic 400s,
+and automatic 10,000-row date-range chunking — STATUS: COMPLETE
+(LSEG not removed; an LSEG-disabled end-to-end validation of the
+QuantHub + SQLite path is a separate, not-yet-performed exercise)
 Module 9 — Intermarket strategy engine (domain model, Strategy Set
 integration, scanner wiring; cross-market legs within ONE strategy) —
 STATUS: COMPLETE (backend only — no Streamlit UI editor for authoring

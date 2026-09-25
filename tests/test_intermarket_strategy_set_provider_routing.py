@@ -183,7 +183,7 @@ def test_mixed_provider_scan_routes_each_market_independently_in_one_run(mocker)
     mock_lseg = mocker.patch("database.service.download_history", side_effect=_lseg)
     mock_qh = mocker.patch(
         "database.service.download_history_quanthub_batch",
-        side_effect=lambda instruments, interval, start, end: {
+        side_effect=lambda instruments, interval, start, end, use_date_range=False: {
             instr: _bars(["2026-01-05", "2026-01-06"]) for instr in instruments
         },
     )

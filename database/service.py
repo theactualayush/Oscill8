@@ -97,7 +97,7 @@ Is requested history fully covered?
                 |     70112 or Intraday 92000 entitlement gap -- see |  |   |
                 |     core.downloader's classifiers), incomplete, or |  |   |
                 |     empty, that sub-range falls back to QuantHub   |  |   |
-                |     (_download_quanthub_full_window) for JUST that |  |   |
+                |     (_download_quanthub_range) for JUST that       |  |   |
                 |     sub-range -- and is STILL persisted with       |  |   |
                 |     provider=None regardless of which provider     |  |   |
                 |     actually served it. NEVER runs the ONE-TIME     |  |   |
@@ -121,19 +121,23 @@ Is requested history fully covered?
                 |     interval).                                  |  |   |
                 |                                                  |  |   |
                 \\-- Established QUANTHUB -----------------------.  |  |   |
-                      QuantHub has no start/end/offset/pagination |  |   |
-                      mechanism (live-verified -- see core.        |  |   |
-                      quanthub's own module docstring), so "only   |  |   |
-                      the missing range" cannot be requested        |  |   |
-                      literally: whenever ANYTHING is missing,      |  |   |
-                      the FULL requested window is re-requested     |  |   |
-                      from QuantHub (existing, unmodified           |  |   |
-                      core.quanthub.download_history_batch, still   |  |   |
-                      capped at QUANTHUB_MAX_ROWS_PER_REQUEST/      |  |   |
-                      QUANTHUB_BATCH_SIZE) -- this is a QuantHub    |  |   |
-                      API limitation, not a design choice. LSEG is  |  |   |
-                      never consulted again for this (ric,          |  |   |
-                      interval) either way.                         |  |   |
+                      Incremental, exactly like established LSEG  |  |   |
+                      above: _missing_ranges() as always, then    |  |   |
+                      one QuantHub date-range request per missing |  |   |
+                      sub-range (_fetch_established_quanthub ->   |  |   |
+                      _download_quanthub_range). The provider     |  |   |
+                      splits a range too large for QuantHub's     |  |   |
+                      10,000-row response ceiling across several  |  |   |
+                      HTTP requests itself and recombines them -- |  |   |
+                      no chunking logic lives in this module.     |  |   |
+                      Until QuantHub's start/end support was      |  |   |
+                      established this branch had to re-request   |  |   |
+                      the ENTIRE window whenever anything was     |  |   |
+                      missing, because count= could only mean     |  |   |
+                      "the most recent N bars ending now" -- a    |  |   |
+                      real API limitation, now lifted. LSEG is    |  |   |
+                      never consulted again for this (ric,        |  |   |
+                      interval) either way.                       |  |   |
                 |                                                              |
         ONE (RIC, INTERVAL)'S HISTORY IS NEVER A MIX OF LSEG AND QUANTHUB BARS  |
         `-----------------------------------------------------------------'
@@ -161,11 +165,38 @@ clearing that (ric, interval)'s cache/provenance with that function.
 get_history_batch() applies this exact same per-(ric, interval) decision
 to many RICs at once. Every ric needing a QuantHub fetch THIS call --
 whether newly establishing QuantHub or already established as QuantHub
-from an earlier call -- is collected into ONE batched fetch through the
-existing, unmodified core.quanthub.download_history_batch()
-(QUANTHUB_BATCH_SIZE chunking, QUANTHUB_MAX_ROWS_PER_REQUEST cap, both
-completely untouched by this design); QuantHub is never called
-speculatively for a ric already resolved via LSEG.
+from an earlier call -- goes through core.quanthub.download_history_batch()
+(QUANTHUB_BATCH_SIZE chunking and the QUANTHUB_MAX_ROWS_PER_REQUEST cap
+both untouched), grouped by IDENTICAL missing range so that batching is
+preserved without widening any ric's request to cover an unrelated
+ric's older gap -- see _get_history_batch_quanthub. QuantHub is never
+called speculatively for a ric already resolved via LSEG.
+
+INCREMENTAL FETCHING NOW APPLIES TO BOTH PROVIDERS. Every provider
+state above -- established LSEG, established QuantHub, and the legacy/
+unknown fallback -- fetches only what _missing_ranges() says is
+genuinely missing. Only the ONE-TIME establishment trial deliberately
+requests the whole window, and for a genuinely new (ric, interval) the
+whole window IS the missing range. Measured effect of this on a warm
+cache with a one-day hourly gap: 36 rows downloaded rather than 2,989,
+for the same 34 new bars.
+
+A MISSING RANGE TOO LARGE FOR ONE QUANTHUB RESPONSE IS CHUNKED BY THE
+PROVIDER, NOT HERE. This module still decides WHAT to fetch --
+_missing_ranges() alone determines that, unchanged -- and hands the
+resulting range to core.quanthub as a single logical request. QuantHub
+enforces a 10,000-row ceiling on the TOTAL response, shared across
+every instrument in it, so core.quanthub may internally split that one
+range across several HTTP requests (proactively sized, plus a reactive
+split if it is rejected with that specific row-limit 400) and recombine
+them before returning. Nothing about that is visible here: this module
+receives one combined result and feeds it to the existing
+normalization/persistence path exactly as if one request had produced
+it. There is deliberately NO chunking logic in this file -- adding any
+would duplicate the provider's, and would put a provider-specific
+response limit into the cache layer, which is provider-neutral by
+design. The same applies to request pacing: core.quanthub rate-limits
+itself, and this module neither knows nor manages that.
 """
 
 from __future__ import annotations
@@ -474,7 +505,7 @@ def _fetch_legacy_unknown_provider(
     SONM8/SONZ7 in production -- _is_complete_history treats an empty
     frame as incomplete too, so this is caught by the same check, not a
     separate branch) -- that sub-range is instead fetched from QuantHub
-    (_download_quanthub_full_window, the SAME QuantHub-fetch mechanism
+    (_download_quanthub_range, the SAME QuantHub-fetch mechanism
     establishment/established-QuantHub already use) and STILL persisted
     with provider=None.
 
@@ -535,7 +566,7 @@ def _fetch_legacy_unknown_provider(
                 "this sub-range (provider stays unrecorded)",
                 ric, interval.value, sub_start, sub_end,
             )
-            downloaded_qh = _download_quanthub_full_window(ric, interval, sub_start, sub_end)
+            downloaded_qh = _download_quanthub_range(ric, interval, sub_start, sub_end)
             _persist_downloaded(
                 session, ric, interval, downloaded_qh, sub_start, sub_end, boundary, provider=None
             )
@@ -610,51 +641,100 @@ def _establish_provider_and_fetch(
         "establishing QuantHub as the provider instead",
         ric, interval.value, start_dt, end_dt,
     )
-    downloaded_qh = _download_quanthub_full_window(ric, interval, start_dt, end_dt)
+    downloaded_qh = _download_quanthub_range(ric, interval, start_dt, end_dt)
     _persist_downloaded(
         session, ric, interval, downloaded_qh, start_dt, end_dt, boundary,
         provider=Provider.QUANTHUB.value,
     )
 
 
-def _download_quanthub_full_window(
-    ric: str, interval: BarInterval, start_dt: datetime, end_dt: datetime
+def _download_quanthub_range(
+    ric: str, interval: BarInterval, range_start: datetime, range_end: datetime
 ) -> pd.DataFrame:
-    """Fetch [start_dt, end_dt] for one ric from QuantHub -- always the
-    FULL window, never a sub-range, since QuantHub has no start/end/
-    offset/pagination mechanism (live-verified -- see core.quanthub's
-    own module docstring: only instruments=/interval=/count= exist).
-    Used both when establishing QuantHub for the first time and on
-    every subsequent call for a (ric, interval) already established as
-    QuantHub -- the same unavoidable API limitation applies either way.
+    """Fetch EXACTLY [range_start, range_end] for one ric from QuantHub,
+    using the provider's date-range request shape.
+
+    Formerly _download_quanthub_full_window, which could only ever ask
+    for the caller's whole window: QuantHub was believed to have no
+    start/end mechanism, so "fetch just the missing gap" was not
+    expressible and every established-QuantHub refresh re-downloaded
+    everything. That is no longer true -- core.quanthub now supports a
+    genuine start/end request (unix seconds, no count), so this function
+    takes an arbitrary sub-range and every caller passes the range it
+    actually needs. Measured effect on a one-day hourly gap: 36 rows
+    downloaded instead of 2,989, for the same 34 new bars.
+
+    Goes through core.quanthub.download_history_batch()'s single
+    pipeline (via download_history) rather than the lower-level
+    _fetch_quanthub_records, so normalization, 4H resampling, batching
+    and client-side filtering are the existing, shared ones -- there is
+    no second QuantHub pipeline anywhere in this module.
+
+    GRANULARITY -- a deliberate, documented reduction. _missing_ranges()
+    produces DATETIME-precise gaps (e.g. ...15:00:00.000001 ->
+    ...15:59:59.999999), but core.quanthub.download_history_batch()
+    collapses its bounds to whole DAYS. That widening is kept rather
+    than worked around, for two reasons:
+
+      1. It is always a SUPERSET of the gap, never a subset, so no
+         requested bar can be missed. Extra bars are absorbed by
+         cache.insert_bars' ON CONFLICT DO NOTHING upsert, and
+         _persist_downloaded still records only the true missing range
+         as synced -- coverage bookkeeping stays exact.
+      2. It is what keeps FOUR_HOUR correct. 4H bars are synthesized by
+         resampling native hourly bars, so a request starting
+         mid-bucket would resample a partial bucket into a wrong 4H bar.
+         Whole-day bounds are always 4H-aligned (24 % 4 == 0), so every
+         resampled bucket is complete regardless of where the gap
+         happened to start.
+
+    Reaching for _fetch_quanthub_records directly to preserve the extra
+    precision would have meant reimplementing normalization, resampling
+    and filtering here -- a second pipeline, for at most one extra day
+    of bars per gap edge. The saving that matters is already captured.
     """
     parsed = parse_ric(ric)
     qh_root = qh_root_for_market(parsed.market_key)
     instrument = build_instrument(qh_root, parsed.month, parsed.year)
-    return download_history_quanthub(instrument, interval.value, start_dt, end_dt)
+    return download_history_quanthub(
+        instrument, interval.value, range_start, range_end, use_date_range=True
+    )
 
 
 def _fetch_established_quanthub(
     session,
     ric: str,
     interval: BarInterval,
-    start_dt: datetime,
-    end_dt: datetime,
+    missing: list[tuple[datetime, datetime]],
     boundary: datetime,
 ) -> None:
-    """Fetch from QuantHub for a (ric, interval) already ESTABLISHED as
-    QuantHub's responsibility (cache.get_established_provider returned
-    "QUANTHUB") -- LSEG is never consulted again once established. See
-    _download_quanthub_full_window for why the full window is requested
-    rather than just the missing portion (a QuantHub API limitation,
-    not a design choice). `end_dt` here is already the caller's
-    effective end (see _effective_request_end).
+    """INCREMENTAL fetch from QuantHub for a (ric, interval) already
+    ESTABLISHED as QuantHub's responsibility (cache.
+    get_established_provider returned "QUANTHUB") -- LSEG is never
+    consulted again once established.
+
+    Now structurally identical to the established-LSEG branch: one
+    request per genuinely missing sub-range, never the whole window.
+    Previously this took (start_dt, end_dt) and re-requested everything
+    on every call, because QuantHub had no way to express a sub-range;
+    core.quanthub's start/end support removed that constraint, so a
+    warm cache with a one-bar tail gap now fetches that tail instead of
+    six months. `missing` comes straight from _missing_ranges() -- the
+    same gap detector LSEG has always used, not a QuantHub-specific
+    reimplementation -- and is already computed against the caller's
+    effective end (see _effective_request_end), so no sub-range here
+    can reach into a currently-forming bar.
     """
-    downloaded_qh = _download_quanthub_full_window(ric, interval, start_dt, end_dt)
-    _persist_downloaded(
-        session, ric, interval, downloaded_qh, start_dt, end_dt, boundary,
-        provider=Provider.QUANTHUB.value,
-    )
+    for sub_start, sub_end in missing:
+        logger.info(
+            "Cache miss for %s [%s]: downloading %s -> %s from established QuantHub",
+            ric, interval.value, sub_start, sub_end,
+        )
+        downloaded_qh = _download_quanthub_range(ric, interval, sub_start, sub_end)
+        _persist_downloaded(
+            session, ric, interval, downloaded_qh, sub_start, sub_end, boundary,
+            provider=Provider.QUANTHUB.value,
+        )
 
 
 def get_history(
@@ -778,7 +858,7 @@ def get_history(
                         provider=Provider.LSEG.value,
                     )
             elif established == Provider.QUANTHUB.value:
-                _fetch_established_quanthub(session, ric, interval, start_dt, effective_end_dt, boundary)
+                _fetch_established_quanthub(session, ric, interval, missing, boundary)
             elif sync_ranges:
                 # No recorded provider, but coverage already exists --
                 # a LEGACY row (see _fetch_legacy_unknown_provider).
@@ -797,34 +877,43 @@ def get_history(
 def _get_history_batch_quanthub(
     rics: list[str], interval: BarInterval, start_dt: datetime, end_dt: datetime
 ) -> dict[str, pd.DataFrame]:
-    """QuantHub half of get_history_batch(): batches every `rics` entry
-    that actually needs a fetch into as few core.quanthub.
-    download_history_batch() HTTP requests as QUANTHUB_BATCH_SIZE allows,
-    then persists/reads each RIC through the exact same cache-first path
-    get_history() itself uses (_persist_downloaded + cache.read_bars) --
-    a batched fetch is a cache-first citizen too, not a second cache.
+    """QuantHub half of get_history_batch(): fetches only what each RIC
+    is actually missing, while still batching many instruments into as
+    few core.quanthub.download_history_batch() HTTP requests as
+    QUANTHUB_BATCH_SIZE allows, then persists/reads each RIC through the
+    exact same cache-first path get_history() itself uses
+    (_persist_downloaded + cache.read_bars) -- a batched fetch is a
+    cache-first citizen too, not a second cache.
 
-    Deliberate simplification vs. get_history()'s own per-RIC gap
-    tracking: any RIC with SOME missing coverage in [start_dt, end_dt]
-    is fetched for the FULL window, not just its own narrow gap. This is
-    safe (cache.insert_bars upserts with ON CONFLICT DO NOTHING -- re-
-    inserting already-cached bars is a no-op) and is actually the only
-    behavior that makes sense for QuantHub specifically: its count=
-    parameter always means "most recent N bars ending now", never a
-    caller-chosen historical sub-range, so there is no such thing as
-    "fetch just this RIC's small gap" for this provider -- every fetch
-    already covers "as much of the recent window as count allows"
-    regardless of what particular sub-range prompted it. A RIC with NO
-    missing coverage is excluded from the batch entirely.
+    INCREMENTAL, GROUPED BY MISSING RANGE. Previously any RIC with SOME
+    missing coverage was fetched for the FULL window, because QuantHub's
+    count= parameter could only ever mean "the most recent N bars ending
+    now" -- there was no way to ask for one RIC's narrow gap. QuantHub's
+    start/end support removed that limitation, so this function now:
+
+      1. computes each RIC's own missing ranges with _missing_ranges()
+         -- the same gap detector LSEG has always used;
+      2. GROUPS RICs whose missing ranges are IDENTICAL, and issues one
+         batched request per group per sub-range.
+
+    The grouping is what keeps batching without conflating unrelated
+    gaps. One HTTP request carries ONE start/end for every instrument in
+    it, so RICs with different coverage genuinely cannot share a request
+    without widening someone's window -- and widening a RIC's request to
+    cover an unrelated RIC's older gap would re-download exactly the
+    history this change exists to stop re-downloading. In practice the
+    common case still collapses to a single request: RICs scanned
+    together were cached together, so they share a signature. A RIC with
+    NO missing coverage is excluded entirely and no provider is
+    contacted for it.
 
     Every persisted result is recorded with provider="QUANTHUB" (see
     database.cache.record_sync_range/get_established_provider) -- this
     function is the shared QuantHub-fetch mechanism used both when a
     ric is newly establishing QuantHub as its provider and when a ric
-    is already established as QuantHub from an earlier call; both cases
-    need identical treatment (batched full-window fetch, provider
-    recorded), so callers (get_history_batch's provenance-aware batch
-    path) route both groups through this one function together.
+    is already established as QuantHub from an earlier call. A newly-
+    establishing ric has no coverage at all, so its missing range IS
+    the full window and it is fetched as such, with no special case.
     """
     now = datetime.utcnow()
     boundary = _last_completed_boundary(interval, now)
@@ -832,40 +921,46 @@ def _get_history_batch_quanthub(
 
     results: dict[str, pd.DataFrame] = {}
     with get_session() as session:
-        rics_needing_fetch = (
-            [
-                ric
-                for ric in rics
-                if _missing_ranges(
-                    cache.get_sync_ranges(session, ric, interval.value), start_dt, effective_end_dt
+        # Group by the EXACT missing-range signature. A tuple of
+        # (start, end) pairs is hashable and compares by value, so two
+        # RICs group together iff they need precisely the same windows.
+        groups: dict[tuple[tuple[datetime, datetime], ...], list[str]] = {}
+        if effective_end_dt >= start_dt:
+            for ric in rics:
+                missing = _missing_ranges(
+                    cache.get_sync_ranges(session, ric, interval.value),
+                    start_dt,
+                    effective_end_dt,
                 )
-            ]
-            if effective_end_dt >= start_dt
-            else []
-        )
+                if missing:
+                    groups.setdefault(tuple(missing), []).append(ric)
 
-        if rics_needing_fetch:
+        for missing, group_rics in groups.items():
             instrument_by_ric: dict[str, str] = {}
-            for ric in rics_needing_fetch:
+            for ric in group_rics:
                 parsed = parse_ric(ric)
                 qh_root = qh_root_for_market(parsed.market_key)
                 instrument_by_ric[ric] = build_instrument(qh_root, parsed.month, parsed.year)
 
-            logger.info(
-                "QuantHub batch cache miss for %d/%d RIC(s) [%s]: downloading %s -> %s",
-                len(rics_needing_fetch), len(rics), interval.value, start_dt, effective_end_dt,
-            )
-            batch_downloaded = download_history_quanthub_batch(
-                list(instrument_by_ric.values()), interval.value, start_dt, effective_end_dt
-            )
-
-            for ric in rics_needing_fetch:
-                instrument = instrument_by_ric[ric]
-                downloaded = batch_downloaded[instrument]
-                _persist_downloaded(
-                    session, ric, interval, downloaded, start_dt, effective_end_dt, boundary,
-                    provider=Provider.QUANTHUB.value,
+            for sub_start, sub_end in missing:
+                logger.info(
+                    "QuantHub batch cache miss for %d/%d RIC(s) [%s]: downloading %s -> %s",
+                    len(group_rics), len(rics), interval.value, sub_start, sub_end,
                 )
+                batch_downloaded = download_history_quanthub_batch(
+                    list(instrument_by_ric.values()),
+                    interval.value,
+                    sub_start,
+                    sub_end,
+                    use_date_range=True,
+                )
+
+                for ric in group_rics:
+                    downloaded = batch_downloaded[instrument_by_ric[ric]]
+                    _persist_downloaded(
+                        session, ric, interval, downloaded, sub_start, sub_end, boundary,
+                        provider=Provider.QUANTHUB.value,
+                    )
 
         for ric in rics:
             results[ric] = cache.read_bars(session, ric, interval.value, start_dt, end_dt)
